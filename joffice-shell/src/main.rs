@@ -1,15 +1,14 @@
 // jOffice shell — native GTK4 + WebKitGTK 6.0 host for the Euro-Office
 // web-apps editor. Replaces the Qt/CEF DesktopEditors shell.
 //
-// Architecture (Kagi-reviewed, round 1):
+// Architecture (Kagi-reviewed, rounds 1-2):
 //   - The editor (web-apps JS + sdkjs) runs inside WebKitGTK, served from
-//     the joffice:// custom URI scheme — NOT file://. file:// gives
-//     origin null, blocks XHR/fetch/modules, and the editor expects a
-//     host backend anyway.
+//     the joffice:// custom URI scheme — NOT file://.
 //   - The host backend is window.AscDesktopEditor (see shim.js), the
 //     desktop-host interface sdkjs actually speaks. window.joffice.invoke
 //     is only the low-level Rust bridge the shim calls into.
-//   - Local files flow through the x2t converter sidecar:
+//   - Local files flow through the x2t converter sidecar (worker thread,
+//     never the GTK main thread):
 //     .docx/.xlsx/.pptx --x2t--> Editor.bin --shim--> editor
 //     editor --asc_nativeGetFile--> Editor.bin --x2t--> .docx/.xlsx/.pptx
 //   - Bridge is origin-scoped: the handler rejects any page whose URI is
@@ -32,6 +31,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use webkit6::javascriptcore::{Context, Value};
 use webkit6::{
     NavigationAction, NavigationPolicyDecision, PolicyDecisionType, ScriptMessageReply,
@@ -83,6 +83,8 @@ fn reply_err(reply: &ScriptMessageReply, msg: String) {
 }
 
 /// Opaque handle table: JS gets handle IDs, never raw filesystem paths.
+/// No literal-path fallback — a path is only resolvable if it was
+/// registered (via a dialog or --file at startup).
 struct HandleTable {
     next: u64,
     paths: HashMap<String, PathBuf>,
@@ -100,50 +102,59 @@ impl HandleTable {
         id
     }
 
-    fn resolve(&self, handle_or_path: &str) -> Option<PathBuf> {
-        if let Some(p) = self.paths.get(handle_or_path) {
-            return Some(p.clone());
-        }
-        // Fallback: treat as a literal path (e.g. from --file).
-        let p = PathBuf::from(handle_or_path);
-        if p.exists() {
-            Some(p)
-        } else {
-            None
-        }
+    fn resolve(&self, handle: &str) -> Option<PathBuf> {
+        self.paths.get(handle).cloned()
+    }
+
+    #[allow(dead_code)]
+    fn name_of(&self, handle: &str) -> Option<String> {
+        self.paths
+            .get(handle)
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
     }
 }
 
 /// Shared shell state.
 struct Shell {
-    /// Directory containing the web-apps checkout (editor JS).
+    /// Directory containing the web-apps checkout (editor JS), canonicalized.
     webapps_dir: PathBuf,
     /// x2t converter binary (from the `core` build). None = not found.
     x2t: Option<PathBuf>,
-    /// File to open on startup (--file).
-    pending_file: Option<PathBuf>,
+    /// File to open on startup (--file). Consumed once via take().
+    pending_file: RefCell<Option<PathBuf>>,
     /// Opaque handle -> filesystem path.
     handles: Rc<RefCell<HandleTable>>,
     /// The main window (dialog parent). Set after window creation.
     window: RefCell<Option<ApplicationWindow>>,
     /// Currently open document's path (for save, not save-as).
     current_path: RefCell<Option<PathBuf>>,
+    /// Active file dialog, held to keep it alive until response.
+    /// Cleared in the response handler, breaking the Shell->dialog->
+    /// closure->Shell cycle. No Rc in the closure.
+    active_dialog: RefCell<Option<FileChooserNative>>,
 }
 
 impl Shell {
     fn new(webapps_dir: PathBuf, pending_file: Option<PathBuf>) -> Rc<Self> {
-        // x2t lives in the `core` build output. Look in likely spots.
+        let webapps_dir = webapps_dir.canonicalize().unwrap_or(webapps_dir);
         let x2t = ["/usr/local/bin/x2t", "/usr/bin/x2t", "./x2t", "../core/build/bin/x2t"]
             .iter()
             .map(PathBuf::from)
             .find(|p| p.exists());
+        let mut handles = HandleTable::new();
+        // Register --file at startup so it is resolvable as a handle.
+        if let Some(p) = &pending_file {
+            handles.insert(p.clone());
+        }
         Rc::new(Self {
             webapps_dir,
             x2t,
-            pending_file,
-            handles: Rc::new(RefCell::new(HandleTable::new())),
+            pending_file: RefCell::new(pending_file),
+            handles: Rc::new(RefCell::new(handles)),
             window: RefCell::new(None),
             current_path: RefCell::new(None),
+            active_dialog: RefCell::new(None),
         })
     }
 }
@@ -152,11 +163,13 @@ impl Shell {
 // x2t sidecar
 // ---------------------------------------------------------------------------
 
-/// AVS_OFFICE_FILE_FORMAT values (from ONLYOFFICE core / euro-office-lite).
-/// The internal Editor.bin format code needs verification against core
-/// source — marked here so Kagi round 2 can check it.
+/// AVS_OFFICE_FILE_FORMAT values (from ONLYOFFICE core OfficeFileFormats.h).
+/// BIN: the internal Editor.bin format. 0 is AVS_OFFICESTUDIO_FILE_UNKNOWN
+/// (a sentinel, NOT a target). 8192 (0x2000) is the reported internal binary
+/// code — verify empirically: x2t output must start with the sdkjs stream
+/// signature (AscCommon.c_oSerFormat.Signature).
 mod fmt {
-    pub const BIN: i32 = 0; // Editor.bin internal format (VERIFY against core)
+    pub const BIN: i32 = 8192; // Editor.bin internal format (VERIFY via signature)
     pub const DOCX: i32 = 65;
     pub const DOC: i32 = 66;
     pub const ODT: i32 = 67;
@@ -191,33 +204,75 @@ fn format_for_path(path: &Path) -> i32 {
     }
 }
 
-/// Run x2t to convert `from` -> `to` (target format code).
-/// Returns Err with a clear message if x2t is missing or fails.
-fn x2t_convert(shell: &Shell, from: &Path, to: &Path, format_to: i32) -> Result<(), String> {
-    let x2t = shell.x2t.as_ref().ok_or_else(|| {
-        "x2t converter not found. Build the `core` submodule first (see README).".to_string()
-    })?;
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
 
-    // x2t takes an XML params file.
+/// Unique temp stem: pid + atomic counter. Never pid alone — concurrent
+/// conversions would clobber each other's params/output files, and
+/// predictable temp names are a symlink hazard.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn temp_stem(tag: &str) -> String {
+    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("joffice-{tag}-{}-{n}", std::process::id())
+}
+
+/// Run x2t synchronously (call only from a worker thread).
+/// Params XML root is TaskQueueDataConvert — Task with bare children is
+/// not the schema x2t parses. m_sTempDir is required. Paths are escaped.
+/// CSV/TXT get encoding/delimiter defaults (else x2t exits 89).
+/// Returns the output file bytes.
+fn x2t_convert_sync(
+    x2t: &Path,
+    from: &Path,
+    format_to: i32,
+) -> Result<Vec<u8>, String> {
+    let stem = temp_stem("x2t");
+    let tmpdir = std::env::temp_dir();
+    let out_path = tmpdir.join(format!("{stem}.out"));
+    let params_path = tmpdir.join(format!("{stem}.xml"));
+
+    // x2t infers from extensions: the input extension must be right.
+    // Copy the input to a temp file with its real extension if needed.
+    let from_ext = from.extension().and_then(|e| e.to_str()).unwrap_or("docx");
+    let from_tmp = tmpdir.join(format!("{stem}.in.{from_ext}"));
+    std::fs::copy(from, &from_tmp).map_err(|e| format!("stage input: {e}"))?;
+
+    let mut extra = String::new();
+    if format_to == fmt::CSV || format_to == fmt::TXT {
+        // CSV/TXT need encoding + delimiter or x2t exits 89.
+        extra.push_str("  <m_nCsvTxtEncoding>65001</m_nCsvTxtEncoding>\n");
+        extra.push_str("  <m_cCsvDelimiter>,</m_cCsvDelimiter>\n");
+    }
+
     let params = format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
-<Task>
+<TaskQueueDataConvert xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <m_sFileFrom>{}</m_sFileFrom>
   <m_sFileTo>{}</m_sFileTo>
   <m_nFormatTo>{}</m_nFormatTo>
-</Task>"#,
-        from.display(),
-        to.display(),
-        format_to
+  <m_sTempDir>{}</m_sTempDir>
+{}</TaskQueueDataConvert>"#,
+        xml_escape(&from_tmp.display().to_string()),
+        xml_escape(&out_path.display().to_string()),
+        format_to,
+        xml_escape(&tmpdir.display().to_string()),
+        extra
     );
-    let params_path = std::env::temp_dir().join(format!("joffice-x2t-{}.xml", std::process::id()));
     std::fs::write(&params_path, params).map_err(|e| format!("write x2t params: {e}"))?;
 
     let out = Command::new(x2t)
         .arg(&params_path)
         .output()
         .map_err(|e| format!("run x2t: {e}"))?;
+
     let _ = std::fs::remove_file(&params_path);
+    let _ = std::fs::remove_file(&from_tmp);
 
     if !out.status.success() {
         return Err(format!(
@@ -226,7 +281,54 @@ fn x2t_convert(shell: &Shell, from: &Path, to: &Path, format_to: i32) -> Result<
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    Ok(())
+    let bytes = std::fs::read(&out_path).map_err(|e| format!("read x2t output: {e}"))?;
+    let _ = std::fs::remove_file(&out_path);
+    Ok(bytes)
+}
+
+/// Run x2t on a worker thread; `done` runs on the GTK main thread with
+/// the output bytes (or an error). Never blocks the UI.
+fn x2t_convert_async(
+    shell: &Rc<Shell>,
+    from: PathBuf,
+    format_to: i32,
+    done: impl FnOnce(Result<Vec<u8>, String>) + 'static,
+) {
+    let x2t = match shell.x2t.clone() {
+        Some(x) => x,
+        None => {
+            done(Err(
+                "x2t converter not found. Build the `core` submodule first (see README).".to_string(),
+            ));
+            return;
+        }
+    };
+    let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
+    std::thread::spawn(move || {
+        let result = x2t_convert_sync(&x2t, &from, format_to);
+        let _ = tx.send(result);
+    });
+    // Poll the channel from the main thread; reply there (WebKit calls
+    // must stay on main). Polling is ugly; glib::MainContext::channel
+    // does not exist in this glib version.
+    let mut done_opt = Some(done);
+    gtk4::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+        match rx.try_recv() {
+            Ok(result) => {
+                if let Some(done) = done_opt.take() {
+                    done(result);
+                }
+                gtk4::glib::ControlFlow::Break
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => gtk4::glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                if let Some(done) = done_opt.take() {
+                    done(Err("x2t worker died".to_string()));
+                }
+                gtk4::glib::ControlFlow::Break
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -252,24 +354,48 @@ fn content_type(path: &Path) -> &'static str {
 }
 
 /// Serve a joffice:// URI from the web-apps directory.
-/// joffice:///apps/documenteditor/main/index.html -> <webapps>/apps/documenteditor/main/index.html
+/// Defenses: percent-decode, strip query/fragment, canonicalize and
+/// assert the result stays under webapps_dir (blocks ../../ traversal).
 fn handle_uri_scheme(shell: &Shell, req: &URISchemeRequest) {
     let uri = req.uri().unwrap_or_default();
-    // Strip scheme + leading slashes: joffice:///apps/... -> /apps/...
-    let path_part = uri.strip_prefix(EDITOR_ORIGIN).unwrap_or("").trim_start_matches('/');
-    let file_path = shell.webapps_dir.join(path_part);
+    let rest = uri.strip_prefix(EDITOR_ORIGIN).unwrap_or("");
+    // Strip query and fragment: ?v=2 and #hash are not filesystem.
+    let path_part = rest.split(['?', '#']).next().unwrap_or("");
+    // Percent-decode: %20 -> space, etc.
+    let decoded = gtk4::glib::uri_unescape_string(path_part, None::<&str>)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| path_part.to_string());
+    let file_path = shell.webapps_dir.join(decoded.trim_start_matches('/'));
 
-    // Directory -> index.html
     let file_path = if file_path.is_dir() {
         file_path.join("index.html")
     } else {
         file_path
     };
 
-    match std::fs::read(&file_path) {
-        Ok(data) => {
-            let stream = gtk4::gio::MemoryInputStream::from_bytes(&gtk4::glib::Bytes::from(&data));
-            req.finish(&stream, data.len() as i64, Some(content_type(&file_path)));
+    // Canonicalize and verify containment. Nonexistent -> 404 (safe).
+    match file_path.canonicalize() {
+        Ok(canon) if canon.starts_with(&shell.webapps_dir) => match std::fs::read(&canon) {
+            Ok(data) => {
+                let stream =
+                    gtk4::gio::MemoryInputStream::from_bytes(&gtk4::glib::Bytes::from(&data));
+                req.finish(&stream, data.len() as i64, Some(content_type(&canon)));
+            }
+            Err(_) => {
+                let mut err = gtk4::glib::Error::new(
+                    gtk4::gio::IOErrorEnum::NotFound,
+                    &format!("joffice: not found: {uri}"),
+                );
+                req.finish_error(&mut err);
+            }
+        },
+        Ok(_) => {
+            // Traversal outside web-apps.
+            let mut err = gtk4::glib::Error::new(
+                gtk4::gio::IOErrorEnum::PermissionDenied,
+                "joffice: path outside web-apps",
+            );
+            req.finish_error(&mut err);
         }
         Err(_) => {
             let mut err = gtk4::glib::Error::new(
@@ -293,8 +419,9 @@ fn handle_bridge(
     msg: &BridgeMsg,
 ) {
     // ORIGIN CHECK: only the editor origin may call the bridge.
-    // The WebView's current URI must be joffice://. Anything else
-    // (navigation to an external site, injected frame, etc.) is rejected.
+    // view.uri() is the top-frame URI; a same-origin iframe could in
+    // principle reach the handler, but the shim is TopFrame-only and
+    // the editor origin is ours. Known limitation, documented.
     let uri = view.uri().unwrap_or_default();
     if !uri.starts_with(EDITOR_ORIGIN) {
         reply_err(reply, format!("bridge rejected: untrusted origin {uri}"));
@@ -303,12 +430,25 @@ fn handle_bridge(
 
     match msg.cmd.as_str() {
         "pendingFile" => {
-            let path = shell.pending_file.clone();
-            // Consume: only report once.
-            if let Some(p) = path {
-                reply_json(reply, ctx, &serde_json::json!({ "path": p.to_string_lossy() }));
-            } else {
-                reply_json(reply, ctx, &serde_json::json!({ "path": null }));
+            // CONSUME once: take() clears it so a second LocalStartOpen
+            // does not re-open the same file.
+            let path = shell.pending_file.borrow_mut().take();
+            match path {
+                Some(p) => {
+                    let name = p
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let handle = shell.handles.borrow_mut().insert(p);
+                    reply_json(
+                        reply,
+                        ctx,
+                        &serde_json::json!({ "handle": handle, "name": name }),
+                    );
+                }
+                None => {
+                    reply_json(reply, ctx, &serde_json::json!({ "handle": null, "name": null }));
+                }
             }
         }
 
@@ -333,83 +473,59 @@ fn handle_bridge(
                 filter.add_mime_type(mime);
             }
             dialog.add_filter(&filter);
-            // Hold a strong ref until the response fires (dialog is a
-            // local; without this the response may never arrive).
-            // The closure holds a clone; it drops naturally when the
-            // dialog is destroyed after the response.
-            let dialog_rc = Rc::new(dialog);
-            let dialog_clone = dialog_rc.clone();
-            let _dialog_hold = dialog_rc.clone();
-            let reply_clone = reply.clone();
-            let ctx_clone = ctx.clone();
-            let handles = shell.handles.clone();
-            dialog_clone.connect_response(move |d, resp| {
+            // Hold the dialog in Shell state (cleared on response).
+            // No Rc in the closure: the closure captures `shell`, and
+            // the response handler clears the field, breaking the cycle.
+            *shell.active_dialog.borrow_mut() = Some(dialog.clone());
+            let shell_c = shell.clone();
+            let reply_c = reply.clone();
+            let ctx_c = ctx.clone();
+            dialog.connect_response(move |d, resp| {
+                *shell_c.active_dialog.borrow_mut() = None;
                 if resp == ResponseType::Accept {
                     if let Some(path) = d.file().and_then(|f| f.path()) {
-                        let handle = handles.borrow_mut().insert(path);
-                        reply_json(&reply_clone, &ctx_clone, &serde_json::json!({ "handle": handle }));
+                        let handle = shell_c.handles.borrow_mut().insert(path);
+                        reply_json(&reply_c, &ctx_c, &serde_json::json!({ "handle": handle }));
                     } else {
-                        reply_json(&reply_clone, &ctx_clone, &serde_json::json!({ "handle": null }));
+                        reply_json(&reply_c, &ctx_c, &serde_json::json!({ "handle": null }));
                     }
                 } else {
-                    reply_json(&reply_clone, &ctx_clone, &serde_json::json!({ "handle": null }));
+                    reply_json(&reply_c, &ctx_c, &serde_json::json!({ "handle": null }));
                 }
             });
-            dialog_clone.show();
+            dialog.show();
         }
 
-        "openFile" => {
-            // Convert the requested file via x2t -> Editor.bin, return base64.
+        "openFile" | "convertFile" => {
             let handle = msg.args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let path = match shell.handles.borrow().resolve(handle) {
                 Some(p) => p,
                 None => {
-                    reply_err(reply, format!("openFile: unknown handle/path: {handle}"));
+                    reply_err(reply, format!("{}: unknown handle: {handle}", msg.cmd));
                     return;
                 }
             };
-            *shell.current_path.borrow_mut() = Some(path.clone());
-            let tmp = std::env::temp_dir().join(format!("joffice-open-{}.bin", std::process::id()));
-            match x2t_convert(shell, &path, &tmp, fmt::BIN) {
-                Ok(()) => match std::fs::read(&tmp) {
-                    Ok(data) => {
-                        let _ = std::fs::remove_file(&tmp);
-                        use base64::Engine;
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-                        reply_json(reply, ctx, &serde_json::json!({ "data": b64 }));
-                    }
-                    Err(e) => reply_err(reply, format!("read Editor.bin: {e}")),
-                },
-                Err(e) => reply_err(reply, e),
+            if msg.cmd == "openFile" {
+                *shell.current_path.borrow_mut() = Some(path.clone());
             }
-        }
-
-        "convertFile" => {
-            let handle = msg.args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            let path = match shell.handles.borrow().resolve(handle) {
-                Some(p) => p,
-                None => {
-                    reply_err(reply, format!("convertFile: unknown handle/path: {handle}"));
-                    return;
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let reply_c = reply.clone();
+            let ctx_c = ctx.clone();
+            x2t_convert_async(shell, path, fmt::BIN, move |result| match result {
+                Ok(bytes) => {
+                    use base64::Engine;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    reply_json(
+                        &reply_c,
+                        &ctx_c,
+                        &serde_json::json!({ "data": b64, "images": {}, "name": name }),
+                    );
                 }
-            };
-            let tmp = std::env::temp_dir().join(format!("joffice-conv-{}.bin", std::process::id()));
-            match x2t_convert(shell, &path, &tmp, fmt::BIN) {
-                Ok(()) => match std::fs::read(&tmp) {
-                    Ok(data) => {
-                        let _ = std::fs::remove_file(&tmp);
-                        use base64::Engine;
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-                        reply_json(
-                            reply,
-                            ctx,
-                            &serde_json::json!({ "data": b64, "images": {} }),
-                        );
-                    }
-                    Err(e) => reply_err(reply, format!("read Editor.bin: {e}")),
-                },
-                Err(e) => reply_err(reply, e),
-            }
+                Err(e) => reply_err(&reply_c, e),
+            });
         }
 
         "saveFile" => {
@@ -424,76 +540,72 @@ fn handle_bridge(
                     return;
                 }
             };
-            let tmp_bin = std::env::temp_dir().join(format!("joffice-save-{}.bin", std::process::id()));
+            let tmp_bin =
+                std::env::temp_dir().join(format!("{}.bin", temp_stem("save")));
             if let Err(e) = std::fs::write(&tmp_bin, &bin) {
                 reply_err(reply, format!("write temp Editor.bin: {e}"));
                 return;
             }
 
-            // Determine target path: current file, or Save As dialog.
-            let target: Option<PathBuf> = if save_as || shell.current_path.borrow().is_none() {
-                // Save As: show dialog, block on it (sync via channel).
-                // For now, require the shim to pass a handle; dialog flow
-                // is handled by the saveFileDialog command below.
-                None
-            } else {
-                shell.current_path.borrow().clone()
-            };
-
-            match target {
-                Some(path) => {
+            // Save As (or no current path): show the dialog INLINE and
+            // reply from its response. Do NOT bounce an error to the shim.
+            let needs_dialog = save_as || shell.current_path.borrow().is_none();
+            if needs_dialog {
+                let window = shell.window.borrow().clone();
+                let dialog = FileChooserNative::new(
+                    Some("Save document"),
+                    window.as_ref(),
+                    FileChooserAction::Save,
+                    Some("_Save"),
+                    Some("_Cancel"),
+                );
+                dialog.set_current_name("Untitled.docx");
+                *shell.active_dialog.borrow_mut() = Some(dialog.clone());
+                let shell_c = shell.clone();
+                let reply_c = reply.clone();
+                let ctx_c = ctx.clone();
+                let tmp_bin_c = tmp_bin.clone();
+                dialog.connect_response(move |d, resp| {
+                    *shell_c.active_dialog.borrow_mut() = None;
+                    if resp != ResponseType::Accept {
+                        let _ = std::fs::remove_file(&tmp_bin_c);
+                        reply_err(&reply_c, "saveFile: dialog cancelled".to_string());
+                        return;
+                    }
+                    let Some(path) = d.file().and_then(|f| f.path()) else {
+                        let _ = std::fs::remove_file(&tmp_bin_c);
+                        reply_err(&reply_c, "saveFile: no path chosen".to_string());
+                        return;
+                    };
+                    *shell_c.current_path.borrow_mut() = Some(path.clone());
                     let fmt_to = format_for_path(&path);
-                    match x2t_convert(shell, &tmp_bin, &path, fmt_to) {
-                        Ok(()) => {
-                            let _ = std::fs::remove_file(&tmp_bin);
-                            reply_json(reply, ctx, &serde_json::json!({ "ok": true }));
+                    let reply_c2 = reply_c.clone();
+                    let ctx_c2 = ctx_c.clone();
+                    x2t_convert_async(&shell_c, tmp_bin_c.clone(), fmt_to, move |result| match result {
+                        Ok(_) => {
+                            reply_json(&reply_c2, &ctx_c2, &serde_json::json!({ "ok": true }));
                         }
-                        Err(e) => reply_err(reply, e),
-                    }
-                }
-                None => {
-                    // No target yet: ask the shim to show a Save As dialog
-                    // via the saveFileDialog command, then retry.
-                    reply_err(reply, "saveFile: no target path; use saveFileDialog first".to_string());
-                }
+                        Err(e) => reply_err(&reply_c2, e),
+                    });
+                });
+                dialog.show();
+                return;
             }
-        }
 
-        "saveFileDialog" => {
-            let window = shell.window.borrow().clone();
-            let dialog = FileChooserNative::new(
-                Some("Save document"),
-                window.as_ref(),
-                FileChooserAction::Save,
-                Some("_Save"),
-                Some("_Cancel"),
-            );
-            dialog.set_current_name("Untitled.docx");
-            let dialog_rc = Rc::new(dialog);
-            let dialog_clone = dialog_rc.clone();
-            let _dialog_hold = dialog_rc.clone();
-            let reply_clone = reply.clone();
-            let ctx_clone = ctx.clone();
-            let handles = shell.handles.clone();
-            let current = shell.current_path.clone();
-            dialog_clone.connect_response(move |d, resp| {
-                if resp == ResponseType::Accept {
-                    if let Some(path) = d.file().and_then(|f| f.path()) {
-                        *current.borrow_mut() = Some(path.clone());
-                        let handle = handles.borrow_mut().insert(path);
-                        reply_json(&reply_clone, &ctx_clone, &serde_json::json!({ "handle": handle }));
-                    } else {
-                        reply_json(&reply_clone, &ctx_clone, &serde_json::json!({ "handle": null }));
-                    }
-                } else {
-                    reply_json(&reply_clone, &ctx_clone, &serde_json::json!({ "handle": null }));
+            // Normal save to the current path.
+            let path = shell.current_path.borrow().clone().expect("current_path");
+            let fmt_to = format_for_path(&path);
+            let reply_c = reply.clone();
+            let ctx_c = ctx.clone();
+            x2t_convert_async(shell, tmp_bin, fmt_to, move |result| match result {
+                Ok(_) => {
+                    reply_json(&reply_c, &ctx_c, &serde_json::json!({ "ok": true }));
                 }
+                Err(e) => reply_err(&reply_c, e),
             });
-            dialog_clone.show();
         }
 
         "createNew" => {
-            // New empty document: clear current path, return ok.
             *shell.current_path.borrow_mut() = None;
             reply_json(reply, ctx, &serde_json::json!({ "ok": true }));
         }
@@ -529,7 +641,6 @@ fn main() {
     }
 
     // Resolve the web-apps dir: <exe-dir>/../web-apps, or ./web-apps.
-    // (Fragile path from round 0 replaced with a search over candidates.)
     let webapps_dir = std::env::current_exe()
         .ok()
         .and_then(|e| e.parent().map(|p| p.to_path_buf()))
@@ -564,7 +675,29 @@ fn main() {
             .build();
         *shell.window.borrow_mut() = Some(window.clone());
 
-        // WebContext with the joffice:// scheme + CORS.
+        // Save-on-close: ask the editor to save before the window closes.
+        // Best-effort: the shim's LocalFileSaveChanges handles the sdkjs
+        // side; here we just trigger a save via the shim if a doc is open.
+        let shell_close = shell.clone();
+        window.connect_close_request(move |win| {
+            if shell_close.current_path.borrow().is_some() {
+                if let Some(child) = win.child() {
+                    if let Ok(view) = child.downcast::<WebView>() {
+                        view.evaluate_javascript(
+                            "window.AscDesktopEditor && window.AscDesktopEditor.LocalFileSave && window.AscDesktopEditor.LocalFileSave('', null, null, 0, null);",
+                            None,
+                            None,
+                            None::<&gtk4::gio::Cancellable>,
+                            |_| {},
+                        );
+                    }
+                }
+            }
+            gtk4::glib::Propagation::Proceed // allow close
+        });
+
+        // WebContext with the joffice:// scheme + CORS. Register the
+        // scheme BEFORE constructing the WebView.
         let context = WebContext::default().expect("default WebContext");
         let security = context.security_manager().expect("security manager");
         security.register_uri_scheme_as_cors_enabled(EDITOR_SCHEME);
@@ -628,11 +761,13 @@ fn main() {
             },
         );
 
-        // NAVIGATION POLICY: block top-level navigation away from joffice://.
-        // External links open in the system browser via UriLauncher.
+        // NAVIGATION POLICY: allow the editor origin + the schemes the
+        // editor itself uses (blob/data/about:blank for its iframes).
+        // External http/https/mailto links open in the system browser.
+        // Everything else: let WebKit decide (don't break internals).
         view.connect_decide_policy(|_view, decision, decision_type| {
             if decision_type != PolicyDecisionType::NavigationAction {
-                return false; // let WebKit handle non-navigation decisions
+                return false;
             }
             let nav_policy: &NavigationPolicyDecision =
                 match decision.downcast_ref::<NavigationPolicyDecision>() {
@@ -644,13 +779,20 @@ fn main() {
                 None => return false,
             };
             let uri = nav.request().and_then(|r| r.uri()).unwrap_or_default();
-            if uri.starts_with(EDITOR_ORIGIN) || uri.is_empty() {
-                return false; // allow editor navigation
+            if uri.starts_with(EDITOR_ORIGIN)
+                || uri.starts_with("blob:")
+                || uri.starts_with("data:")
+                || uri == "about:blank"
+                || uri.is_empty()
+            {
+                return false; // allow editor + its own frames
             }
-            // External: open in system browser, block in WebView.
-            let _ = AppInfo::launch_default_for_uri(&uri, None::<&gtk4::gio::AppLaunchContext>);
-            decision.ignore();
-            true
+            if uri.starts_with("http://") || uri.starts_with("https://") || uri.starts_with("mailto:") {
+                let _ = AppInfo::launch_default_for_uri(&uri, None::<&gtk4::gio::AppLaunchContext>);
+                decision.ignore();
+                return true;
+            }
+            false
         });
 
         // Load the editor from the custom scheme.

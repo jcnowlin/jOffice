@@ -5,10 +5,17 @@
 // DesktopEditors and euro-office-lite implement. This shim implements
 // that interface on top of the Rust bridge (window.joffice.invoke).
 //
+// Correct lifecycle (Kagi round 2 — sdkjs common/Local/common.js):
+//   LocalStartOpen -> bridge convert -> DesktopOfflineAppDocumentEndLoad
+//   (which builds OpenFileResult, checks the stream signature, sets
+//   file.url, calls editor.openDocument, asc_SetFastCollaborative,
+//   DesktopOfflineUpdateLocalName, DesktopAfterOpen, password event).
+// Do NOT hand-build OpenFileResult / call editor.openDocument directly.
+//
 // Flow for opening a local file:
-//   1. sdkjs calls AscDesktopEditor.LocalFileOpen(path)
-//   2. Shim asks Rust to convert the file via x2t -> Editor.bin (base64)
-//   3. Shim feeds Editor.bin to the editor via openDocument()
+//   1. sdkjs calls AscDesktopEditor.LocalStartOpen()
+//   2. Shim asks Rust for the pending file (if any) -> convert via x2t
+//   3. Shim calls window.DesktopOfflineAppDocumentEndLoad(url, data, len)
 // Flow for saving:
 //   1. sdkjs calls AscDesktopEditor.LocalFileSave(...)
 //   2. Shim pulls Editor.bin from the editor via asc_nativeGetFile()
@@ -20,18 +27,34 @@
 (function () {
     'use strict';
 
-    // The Rust bridge. Every call returns a Promise.
+    // The Rust bridge. Every call returns a Promise. Guard: if the
+    // handler is absent (e.g. shim ran on a page without the bridge),
+    // fail loudly instead of throwing on undefined.
     function bridge(cmd, args) {
-        return window.webkit.messageHandlers.joffice.postMessage({ cmd: cmd, args: args || {} });
+        var handlers = window.webkit && window.webkit.messageHandlers;
+        if (!handlers || !handlers.joffice) {
+            return Promise.reject(new Error('joffice bridge handler missing'));
+        }
+        return handlers.joffice.postMessage({ cmd: cmd, args: args || {} });
     }
 
-    // Find the editor API object (lives in the editor iframe).
+    // The editor API object sdkjs hands us via CreateEditorApi.
+    var editorApi = null;
+    // Guard against LocalStartOpen firing twice (reopen loop).
+    var startOpenDone = false;
+    // Current document name, for SetDocumentName / DesktopOfflineUpdateLocalName.
+    var currentDocName = '';
+
+    // Find the editor API: prefer the object from CreateEditorApi,
+    // fall back to scanning iframes for contentWindow.Asc.
     function getEditor() {
+        if (editorApi) return { editor: editorApi, ew: window };
         var frames = document.querySelectorAll('iframe');
         for (var i = 0; i < frames.length; i++) {
             try {
                 if (frames[i].contentWindow && frames[i].contentWindow.Asc) {
-                    return { editor: frames[i].contentWindow.Asc.editor || null, ew: frames[i].contentWindow };
+                    var api = frames[i].contentWindow.Asc.editor;
+                    if (api) return { editor: api, ew: frames[i].contentWindow };
                 }
             } catch (e) { /* cross-origin frame, skip */ }
         }
@@ -53,54 +76,70 @@
             return 'joffice:///sdkjs/common/Images/fonts_thumbnail' + suffix + '.png';
         },
 
+        // sdkjs hands us the editor API object. KEEP IT. Do not discard
+        // it and scan iframes — the editor may run in the top document.
         CreateEditorApi: function (api) {
-            // sdkjs hands us the editor API; stash the editor window.
-            try {
-                var frames = document.querySelectorAll('iframe');
-                for (var i = 0; i < frames.length; i++) {
-                    try {
-                        if (frames[i].contentWindow && frames[i].contentWindow.Asc) {
-                            window.AscDesktopEditor._editorWindow = frames[i].contentWindow;
-                            break;
-                        }
-                    } catch (e) { /* skip */ }
-                }
-            } catch (e) { /* ignore */ }
+            editorApi = api || null;
+        },
+
+        // Called by DesktopOfflineUpdateLocalName during load.
+        // Without this, the load throws.
+        SetDocumentName: function (name) {
+            currentDocName = name || '';
+        },
+
+        // Used when data starts with binary_content://.
+        GetOpenedFile: function (_data) {
+            // No pre-opened file data in this shell; return null so
+            // sdkjs falls through to the normal LocalStartOpen path.
+            return null;
+        },
+
+        // Called by CDocsCoApi.saveChanges for change-tracking.
+        // Without it, save-on-close / unsaved-changes tracking is dead.
+        LocalFileSaveChanges: function (_param, _password, _docinfo, _fileType, _jsonOptions) {
+            // Treat as a normal save: delegate to LocalFileSave.
+            return window.AscDesktopEditor.LocalFileSave(_param, _password, _docinfo, _fileType, _jsonOptions);
         },
 
         // Called by sdkjs when the editor is ready to open a document.
+        // NO-OP when there is no pending file: do NOT open an empty doc
+        // (that loops: openDocument -> onEndLoadFile -> LocalStartOpen).
+        // Guard against firing twice.
         LocalStartOpen: function () {
-            var ref = getEditor();
-            if (!ref.editor) return;
+            if (startOpenDone) return;
+            startOpenDone = true;
             setTimeout(function () {
-                try {
-                    // Ask Rust: is there a pending file to open?
-                    bridge('pendingFile').then(function (pending) {
-                        if (pending && pending.path) {
-                            // Convert via x2t, then feed Editor.bin to the editor.
-                            return bridge('convertFile', { path: pending.path }).then(function (res) {
-                                if (!res || !res.data) throw new Error('convertFile returned no data');
-                                var bin = _b64ToBytes(res.data);
-                                var file = new ref.ew.AscCommon.OpenFileResult();
-                                file.data = bin;
-                                file.bSerFormat = true;
-                                ref.editor.openDocument(file);
-                                ref.ew.AscCommon.History.UserSaveMode = true;
-                            });
+                bridge('pendingFile').then(function (pending) {
+                    if (!pending || !pending.handle) {
+                        // No file to open. Leave the editor on its start
+                        // screen; do not force an empty document.
+                        return;
+                    }
+                    return bridge('convertFile', { path: pending.handle }).then(function (res) {
+                        if (!res || !res.data) throw new Error('convertFile returned no data');
+                        var bin = _b64ToBytes(res.data);
+                        // Drive the canonical sdkjs loader. It builds
+                        // OpenFileResult, checks the stream signature,
+                        // sets file.url, opens the document, and fires
+                        // the post-open hooks. Do NOT hand-roll this.
+                        if (typeof window.DesktopOfflineAppDocumentEndLoad === 'function') {
+                            window.DesktopOfflineAppDocumentEndLoad(pending.name || '', bin, bin.length);
+                        } else {
+                            // Fallback if the global is absent (older sdkjs):
+                            // hand-build OpenFileResult with signature check.
+                            var ref = getEditor();
+                            if (!ref.editor) throw new Error('no editor API');
+                            var file = new ref.ew.AscCommon.OpenFileResult();
+                            file.data = bin;
+                            file.bSerFormat = true;
+                            file.url = pending.name || '';
+                            ref.editor.openDocument(file);
                         }
-                        // No file: open an empty document.
-                        var emptyData = ref.ew.AscCommon.getEmpty();
-                        var file = new ref.ew.AscCommon.OpenFileResult();
-                        file.data = emptyData;
-                        file.bSerFormat = true;
-                        ref.editor.openDocument(file);
-                        ref.ew.AscCommon.History.UserSaveMode = true;
-                    }).catch(function (e) {
-                        console.error('[jOffice] LocalStartOpen failed: ' + (e && e.message ? e.message : e));
                     });
-                } catch (e) {
-                    console.error('[jOffice] LocalStartOpen error: ' + (e && e.message ? e.message : e));
-                }
+                }).catch(function (e) {
+                    console.error('[jOffice] LocalStartOpen failed: ' + (e && e.message ? e.message : e));
+                });
             }, 100);
         },
 
@@ -115,18 +154,14 @@
         },
 
         LocalFileOpen: function (path) {
-            // path may be an opaque handle from OpenFilenameDialog, or a real path.
-            // Either way, Rust resolves it. We just trigger the open flow:
-            // convert via x2t and feed Editor.bin, or reload if a doc is open.
+            // path is an opaque handle from OpenFilenameDialog.
+            // Rust resolves it, converts via x2t, returns Editor.bin.
             bridge('openFile', { path: path || null }).then(function (res) {
                 if (res && res.data) {
-                    var ref = getEditor();
-                    if (!ref.editor) return;
                     var bin = _b64ToBytes(res.data);
-                    var file = new ref.ew.AscCommon.OpenFileResult();
-                    file.data = bin;
-                    file.bSerFormat = true;
-                    ref.editor.openDocument(file);
+                    if (typeof window.DesktopOfflineAppDocumentEndLoad === 'function') {
+                        window.DesktopOfflineAppDocumentEndLoad(res.name || '', bin, bin.length);
+                    }
                 }
             }).catch(function (e) {
                 console.error('[jOffice] LocalFileOpen failed: ' + (e && e.message ? e.message : e));
@@ -140,13 +175,25 @@
                 console.error('[jOffice] LocalFileSave aborted: no editor');
                 return;
             }
+            // asc_nativeGetFile may not exist on all sdkjs builds.
+            if (typeof ref.editor.asc_nativeGetFile !== 'function') {
+                console.error('[jOffice] LocalFileSave aborted: asc_nativeGetFile missing');
+                if (ref.ew && ref.ew.DesktopOfflineAppDocumentEndSave) {
+                    ref.ew.DesktopOfflineAppDocumentEndSave(1);
+                }
+                return;
+            }
             try {
                 var binData = ref.editor.asc_nativeGetFile();
                 if (!binData) {
                     console.error('[jOffice] LocalFileSave aborted: asc_nativeGetFile returned no data');
+                    if (ref.ew && ref.ew.DesktopOfflineAppDocumentEndSave) {
+                        ref.ew.DesktopOfflineAppDocumentEndSave(1);
+                    }
                     return;
                 }
                 var b64 = (typeof binData === 'string') ? btoa(binData) : _bytesToB64(new Uint8Array(binData));
+                // Rust handles the Save As dialog inline when needed.
                 bridge('saveFile', { data: b64, saveAs: isSaveAs, fileType: fileType || 0 })
                     .then(function () {
                         if (ref.ew && ref.ew.DesktopOfflineAppDocumentEndSave) {
@@ -209,12 +256,14 @@
                 });
         },
 
-        // Compare / merge delegate to the same convert path.
+        // Compare / merge: decode base64 to raw bytes, pass BYTE length.
+        // Passing base64 length / base64 string is wrong.
         CompareDocumentFile: function (file, oOptions) {
             bridge('convertFile', { path: file }).then(function (res) {
                 var ref = getEditor();
-                if (ref.ew && ref.ew.onDocumentCompare) {
-                    ref.ew.onDocumentCompare('', res.data, res.data.length, res.images || {}, oOptions);
+                if (ref.ew && ref.ew.onDocumentCompare && res && res.data) {
+                    var bytes = _b64ToBytes(res.data);
+                    ref.ew.onDocumentCompare('', bytes, bytes.length, res.images || {}, oOptions);
                 }
             }).catch(function (e) {
                 console.error('[jOffice] CompareDocumentFile failed: ' + (e && e.message ? e.message : e));
@@ -224,8 +273,9 @@
         MergeDocumentFile: function (file, oOptions) {
             bridge('convertFile', { path: file }).then(function (res) {
                 var ref = getEditor();
-                if (ref.ew && ref.ew.onDocumentMerge) {
-                    ref.ew.onDocumentMerge('', res.data, res.data.length, res.images || {}, oOptions);
+                if (ref.ew && ref.ew.onDocumentMerge && res && res.data) {
+                    var bytes = _b64ToBytes(res.data);
+                    ref.ew.onDocumentMerge('', bytes, bytes.length, res.images || {}, oOptions);
                 }
             }).catch(function (e) {
                 console.error('[jOffice] MergeDocumentFile failed: ' + (e && e.message ? e.message : e));
