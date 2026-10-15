@@ -68,7 +68,7 @@
         CheckUserId: function () { return 'local-user'; },
         isSupportBinaryFontsSprite: false,
         isSupportNetworkFunctionality: function () { return false; },
-        LocalFileGetSourcePath: function () { return ''; },
+        LocalFileGetSourcePath: function () { return currentDocName; },
         LocalFileGetSaved: function () { return false; },
 
         getFontsSprite: function (suffix) {
@@ -118,16 +118,18 @@
                     }
                     return bridge('convertFile', { path: pending.handle }).then(function (res) {
                         if (!res || !res.data) throw new Error('convertFile returned no data');
+                        if (res.name) currentDocName = res.name;
                         var bin = _b64ToBytes(res.data);
-                        // Drive the canonical sdkjs loader. It builds
-                        // OpenFileResult, checks the stream signature,
-                        // sets file.url, opens the document, and fires
-                        // the post-open hooks. Do NOT hand-roll this.
+                        // INSTRUMENTATION (Kagi round 3): log which loader
+                        // path executes. If DesktopOfflineAppDocumentEndLoad
+                        // is namespaced / absent, the fallback may itself
+                        // fail to construct OpenFileResult — this log is
+                        // the first thing to check on a spinner.
                         if (typeof window.DesktopOfflineAppDocumentEndLoad === 'function') {
+                            console.log('[jOffice] using DesktopOfflineAppDocumentEndLoad');
                             window.DesktopOfflineAppDocumentEndLoad(pending.name || '', bin, bin.length);
                         } else {
-                            // Fallback if the global is absent (older sdkjs):
-                            // hand-build OpenFileResult with signature check.
+                            console.warn('[jOffice] DesktopOfflineAppDocumentEndLoad MISSING, using fallback openDocument');
                             var ref = getEditor();
                             if (!ref.editor) throw new Error('no editor API');
                             var file = new ref.ew.AscCommon.OpenFileResult();
@@ -175,9 +177,10 @@
                 console.error('[jOffice] LocalFileSave aborted: no editor');
                 return;
             }
-            // asc_nativeGetFile may not exist on all sdkjs builds.
+            // INSTRUMENTATION: asc_nativeGetFile must exist or Save
+            // hard-fails. Log its presence on first save attempt.
             if (typeof ref.editor.asc_nativeGetFile !== 'function') {
-                console.error('[jOffice] LocalFileSave aborted: asc_nativeGetFile missing');
+                console.error('[jOffice] asc_nativeGetFile MISSING — save cannot work');
                 if (ref.ew && ref.ew.DesktopOfflineAppDocumentEndSave) {
                     ref.ew.DesktopOfflineAppDocumentEndSave(1);
                 }
@@ -195,7 +198,10 @@
                 var b64 = (typeof binData === 'string') ? btoa(binData) : _bytesToB64(new Uint8Array(binData));
                 // Rust handles the Save As dialog inline when needed.
                 bridge('saveFile', { data: b64, saveAs: isSaveAs, fileType: fileType || 0 })
-                    .then(function () {
+                    .then(function (res) {
+                        // User cancelled the Save As dialog: not an error.
+                        // Do not call EndSave(1) — the document is unchanged.
+                        if (res && res.cancelled) return;
                         if (ref.ew && ref.ew.DesktopOfflineAppDocumentEndSave) {
                             ref.ew.DesktopOfflineAppDocumentEndSave(0);
                         }

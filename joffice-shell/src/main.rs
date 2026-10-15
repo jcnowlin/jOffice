@@ -133,6 +133,10 @@ struct Shell {
     /// Cleared in the response handler, breaking the Shell->dialog->
     /// closure->Shell cycle. No Rc in the closure.
     active_dialog: RefCell<Option<FileChooserNative>>,
+    /// Window close requested while a save is in flight. The close
+    /// handler blocks (Propagation::Stop) and the save completion
+    /// destroys the window. Prevents save-on-close data loss.
+    close_pending: RefCell<bool>,
 }
 
 impl Shell {
@@ -155,6 +159,7 @@ impl Shell {
             window: RefCell::new(None),
             current_path: RefCell::new(None),
             active_dialog: RefCell::new(None),
+            close_pending: RefCell::new(false),
         })
     }
 }
@@ -224,13 +229,16 @@ fn temp_stem(tag: &str) -> String {
 
 /// Run x2t synchronously (call only from a worker thread).
 /// Params XML root is TaskQueueDataConvert — Task with bare children is
-/// not the schema x2t parses. m_sTempDir is required. Paths are escaped.
+/// not the schema x2t parses. Paths are escaped.
 /// CSV/TXT get encoding/delimiter defaults (else x2t exits 89).
+/// `format_from`: source format code. Required when the source is bin
+/// (8192) — x2t cannot auto-detect the internal format.
 /// Returns the output file bytes.
 fn x2t_convert_sync(
     x2t: &Path,
     from: &Path,
     format_to: i32,
+    format_from: Option<i32>,
 ) -> Result<Vec<u8>, String> {
     let stem = temp_stem("x2t");
     let tmpdir = std::env::temp_dir();
@@ -244,10 +252,15 @@ fn x2t_convert_sync(
     std::fs::copy(from, &from_tmp).map_err(|e| format!("stage input: {e}"))?;
 
     let mut extra = String::new();
+    if let Some(f) = format_from {
+        extra.push_str(&format!("  <m_nFormatFrom>{f}</m_nFormatFrom>\n"));
+    }
     if format_to == fmt::CSV || format_to == fmt::TXT {
         // CSV/TXT need encoding + delimiter or x2t exits 89.
-        extra.push_str("  <m_nCsvTxtEncoding>65001</m_nCsvTxtEncoding>\n");
-        extra.push_str("  <m_cCsvDelimiter>,</m_cCsvDelimiter>\n");
+        // Element name is m_nCsvDelimiter (not m_cCsvDelimiter).
+        // Encoding 46 = reference value (not Windows codepage 65001).
+        extra.push_str("  <m_nCsvTxtEncoding>46</m_nCsvTxtEncoding>\n");
+        extra.push_str("  <m_nCsvDelimiter>4</m_nCsvDelimiter>\n");
     }
 
     let params = format!(
@@ -257,6 +270,9 @@ fn x2t_convert_sync(
   <m_sFileTo>{}</m_sFileTo>
   <m_nFormatTo>{}</m_nFormatTo>
   <m_sTempDir>{}</m_sTempDir>
+  <m_sFontDir />
+  <m_sTitle>jOffice</m_sTitle>
+  <m_bIsNoBase64>true</m_bIsNoBase64>
 {}</TaskQueueDataConvert>"#,
         xml_escape(&from_tmp.display().to_string()),
         xml_escape(&out_path.display().to_string()),
@@ -292,6 +308,7 @@ fn x2t_convert_async(
     shell: &Rc<Shell>,
     from: PathBuf,
     format_to: i32,
+    format_from: Option<i32>,
     done: impl FnOnce(Result<Vec<u8>, String>) + 'static,
 ) {
     let x2t = match shell.x2t.clone() {
@@ -305,7 +322,7 @@ fn x2t_convert_async(
     };
     let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
     std::thread::spawn(move || {
-        let result = x2t_convert_sync(&x2t, &from, format_to);
+        let result = x2t_convert_sync(&x2t, &from, format_to, format_from);
         let _ = tx.send(result);
     });
     // Poll the channel from the main thread; reply there (WebKit calls
@@ -407,6 +424,17 @@ fn handle_uri_scheme(shell: &Shell, req: &URISchemeRequest) {
     }
 }
 
+// After a save completes, if a window close is pending, destroy the
+// window now that the document is safely written. Called from the
+// saveFile reply paths on the main thread.
+fn maybe_destroy_after_save(shell: &Rc<Shell>) {
+    if *shell.close_pending.borrow() {
+        if let Some(win) = shell.window.borrow().as_ref() {
+            win.destroy();
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bridge: JS (shim) -> Rust
 // ---------------------------------------------------------------------------
@@ -453,6 +481,12 @@ fn handle_bridge(
         }
 
         "openFileDialog" => {
+            // A dialog is already open: reject instead of overwriting
+            // active_dialog (which would drop the first dialog mid-flight).
+            if shell.active_dialog.borrow().is_some() {
+                reply_err(reply, "openFileDialog: dialog already open".to_string());
+                return;
+            }
             let window = shell.window.borrow().clone();
             let dialog = FileChooserNative::new(
                 Some("Open document"),
@@ -514,7 +548,7 @@ fn handle_bridge(
                 .unwrap_or_default();
             let reply_c = reply.clone();
             let ctx_c = ctx.clone();
-            x2t_convert_async(shell, path, fmt::BIN, move |result| match result {
+            x2t_convert_async(shell, path, fmt::BIN, None, move |result| match result {
                 Ok(bytes) => {
                     use base64::Engine;
                     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
@@ -551,6 +585,11 @@ fn handle_bridge(
             // reply from its response. Do NOT bounce an error to the shim.
             let needs_dialog = save_as || shell.current_path.borrow().is_none();
             if needs_dialog {
+                if shell.active_dialog.borrow().is_some() {
+                    let _ = std::fs::remove_file(&tmp_bin);
+                    reply_err(reply, "saveFile: dialog already open".to_string());
+                    return;
+                }
                 let window = shell.window.borrow().clone();
                 let dialog = FileChooserNative::new(
                     Some("Save document"),
@@ -569,7 +608,13 @@ fn handle_bridge(
                     *shell_c.active_dialog.borrow_mut() = None;
                     if resp != ResponseType::Accept {
                         let _ = std::fs::remove_file(&tmp_bin_c);
-                        reply_err(&reply_c, "saveFile: dialog cancelled".to_string());
+                        // Cancel is not an error: the shim checks
+                        // `cancelled` and does not flag a save failure.
+                        reply_json(
+                            &reply_c,
+                            &ctx_c,
+                            &serde_json::json!({ "ok": false, "cancelled": true }),
+                        );
                         return;
                     }
                     let Some(path) = d.file().and_then(|f| f.path()) else {
@@ -581,9 +626,11 @@ fn handle_bridge(
                     let fmt_to = format_for_path(&path);
                     let reply_c2 = reply_c.clone();
                     let ctx_c2 = ctx_c.clone();
-                    x2t_convert_async(&shell_c, tmp_bin_c.clone(), fmt_to, move |result| match result {
+                    let shell_c2 = shell_c.clone();
+                    x2t_convert_async(&shell_c2.clone(), tmp_bin_c.clone(), fmt_to, Some(fmt::BIN), move |result| match result {
                         Ok(_) => {
                             reply_json(&reply_c2, &ctx_c2, &serde_json::json!({ "ok": true }));
+                            maybe_destroy_after_save(&shell_c2);
                         }
                         Err(e) => reply_err(&reply_c2, e),
                     });
@@ -597,9 +644,11 @@ fn handle_bridge(
             let fmt_to = format_for_path(&path);
             let reply_c = reply.clone();
             let ctx_c = ctx.clone();
-            x2t_convert_async(shell, tmp_bin, fmt_to, move |result| match result {
+            let shell_c = shell.clone();
+            x2t_convert_async(&shell_c.clone(), tmp_bin, fmt_to, Some(fmt::BIN), move |result| match result {
                 Ok(_) => {
                     reply_json(&reply_c, &ctx_c, &serde_json::json!({ "ok": true }));
+                    maybe_destroy_after_save(&shell_c);
                 }
                 Err(e) => reply_err(&reply_c, e),
             });
@@ -675,12 +724,23 @@ fn main() {
             .build();
         *shell.window.borrow_mut() = Some(window.clone());
 
-        // Save-on-close: ask the editor to save before the window closes.
-        // Best-effort: the shim's LocalFileSaveChanges handles the sdkjs
-        // side; here we just trigger a save via the shim if a doc is open.
+        // Save-on-close: BLOCK the close until the save completes.
+        // Returning Proceed immediately would tear the window down
+        // before the async save (worker thread + dialog) finishes —
+        // a data-loss path. Instead: trigger the save, return Stop,
+        // and let maybe_destroy_after_save() destroy the window once
+        // the save reply lands. A 10s watchdog destroys anyway so a
+        // wedged save cannot hang the close forever.
         let shell_close = shell.clone();
         window.connect_close_request(move |win| {
+            // Already waiting on a save: allow this close through.
+            // (Destroying the window does not re-fire close-request,
+            // but the guard makes the state machine explicit.)
+            if *shell_close.close_pending.borrow() {
+                return gtk4::glib::Propagation::Proceed;
+            }
             if shell_close.current_path.borrow().is_some() {
+                *shell_close.close_pending.borrow_mut() = true;
                 if let Some(child) = win.child() {
                     if let Ok(view) = child.downcast::<WebView>() {
                         view.evaluate_javascript(
@@ -692,8 +752,19 @@ fn main() {
                         );
                     }
                 }
+                // Watchdog: destroy after 10s even if the save never lands.
+                let shell_watch = shell_close.clone();
+                gtk4::glib::timeout_add_local_once(
+                    std::time::Duration::from_secs(10),
+                    move || {
+                        if let Some(w) = shell_watch.window.borrow().as_ref() {
+                            w.destroy();
+                        }
+                    },
+                );
+                return gtk4::glib::Propagation::Stop;
             }
-            gtk4::glib::Propagation::Proceed // allow close
+            gtk4::glib::Propagation::Proceed
         });
 
         // WebContext with the joffice:// scheme + CORS. Register the
