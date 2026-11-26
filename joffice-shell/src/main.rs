@@ -122,8 +122,13 @@ fn reply_err(reply: &ScriptMessageReply, msg: String) {
 /// one-window-per-failure behavior (drive F4 stacked two
 /// identical windows on autosave retries).
 fn reply_save_err(shell: &Rc<Shell>, reply: &ScriptMessageReply, msg: String, origin: &str) {
+    *shell.save_failed_outstanding.borrow_mut() = true;
     eprintln!("joffice: SAVE-ERROR origin={origin} {msg}");
     present_save_error(shell, &msg, origin);
+    deliver_save_reply_js(
+        shell,
+        &serde_json::json!({ "ok": false, "failed": true }),
+    );
     reply_err(reply, msg);
 }
 
@@ -272,6 +277,7 @@ fn present_save_error(shell: &Rc<Shell>, msg: &str, origin: &str) {
 /// A save succeeded: reset the presenter and the autosave
 /// bookkeeping, clear the banner.
 fn note_save_success(shell: &Rc<Shell>) {
+    *shell.save_failed_outstanding.borrow_mut() = false;
     // Take the window out and DROP the borrow before closing:
     // close() runs the window's close-request handler
     // synchronously, and that handler borrows save_error too.
@@ -322,6 +328,15 @@ fn request_page_save(shell: &Rc<Shell>, mode: &str) {
     view.evaluate_javascript(&script, None, None, None::<&gtk4::gio::Cancellable>, |_| {});
 }
 
+/// Fire-and-forget JS in the editor view (cycle 3 action bar /
+/// printRequest kick-off).
+fn eval_in_view(shell: &Rc<Shell>, script: &str) {
+    let Some(view) = shell.view.borrow().clone() else {
+        return;
+    };
+    view.evaluate_javascript(script, None, None, None::<&gtk4::gio::Cancellable>, |_| {});
+}
+
 /// Refresh the window title (with the dirty bullet) and the
 /// format badge from the doc state (marathon 2 cycle 2).
 fn refresh_chrome(shell: &Rc<Shell>) {
@@ -351,6 +366,7 @@ fn refresh_chrome(shell: &Rc<Shell>) {
                         "{} — legacy format; saving means Save As",
                         ext_of_code(d.origin_code).unwrap_or("").to_uppercase()
                     ),
+                    Policy::ViewOnly => "PDF — opens read-only".to_string(),
                 };
                 badge.set_text(&text);
                 badge.set_visible(!text.is_empty());
@@ -362,6 +378,11 @@ fn refresh_chrome(shell: &Rc<Shell>) {
                 badge.set_visible(false);
             }
         }
+    }
+    // The action row (Export as PDF… / Print…) exists only
+    // while a document is open (cycle 3).
+    if let Some(row) = shell.action_row.borrow().as_ref() {
+        row.set_visible(doc.is_some());
     }
 }
 
@@ -820,6 +841,42 @@ struct PendingSave {
     /// check and the external-change stamp).
     doc_path: Option<PathBuf>,
     origin_code: i32,
+    /// PDF/A requested for a PDF target (cycle 3).
+    pdfa: bool,
+    /// The editor reported the document unmodified at
+    /// LocalFileSave time (cycle 3, KAO round 1 §6a: unedited
+    /// documents are never converted — a same-format Save As
+    /// copies the original bytes instead).
+    unmodified: bool,
+    /// ViewOnly (PDF) Save As: on dialog accept, copy THESE
+    /// bytes to the chosen path; no conversion ever runs.
+    copy_source: Option<PathBuf>,
+}
+
+/// A print-intent export parked on the native print dialog
+/// (cycle 3): the bridge reply is owed to the page until the
+/// user sends or cancels the job.
+struct PendingPrint {
+    /// The bridge reply owed to the page, when the print came
+    /// through one (None for the native action-bar button).
+    reply: Option<(ScriptMessageReply, Context)>,
+    /// The PDF handed to the print job. For exports this is
+    /// a shell-created temp (removed after the job); for a
+    /// ViewOnly window it is the USER'S OWN document, which
+    /// must NEVER be removed — the first cycle-3 PR drives
+    /// deleted the opened PDF on a print CANCEL because this
+    /// distinction was not made. `owned` gates the removal.
+    pdf_path: PathBuf,
+    /// True when pdf_path is a shell-created temp file.
+    owned: bool,
+    /// Self-sliced page-range output (shell-created temp,
+    /// always removed after the job).
+    slice_path: Option<PathBuf>,
+    origin: String,
+    /// True when the reply belongs to a saveFile cycle
+    /// (save_done bookkeeping applies); false for a direct
+    /// printRequest on a ViewOnly PDF window.
+    from_save: bool,
 }
 
 /// Save-error presenter state (round 2 restatement 7): ONE
@@ -939,6 +996,15 @@ struct Shell {
     /// saveFile bridge calls that have not replied yet (the
     /// dirty formula's save_in_flight term).
     saves_active: RefCell<u32>,
+    /// Shim seq of the saveFile call currently owed a reply
+    /// (dual-channel delivery, cycle 3).
+    save_reply_seq: RefCell<Option<i64>>,
+    /// A save has failed since the last successful write
+    /// (cycle 3): while set, the §6a unedited no-op is
+    /// forbidden — after a failure the editor's modified
+    /// verdict can settle to "clean" while the disk still
+    /// lacks the edits (observed on the macro refusal).
+    save_failed_outstanding: RefCell<bool>,
     /// The autosave banner widgets (a second revealer under the
     /// font banner).
     save_banner_revealer: RefCell<Option<gtk4::Revealer>>,
@@ -949,6 +1015,15 @@ struct Shell {
     /// A save parked on a native dialog (Save As / AskOnce /
     /// cross-editor rejection).
     pending_save: RefCell<Option<PendingSave>>,
+    /// A print parked on the native print dialog (cycle 3).
+    pending_print: RefCell<Option<PendingPrint>>,
+    print_dialog: RefCell<Option<gtk4::PrintUnixDialog>>,
+    /// The editor's own print range spec (nativeOptions),
+    /// carried from begin_print to the dialog's response.
+    print_editor_spec: RefCell<Option<String>>,
+    /// The chrome action row (Export as PDF… / Print…), shown
+    /// only while a document is open (cycle 3).
+    action_row: RefCell<Option<gtk4::Box>>,
     /// Staged inserted images by local name, and the scheme
     /// requests held until their copies land.
     staged_images: RefCell<std::collections::HashMap<String, ImageStage>>,
@@ -1071,16 +1146,24 @@ impl Shell {
                 retry_pending: false,
             }),
             saves_active: RefCell::new(0),
+            save_reply_seq: RefCell::new(None),
+            save_failed_outstanding: RefCell::new(false),
             save_banner_revealer: RefCell::new(None),
             save_banner_label: RefCell::new(None),
             badge_label: RefCell::new(None),
             pending_save: RefCell::new(None),
+            pending_print: RefCell::new(None),
+            print_dialog: RefCell::new(None),
+            print_editor_spec: RefCell::new(None),
+            action_row: RefCell::new(None),
             staged_images: RefCell::new(std::collections::HashMap::new()),
             held_image_requests: RefCell::new(Vec::new()),
             media_dir: std::env::temp_dir().join(format!("joffice-media-{}", std::process::id())),
             endsave_hash_seen: RefCell::new(None),
         });
         shell.log_manifest();
+        shell.ensure_doctrenderer_config();
+        shell.purge_stale_sdkjs_caches();
         shell
     }
 
@@ -1197,6 +1280,88 @@ impl Shell {
         }
     }
 
+    /// Generate DoctRenderer.config beside x2t (marathon 2
+    /// cycle 3, KAO round 1 §2): the deb's stock config points
+    /// at ../editors/... relative paths that do not exist in
+    /// this runtime's layout — the exit-80 root cause. The
+    /// generated file keeps the deb's 9.3.8 structure with
+    /// ABSOLUTE paths into the staged trees; the AllFonts
+    /// entry is the editor-facing path-keyed file staged at
+    /// sdkjs/common/AllFonts.js (the renderer runs sdkjs
+    /// inside x2t, so cycle 1's path-keyed finding applies).
+    /// In the Nix cycle the derivation generates this file the
+    /// same way; a read-only converter dir logs and moves on.
+    fn ensure_doctrenderer_config(&self) {
+        let (Some(x2t), Some(sdkjs)) = (&self.x2t, &self.sdkjs_dir) else {
+            return;
+        };
+        generate_doctrenderer_config(x2t, sdkjs, &self.webapps_dir);
+    }
+
+    /// The x2t script-cache rule (KAO round 2 §D): code caching
+    /// writes sdk-all.cache beside sdkjs/{word,cell,slide}, and
+    /// a stale sdk-all.bin snapshot makes x2t silently run OLD
+    /// sdkjs. Whenever the sdkjs fingerprint changes, purge
+    /// both. The fingerprint is the FNV of the six sdk-all
+    /// files, stamped in the user cache dir.
+    fn purge_stale_sdkjs_caches(&self) {
+        let Some(sdkjs) = &self.sdkjs_dir else { return };
+        // Both trees: the editor's and the renderer's deploy
+        // tree (cycle 3: the caches were observed in
+        // sdkjs-deploy after the first successful PDF run).
+        let mut roots: Vec<PathBuf> = vec![sdkjs.clone()];
+        if let Some(x2t) = &self.x2t {
+            if let Some(deploy) = x2t
+                .parent()
+                .and_then(|c| c.parent())
+                .map(|r| r.join("sdkjs-deploy"))
+            {
+                if deploy.is_dir() {
+                    roots.push(deploy);
+                }
+            }
+        }
+        let mut fingerprint = String::new();
+        let mut caches: Vec<PathBuf> = Vec::new();
+        for root in &roots {
+            for ed in ["word", "cell", "slide"] {
+                for f in ["sdk-all-min.js", "sdk-all.js"] {
+                    fingerprint.push_str(&fnv_file(&root.join(ed).join(f)).unwrap_or_default());
+                }
+                for f in ["sdk-all.cache", "sdk-all.bin"] {
+                    let p = root.join(ed).join(f);
+                    if p.exists() {
+                        caches.push(p);
+                    }
+                }
+            }
+        }
+        let stamp_path = gtk4::glib::user_cache_dir()
+            .join("joffice")
+            .join("sdkjs-fingerprint");
+        let prev = std::fs::read_to_string(&stamp_path).unwrap_or_default();
+        if prev != fingerprint {
+            if !caches.is_empty() {
+                let n = caches.len();
+                for c in &caches {
+                    let _ = std::fs::remove_file(c);
+                }
+                eprintln!(
+                    "joffice: SDKJS_CACHE_PURGED {n} file(s) — sdkjs changed since the last run"
+                );
+            }
+            if let Some(parent) = stamp_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&stamp_path, &fingerprint);
+        } else if !caches.is_empty() {
+            eprintln!(
+                "joffice: sdkjs caches present ({}), fingerprint current — kept",
+                caches.len()
+            );
+        }
+    }
+
     /// Record a font substitution (deduped) and show the banner.
     fn note_substitution(&self, real: &str, fallback: &str) {
         {
@@ -1305,6 +1470,10 @@ enum Policy {
     /// Legacy binary (doc/xls/ppt): never overwritten — x2t has
     /// no legacy binary writer, so "save" can only mean Save As.
     SaveAsOnly,
+    /// PDF (marathon 2 cycle 3, KAO round 1 §5): opens in the
+    /// PDF viewer's view mode. The bound file is NEVER written;
+    /// Save As writes a byte-identical copy.
+    ViewOnly,
 }
 
 fn kind_of_code(code: i32) -> Option<EditorKind> {
@@ -1328,6 +1497,7 @@ fn policy_of_code(code: i32) -> Policy {
         }
         fmt::ODT | fmt::ODS | fmt::ODP | fmt::RTF | fmt::TXT | fmt::CSV => Policy::AskOnce,
         fmt::DOC | fmt::XLS | fmt::PPT => Policy::SaveAsOnly,
+        fmt::PDF => Policy::ViewOnly,
         _ => Policy::InPlace,
     }
 }
@@ -1930,6 +2100,9 @@ fn detect_format(path: &Path) -> Detected {
     if head.starts_with(b"{\\rtf") {
         return Detected::Format(fmt::RTF);
     }
+    if head.starts_with(b"%PDF-") {
+        return Detected::Format(fmt::PDF);
+    }
     Detected::Unknown
 }
 
@@ -2192,6 +2365,171 @@ fn temp_stem(tag: &str) -> String {
     format!("joffice-{tag}-{}-{n}", std::process::id())
 }
 
+/// The x2t spawn discipline (marathon 2 cycle 3, KAO round 2 §F):
+/// ONE spawn path for every x2t invocation — the shell's UI
+/// conversions and the hidden `--x2t` CLI mode both come through
+/// run_x2t, so a CLI retest and an in-shell export are the same
+/// experiment by construction. The child gets a CLEARED
+/// environment plus an explicit allowlist (the GTK/WebKit process
+/// environment leaks GIO/GDK variables that change converter
+/// behavior — the recurring environment-gap failure mode), a
+/// fixed working directory (the converter's own dir, the stock
+/// layout's implied cwd), /dev/null stdin, and a per-run ledger
+/// record: the params XML, the environment passed, and a
+/// best-effort /proc snapshot of the child's real environ/cwd.
+fn x2t_env_allowlist() -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    for key in ["PATH", "LD_LIBRARY_PATH", "HOME", "LANG", "LC_ALL", "TZ"] {
+        if let Ok(v) = std::env::var(key) {
+            env.push((key.to_string(), v));
+        }
+    }
+    env
+}
+
+/// Extract DoctRenderer error codes from x2t's stderr (KAO
+/// round 1 §2 instrumentation): the renderer reports failures
+/// as an XML-ish `<error code="N"/>` inside its result line;
+/// "calculate" (a JS exception inside the renderer) is the one
+/// behind the exit-80 family. Every code found becomes an
+/// X2T_RENDER_ERROR ledger line.
+fn parse_render_errors(stderr: &str) -> Vec<String> {
+    let mut codes = Vec::new();
+    for line in stderr.lines() {
+        let mut rest = line;
+        while let Some(pos) = rest.find("error code=") {
+            let tail = &rest[pos + "error code=".len()..];
+            let tail = tail.trim_start_matches(['"', '\'']);
+            let code: String = tail
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            if !code.is_empty() && !codes.contains(&code) {
+                codes.push(code);
+            }
+            rest = tail;
+        }
+    }
+    codes
+}
+
+struct X2tOutcome {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Write the generated DoctRenderer.config beside x2t when its
+/// content differs (see Shell::ensure_doctrenderer_config for
+/// the why). Shared by the shell and the --x2t CLI mode so both
+/// run the converter against the same configuration.
+fn generate_doctrenderer_config(x2t: &Path, sdkjs: &Path, webapps: &Path) {
+    let Some(conv_dir) = x2t.parent() else { return };
+    let cfg_path = conv_dir.join("DoctRenderer.config");
+    // The renderer needs the DEPLOY sdkjs tree (sdk-all
+    // bundles — InitNativeEditors lives in common/apiBase.js
+    // inside them); the tree the editor runs is a develop
+    // checkout without bundles, which is exactly why PDF
+    // conversion died with "InitNativeEditors is not a
+    // function" (cycle 3, X0). When the runtime carries a
+    // staged sdkjs-deploy (from the deb's editors tree), the
+    // config points there; the generated path-keyed
+    // AllFonts.js is staged into it the same way.
+    let rt_root = conv_dir.parent().map(|p| p.to_path_buf());
+    let deploy = rt_root.as_ref().map(|r| r.join("sdkjs-deploy"));
+    let renderer_sdkjs: PathBuf = match &deploy {
+        Some(d) if d.is_dir() => d.clone(),
+        _ => sdkjs.to_path_buf(),
+    };
+    let sdkjs_s = renderer_sdkjs.display();
+    let webapps_s = webapps.display();
+    let dict_dir = conv_dir.join("../dictionaries");
+    let dict_line = if dict_dir.is_dir() {
+        format!(
+            "<dictionaries>{}</dictionaries>\n",
+            dict_dir.canonicalize().unwrap_or(dict_dir).display()
+        )
+    } else {
+        String::new()
+    };
+    let content = format!(
+        "<Settings>\n<file>{sdkjs_s}/common/Native/native.js</file>\n<file>{sdkjs_s}/common/Native/jquery_native.js</file>\n<allfonts>{sdkjs_s}/common/AllFonts.js</allfonts>\n<file>{webapps_s}/vendor/xregexp/xregexp-all-min.js</file>\n<sdkjs>{sdkjs_s}</sdkjs>\n{dict_line}</Settings>\n"
+    );
+    let existing = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+    if existing == content {
+        eprintln!("joffice: DoctRenderer.config current (generated, absolute paths)");
+        return;
+    }
+    match std::fs::write(&cfg_path, &content) {
+        Ok(()) => eprintln!(
+            "joffice: DoctRenderer.config GENERATED at {} (absolute paths)",
+            cfg_path.display()
+        ),
+        Err(e) => eprintln!(
+            "joffice: DoctRenderer.config NOT written ({}): {e} — a packaged runtime must ship its own",
+            cfg_path.display()
+        ),
+    }
+}
+
+/// Spawn x2t on a params file through the single disciplined
+/// path. `extra_env` rides on top of the allowlist (the caller
+/// pins TMPDIR to the conversion's private temp root).
+fn run_x2t(
+    x2t: &Path,
+    params_path: &Path,
+    extra_env: &[(String, String)],
+) -> Result<X2tOutcome, String> {
+    let params_xml = std::fs::read_to_string(params_path).unwrap_or_default();
+    let mut env = x2t_env_allowlist();
+    for (k, v) in extra_env {
+        env.retain(|(ek, _)| ek != k);
+        env.push((k.clone(), v.clone()));
+    }
+    let cwd = x2t.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+    let mut cmd = Command::new(x2t);
+    cmd.arg(params_path)
+        .env_clear()
+        .envs(env.iter().cloned())
+        .current_dir(&cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = cmd.spawn().map_err(|e| format!("run x2t: {e}"))?;
+    let pid = child.id();
+    // Ledger: what we MEANT to pass, plus the child's real
+    // /proc state sampled immediately (best effort — a fast
+    // child may already be gone; the passed-env record stands).
+    let proc_env = std::fs::read(format!("/proc/{pid}/environ"))
+        .map(|b| {
+            String::from_utf8_lossy(&b)
+                .split('\0')
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_else(|_| "<unavailable>".to_string());
+    let proc_cwd = std::fs::read_link(format!("/proc/{pid}/cwd"))
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unavailable>".to_string());
+    eprintln!(
+        "joffice: X2T_RUN pid={pid} cwd={proc_cwd} proc_env={proc_env} params={}",
+        params_xml.replace('\n', " ")
+    );
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("wait for x2t: {e}"))?;
+    let stderr_text = String::from_utf8_lossy(&out.stderr);
+    for code in parse_render_errors(&stderr_text) {
+        eprintln!("joffice: X2T_RENDER_ERROR code={code}");
+    }
+    Ok(X2tOutcome {
+        status: out.status,
+        stdout: out.stdout,
+        stderr: out.stderr,
+    })
+}
+
 /// Run x2t synchronously (call only from a worker thread).
 /// Params XML root is TaskQueueDataConvert — Task with bare children is
 /// not the schema x2t parses. Paths are escaped.
@@ -2209,6 +2547,7 @@ fn x2t_convert_sync(
     allfonts_path: Option<&Path>,
     theme_dir: Option<&Path>,
     csv_delim: Option<i32>,
+    pdfa: bool,
 ) -> Result<Vec<u8>, String> {
     let t_start = std::time::Instant::now();
     let stem = temp_stem("x2t");
@@ -2285,6 +2624,11 @@ fn x2t_convert_sync(
             csv_delim.unwrap_or(4)
         ));
     }
+    // PDF/A (marathon 2 cycle 3, KAO round 1 §2): the stock
+    // desktop sends format 513 plus this flag, NOT format 521.
+    if format_to == fmt::PDF {
+        extra.push_str(&format!("  <m_bIsPDFA>{pdfa}</m_bIsPDFA>\n"));
+    }
 
     let params = format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
@@ -2304,10 +2648,14 @@ fn x2t_convert_sync(
     );
     std::fs::write(&params_path, params).map_err(|e| format!("write x2t params: {e}"))?;
 
-    let out = Command::new(x2t)
-        .arg(&params_path)
-        .output()
-        .map_err(|e| format!("run x2t: {e}"))?;
+    // TMPDIR pinned to the private temp root: x2t's own scratch
+    // (beyond m_sTempDir) must not land in the shared system temp
+    // either (the cycle-2 contamination lesson, generalized).
+    let extra_env = vec![(
+        "TMPDIR".to_string(),
+        work_temp.display().to_string(),
+    )];
+    let out = run_x2t(x2t, &params_path, &extra_env)?;
 
     let _ = std::fs::remove_file(&params_path);
     let _ = std::fs::remove_file(&from_tmp);
@@ -2338,6 +2686,7 @@ fn x2t_convert_async(
     from: PathBuf,
     format_to: i32,
     format_from: Option<i32>,
+    pdfa: bool,
     done: impl FnOnce(Result<Vec<u8>, String>) + 'static,
 ) {
     let x2t = match shell.x2t.clone() {
@@ -2381,6 +2730,7 @@ fn x2t_convert_async(
             allfonts.as_deref(),
             theme_dir.as_deref(),
             csv_delim,
+            pdfa,
         );
         let _ = tx.send(result);
     });
@@ -2464,8 +2814,11 @@ fn editor_entry_url(pending: Option<&PathBuf>, cfg: &JofficeConfig) -> String {
     // (web-apps apps/api/documents/index.html.desktop). Ours
     // come from the shell config: the real name by default, a
     // persisted UUID for the id.
+    // PDFs open in the viewer's view mode (cycle 3, step 6):
+    // annotation tools hidden, nothing writable.
+    let mode = if doctype == "pdf" { "view" } else { "edit" };
     format!(
-        "joffice:///apps/api/documents/index.html?type=desktop&doctype={doctype}&key=joffice-{hash:016x}&url=_offline_&title={}&filetype={}&mode=edit&lang=en&userid={}&username={}",
+        "joffice:///apps/api/documents/index.html?type=desktop&doctype={doctype}&key=joffice-{hash:016x}&url=_offline_&title={}&filetype={}&mode={mode}&lang=en&userid={}&username={}",
         query_escape(&title),
         query_escape(&ext),
         query_escape(&cfg.user_id),
@@ -2536,8 +2889,29 @@ fn handle_uri_scheme(shell: &Rc<Shell>, req: &URISchemeRequest) {
     // unfinished) and poll until it lands or times out — the
     // editor's image load simply waits, which is exactly the
     // semantics the synchronous LocalFileGetImageUrl needs.
-    if let Some(name) = rel.strip_prefix("docmedia/") {
+    // Document-stored media arrives under two prefixes: the
+    // inserted-image rewrite (docmedia/<name>) and the trapped
+    // document base URL (docbase/media/<name>, cycle 3 I1).
+    let docmedia_name = rel
+        .strip_prefix("docmedia/")
+        .or_else(|| rel.strip_prefix("docbase/media/"));
+    if let Some(name) = docmedia_name {
         let name = name.to_string();
+        // Traversal guard (cycle 3, I2): a media name is a bare
+        // file name, never a path. Anything else is refused
+        // with a literal 403 response — the staged lookup below
+        // is by exact name, but the refusal must be explicit,
+        // not a hold-and-timeout.
+        if name.contains('/') || name.contains('\\') || name.starts_with('.') {
+            eprintln!("joffice: DOCMEDIA_403 refused media name: {name}");
+            let stream =
+                gtk4::gio::MemoryInputStream::from_bytes(&gtk4::glib::Bytes::from(&[][..]));
+            let response = webkit6::URISchemeResponse::new(&stream, 0);
+            response.set_status(403, None);
+            response.set_content_type("text/plain");
+            req.finish_with_response(&response);
+            return;
+        }
         enum Stage {
             Ready(PathBuf),
             Failed,
@@ -2896,7 +3270,13 @@ fn shell_is_dirty(shell: &Rc<Shell>) -> bool {
     let doc = shell.doc.borrow();
     match doc.as_ref() {
         Some(d) => {
-            d.policy != Policy::InPlace && d.policy != Policy::InPlaceMacro && !d.is_new
+            // ViewOnly (cycle 3): nothing can ever be written,
+            // so the policy term must not make a PDF window
+            // prompt on close forever; the mirror decides.
+            d.policy != Policy::InPlace
+                && d.policy != Policy::InPlaceMacro
+                && d.policy != Policy::ViewOnly
+                && !d.is_new
         }
         None => false,
     }
@@ -3151,6 +3531,62 @@ fn refuse_encrypted(shell: &Rc<Shell>, path: &Path) {
     }
 }
 
+/// Extract the open document's STORED media into the session
+/// media dir (marathon 2 cycle 3, I1): sdkjs builds document
+/// image URLs as <documentUrl>/media/<name> with documentUrl
+/// forced to file:///<doc path> by EndLoad (common/Local/
+/// common.js), and WebKit refuses to load file:// subresources
+/// from the joffice:// page — every stored image rendered as
+/// blank while round-tripping byte-identically. The shim's
+/// LocalFileGetImageUrlCorrect rewrites those URLs to
+/// joffice:///docmedia/<name>; this extraction is what lets
+/// the scheme handler actually serve them, through the same
+/// route as inserted images. A new open replaces the document,
+/// so previously staged media (inserted images included) is
+/// cleared first.
+fn extract_doc_media(shell: &Rc<Shell>, path: &Path) {
+    {
+        let mut staged = shell.staged_images.borrow_mut();
+        let names: Vec<String> = staged.keys().cloned().collect();
+        staged.clear();
+        drop(staged);
+        for n in names {
+            let _ = std::fs::remove_file(shell.media_dir.join(&n));
+        }
+    }
+    let Ok(data) = std::fs::read(path) else { return };
+    let Some(entries) = zip_central_dir(&data) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&shell.media_dir);
+    let mut count = 0;
+    for e in &entries {
+        let parts: Vec<&str> = e.name.split('/').collect();
+        if parts.len() == 3
+            && parts[1] == "media"
+            && !parts[2].is_empty()
+            && !parts[2].contains("..")
+            && matches!(parts[0], "word" | "ppt" | "xl")
+        {
+            let name = parts[2].to_string();
+            if let Some(bytes) = zip_entry_data(&data, e) {
+                let dest = shell.media_dir.join(&name);
+                if std::fs::write(&dest, &bytes).is_ok() {
+                    shell
+                        .staged_images
+                        .borrow_mut()
+                        .insert(name, ImageStage::Ready(dest));
+                    count += 1;
+                }
+            }
+        }
+    }
+    eprintln!(
+        "joffice: DOCMEDIA_EXTRACT {count} file(s) from {}",
+        path.display()
+    );
+}
+
 /// Release any scheme requests held for a staged image whose
 /// copy just landed (or failed): re-dispatch them through the
 /// scheme handler logic by finishing them here.
@@ -3196,6 +3632,441 @@ fn save_output_sane(dest: &Path, bytes: &[u8]) -> bool {
         }
         _ => !bytes.is_empty(),
     }
+}
+
+/// Parse a page-range spec ("2-3", "1,3-5", "4") into 1-based
+/// page numbers within `total`. None = not a usable subset
+/// spec (empty, unparsable, or covering everything).
+fn parse_page_spec(spec: &str, total: u32) -> Option<Vec<u32>> {
+    let mut pages: Vec<u32> = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((a, b)) = part.split_once('-') {
+            let a: u32 = a.trim().parse().ok()?;
+            let b: u32 = b.trim().parse().ok()?;
+            if a == 0 || b < a {
+                return None;
+            }
+            pages.extend(a..=b);
+        } else {
+            let p: u32 = part.parse().ok()?;
+            if p == 0 {
+                return None;
+            }
+            pages.push(p);
+        }
+    }
+    pages.retain(|p| *p <= total);
+    pages.dedup();
+    if pages.is_empty() || pages.len() as u32 == total {
+        return None;
+    }
+    Some(pages)
+}
+
+/// Find a helper tool on PATH or in the usual Nix profile
+/// locations (the shell's own PATH under the launcher carries
+/// the build shell's, not necessarily the user's tools).
+fn find_tool(name: &str) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(path) = std::env::var("PATH") {
+        candidates.extend(std::env::split_paths(&path).map(|p| p.join(name)));
+    }
+    candidates.push(PathBuf::from("/run/current-system/sw/bin").join(name));
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(PathBuf::from(home).join(".nix-profile/bin").join(name));
+    }
+    candidates.into_iter().find(|p| p.exists())
+}
+
+/// Page count of a PDF via pdfinfo (None when unavailable —
+/// slicing then simply does not happen and the dialog's own
+/// range is the user's only control, recorded in the ledger).
+fn pdf_page_count(pdf: &Path) -> Option<u32> {
+    let tool = find_tool("pdfinfo")?;
+    let out = Command::new(tool).arg(pdf).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("Pages:") {
+            return v.trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// Self-slice a PDF to the given 1-based pages (KAO round 2
+/// §E: never trust the backend with ranges — Print to File
+/// IGNORES them for source-file jobs; the job always goes out
+/// with pages ALL). pdfseparate + pdfunite do the work.
+fn slice_pdf_pages(pdf: &Path, pages: &[u32]) -> Result<PathBuf, String> {
+    let separate = find_tool("pdfseparate").ok_or("pdfseparate not found")?;
+    let unite = find_tool("pdfunite").ok_or("pdfunite not found")?;
+    let dir = std::env::temp_dir().join(temp_stem("slice"));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("slice dir: {e}"))?;
+    let pattern = dir.join("p-%d.pdf");
+    let out = Command::new(&separate)
+        .arg(pdf)
+        .arg(&pattern)
+        .output()
+        .map_err(|e| format!("run pdfseparate: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "pdfseparate failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let mut parts: Vec<PathBuf> = Vec::new();
+    for p in pages {
+        let part = dir.join(format!("p-{p}.pdf"));
+        if !part.exists() {
+            return Err(format!("page {p} missing after pdfseparate"));
+        }
+        parts.push(part);
+    }
+    let sliced = dir.join("sliced.pdf");
+    let out = Command::new(&unite)
+        .args(&parts)
+        .arg(&sliced)
+        .output()
+        .map_err(|e| format!("run pdfunite: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "pdfunite failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(sliced)
+}
+
+/// A print-intent save (cycle 3 step 4): convert the bin to a
+/// temp PDF, then hand it to the print dialog path.
+fn begin_print_export(
+    shell: &Rc<Shell>,
+    reply: ScriptMessageReply,
+    ctx: Context,
+    tmp_bin: PathBuf,
+    kind: EditorKind,
+    pages_spec: Option<String>,
+    origin: String,
+) {
+    if shell.pending_print.borrow().is_some() {
+        save_fail(
+            shell,
+            &reply,
+            "print: another print is already open".to_string(),
+            &origin,
+        );
+        return;
+    }
+    let shell_c = shell.clone();
+    x2t_convert_async(
+        shell,
+        tmp_bin,
+        fmt::PDF,
+        Some(kind.canvas_code()),
+        false,
+        move |result| match result {
+            Ok(bytes) => {
+                let pdf_path =
+                    std::env::temp_dir().join(format!("{}.pdf", temp_stem("print")));
+                match std::fs::write(&pdf_path, &bytes) {
+                    Ok(()) => begin_print(
+                        &shell_c,
+                        Some((reply, ctx)),
+                        pdf_path,
+                        true,
+                        pages_spec,
+                        Some(origin),
+                    ),
+                    Err(e) => save_fail(
+                        &shell_c,
+                        &reply,
+                        format!("write print PDF: {e}"),
+                        &origin,
+                    ),
+                }
+            }
+            Err(e) => save_fail(&shell_c, &reply, format!("print export: {e}"), &origin),
+        },
+    );
+}
+
+/// Evidence for the cycle-3 print grades: which GTK print
+/// backend modules exist beside the loaded libgtk (a dialog
+/// showing only Print to File = the CUPS backend module was
+/// never found = an ENVIRONMENT failure, recorded as such).
+fn probe_print_environment() {
+    let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+    for line in maps.lines() {
+        if let Some(pos) = line.find("/libgtk-4") {
+            let path = line[pos..].trim();
+            if let Some(dir) = Path::new(path).parent() {
+                let bd = dir.join("gtk-4.0/printbackends");
+                let mut modules: Vec<String> = Vec::new();
+                if let Ok(rd) = std::fs::read_dir(&bd) {
+                    for e in rd.flatten() {
+                        modules.push(e.file_name().to_string_lossy().into_owned());
+                    }
+                }
+                eprintln!(
+                    "joffice: PRINT-ENV libgtk={} backends_dir={} modules={:?}",
+                    path,
+                    bd.display(),
+                    modules
+                );
+                return;
+            }
+        }
+    }
+    eprintln!("joffice: PRINT-ENV libgtk not found in /proc/self/maps");
+}
+
+/// The print dialog path, shared by print-intent exports and
+/// ViewOnly PDFs (whose ORIGINAL bytes are printed — no editor
+/// round-trip). `origin` is Some when the reply belongs to a
+/// saveFile cycle (save_done bookkeeping applies), None for a
+/// direct printRequest on a PDF window.
+fn begin_print(
+    shell: &Rc<Shell>,
+    reply: Option<(ScriptMessageReply, Context)>,
+    pdf_path: PathBuf,
+    owned: bool,
+    editor_spec: Option<String>,
+    origin: Option<String>,
+) {
+    if shell.pending_print.borrow().is_some() {
+        match (&origin, &reply) {
+            (Some(o), Some((r, c))) => save_fail(
+                shell,
+                r,
+                "print: another print is already open".to_string(),
+                o,
+            ),
+            (_, Some((r, c))) => reply_json(
+                r,
+                c,
+                &serde_json::json!({ "ok": false, "error": "another print is already open" }),
+            ),
+            _ => show_save_banner(shell, "A print is already open."),
+        }
+        return;
+    }
+    *shell.pending_print.borrow_mut() = Some(PendingPrint {
+        reply,
+        pdf_path,
+        owned,
+        slice_path: None,
+        origin: origin.clone().unwrap_or_else(|| "print".to_string()),
+        from_save: origin.is_some(),
+    });
+    *shell.print_editor_spec.borrow_mut() = editor_spec;
+    show_print_dialog(shell);
+}
+
+/// Complete a parked print exactly once: reply + bookkeeping +
+/// temp cleanup. A cancel replies as a cancelled EXPORT
+/// (EndSave(1) class) with NO error presenter.
+fn finish_print(shell: &Rc<Shell>, outcome: Result<(), String>, sent: bool) {
+    let Some(p) = shell.pending_print.borrow_mut().take() else {
+        return;
+    };
+    *shell.print_editor_spec.borrow_mut() = None;
+    if let Some(slice) = &p.slice_path {
+        let _ = std::fs::remove_file(slice);
+    }
+    if p.owned {
+        let _ = std::fs::remove_file(&p.pdf_path);
+    }
+    match outcome {
+        Ok(()) => {
+            eprintln!("joffice: PRINT completed (sent={sent})");
+            if let Some((r, c)) = &p.reply {
+                reply_save(shell, r, c, &serde_json::json!({ "ok": true, "printed": sent }));
+            }
+            if p.from_save {
+                save_done(shell, true);
+            }
+        }
+        Err(e) if e == "__cancelled__" => {
+            eprintln!("joffice: PRINT cancelled by user");
+            if let Some((r, c)) = &p.reply {
+                reply_save(
+                    shell,
+                    r,
+                    c,
+                    &serde_json::json!({ "ok": false, "cancelled": true, "error": "print cancelled" }),
+                );
+            }
+            if p.from_save {
+                save_done(shell, false);
+            }
+        }
+        Err(e) => {
+            eprintln!("joffice: PRINT failed: {e}");
+            if p.from_save {
+                if let Some((r, _)) = &p.reply {
+                    save_fail(shell, r, format!("print: {e}"), &p.origin);
+                }
+            } else {
+                show_save_banner(shell, &format!("Print failed: {e}"));
+                if let Some((r, c)) = &p.reply {
+                    reply_json(r, c, &serde_json::json!({ "ok": false, "error": e }));
+                }
+            }
+        }
+    }
+}
+
+/// GtkPrintUnixDialog (in-process — NOT the GtkPrintDialog
+/// portal API, KAO round 1 §3) over the parked print. Ranges
+/// are read from the dialog's own settings at Accept time and
+/// applied by SELF-SLICING; the job always goes out as ALL
+/// pages of the (possibly sliced) file.
+fn show_print_dialog(shell: &Rc<Shell>) {
+    let Some(parent) = shell.window.borrow().clone() else {
+        finish_print(shell, Err("no window for the print dialog".to_string()), false);
+        return;
+    };
+    let name = shell
+        .doc
+        .borrow()
+        .as_ref()
+        .map(|d| d.display_name.clone())
+        .unwrap_or_else(|| "document".to_string());
+    let dialog = gtk4::PrintUnixDialog::new(Some(&format!("Print — {name}")), Some(&parent));
+    dialog.set_manual_capabilities(
+        gtk4::PrintCapabilities::PAGE_SET
+            | gtk4::PrintCapabilities::COPIES
+            | gtk4::PrintCapabilities::COLLATE,
+    );
+    dialog.set_support_selection(false);
+    dialog.set_has_selection(false);
+    *shell.print_dialog.borrow_mut() = Some(dialog.clone());
+    let shell_c = shell.clone();
+    // The handler must run ONCE: d.close() inside the Accept
+    // arm re-emits `response` (DeleteEvent), and without this
+    // guard the re-entry consumed the pending print and
+    // reported every accepted job as cancelled (cycle 3 PR2
+    // drive: "PRINT pages=None printer=PDF" followed by
+    // "PRINT cancelled by user", no job ever sent).
+    let responded = std::rc::Rc::new(std::cell::Cell::new(false));
+    dialog.connect_response(move |d, resp| {
+        if responded.replace(true) {
+            return;
+        }
+        *shell_c.print_dialog.borrow_mut() = None;
+        let accepted =
+            matches!(resp, ResponseType::Ok | ResponseType::Accept | ResponseType::Apply);
+        if !accepted {
+            d.close();
+            finish_print(&shell_c, Err("__cancelled__".to_string()), false);
+            return;
+        }
+        let Some(printer) = d.selected_printer() else {
+            d.close();
+            finish_print(&shell_c, Err("no printer selected".to_string()), false);
+            return;
+        };
+        // The virtual-printer trap (round 1 §3): a printer
+        // that cannot take PDF directly would get PostScript /
+        // SVG from the job and degrade silently. Refuse it.
+        if !printer.accepts_pdf() {
+            let pname = printer.name().to_string();
+            d.close();
+            finish_print(
+                &shell_c,
+                Err(format!(
+                    "printer “{pname}” does not accept PDF directly — refusing rather than degrading to PostScript"
+                )),
+                false,
+            );
+            return;
+        }
+        let settings = d.settings();
+        let page_setup = d.page_setup();
+        // Effective page list: the dialog's ranges win; the
+        // editor's nativeOptions spec is the fallback; page-set
+        // (even/odd) filters last.
+        let (pdf_path, total) = {
+            let p = shell_c.pending_print.borrow();
+            match p.as_ref() {
+                Some(p) => (p.pdf_path.clone(), pdf_page_count(&p.pdf_path)),
+                None => (PathBuf::new(), None),
+            }
+        };
+        let mut pages: Option<Vec<u32>> = None;
+        if let Some(total) = total {
+            let ranges = settings.page_ranges();
+            let dialog_spec: Option<Vec<u32>> = if ranges.is_empty() {
+                None
+            } else {
+                let mut v: Vec<u32> = Vec::new();
+                for r in &ranges {
+                    v.extend((r.start() as u32 + 1)..=(r.end() as u32 + 1));
+                }
+                if v.len() as u32 == total && v.first() == Some(&1) {
+                    None
+                } else {
+                    Some(v)
+                }
+            };
+            pages = dialog_spec.or_else(|| {
+                shell_c
+                    .print_editor_spec
+                    .borrow()
+                    .as_deref()
+                    .and_then(|s| parse_page_spec(s, total))
+            });
+            if let Some(v) = &mut pages {
+                match settings.page_set() {
+                    gtk4::PageSet::Even => v.retain(|p| p % 2 == 0),
+                    gtk4::PageSet::Odd => v.retain(|p| p % 2 == 1),
+                    _ => {}
+                }
+                if v.is_empty() {
+                    pages = None;
+                }
+            }
+        }
+        eprintln!(
+            "joffice: PRINT pages={:?} printer={} total={:?}",
+            pages,
+            printer.name(),
+            total
+        );
+        let source: PathBuf = match &pages {
+            Some(v) => match slice_pdf_pages(&pdf_path, v) {
+                Ok(s) => {
+                    if let Some(p) = shell_c.pending_print.borrow_mut().as_mut() {
+                        p.slice_path = Some(s.clone());
+                    }
+                    s
+                }
+                Err(e) => {
+                    d.close();
+                    finish_print(&shell_c, Err(e), false);
+                    return;
+                }
+            },
+            None => pdf_path.clone(),
+        };
+        let job = gtk4::PrintJob::new(&format!("jOffice — {name}"), &printer, &settings, &page_setup);
+        if let Err(e) = job.set_source_file(&source.display().to_string()) {
+            d.close();
+            finish_print(&shell_c, Err(format!("print job source: {e}")), false);
+            return;
+        }
+        d.close();
+        let shell_j = shell_c.clone();
+        job.send(move |_job, result| match result {
+            Ok(()) => finish_print(&shell_j, Ok(()), true),
+            Err(e) => finish_print(&shell_j, Err(format!("print job: {e}")), false),
+        });
+    });
+    dialog.present();
 }
 
 /// Shared tail of every save (marathon 2 §4): sanity check →
@@ -3411,6 +4282,49 @@ fn handle_bridge(
                 );
                 return;
             }
+            if matches!(detect_format(&path), Detected::Format(c) if c == fmt::PDF) {
+                // ViewOnly (marathon 2 cycle 3): the PDF editor
+                // consumes the RAW PDF bytes — its drawingfile
+                // engine renders them itself; x2t never touches
+                // an opened PDF. (Recorded deviation from KAO
+                // round 2 §C's "bytes by URL": the pinned 9.3.8
+                // Local contract has no host URL-open path —
+                // binary_content:// + GetOpenedFile is the only
+                // channel, and it is synchronous.)
+                if msg.cmd == "openFile" {
+                    *shell.current_path.borrow_mut() = Some(path.clone());
+                    shell.note_document_opened(&path);
+                    set_doc_state(shell, Some(path.clone()), fmt::PDF, false);
+                    eprintln!(
+                        "joffice: DOC-DETECT path={} code=513 policy=ViewOnly",
+                        path.display()
+                    );
+                }
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                return match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        use base64::Engine;
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        eprintln!(
+                            "joffice: PDF-OPEN raw bytes={} path={}",
+                            bytes.len(),
+                            path.display()
+                        );
+                        reply_json(
+                            reply,
+                            ctx,
+                            &serde_json::json!({
+                                "data": b64, "images": {}, "name": name,
+                                "boundSaved": false, "rawPdf": true
+                            }),
+                        );
+                    }
+                    Err(e) => reply_err(reply, format!("read pdf: {e}")),
+                };
+            }
             // Cycle 2: an openFile (the editor's own Open flow)
             // re-targets the doc state; a convertFile belongs to
             // the pendingFile open, whose state is already set.
@@ -3438,9 +4352,24 @@ fn handle_bridge(
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            // Stored-media extraction (cycle 3, I1) when this
+            // conversion is the open document's own (compare /
+            // merge conversions of OTHER files must not clobber
+            // the open document's staged media).
+            {
+                let is_doc_open = shell
+                    .doc
+                    .borrow()
+                    .as_ref()
+                    .map(|d| d.path.as_deref() == Some(path.as_path()))
+                    .unwrap_or(false);
+                if is_doc_open {
+                    extract_doc_media(shell, &path);
+                }
+            }
             let reply_c = reply.clone();
             let ctx_c = ctx.clone();
-            x2t_convert_async(shell, path, fmt::BIN, None, move |result| match result {
+            x2t_convert_async(shell, path, fmt::BIN, None, false, move |result| match result {
                 Ok(bytes) => {
                     use base64::Engine;
                     let t_enc = std::time::Instant::now();
@@ -3475,6 +4404,7 @@ fn handle_bridge(
                 .unwrap_or("user")
                 .to_string();
             let js_seq = msg.args.get("seq").and_then(|v| v.as_i64()).unwrap_or(-1);
+            *shell.save_reply_seq.borrow_mut() = Some(js_seq);
             eprintln!(
                 "joffice: [save-ledger] RUST-SAVE seq={} origin={} mirror={:?} cellEditing={}",
                 js_seq,
@@ -3494,6 +4424,49 @@ fn handle_bridge(
                 .get("fileType")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0) as i32;
+            // Cycle 3 fields from the shim: the editor's own
+            // modified verdict at LocalFileSave time (§6a), the
+            // print intent parsed out of the Download-As JSON
+            // options (isPrint + the desktop nativeOptions
+            // range), and the PDF/A toggle for PDF targets.
+            let unmodified = msg
+                .args
+                .get("unmodified")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let print_intent = msg
+                .args
+                .get("printIntent")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let print_pages = msg
+                .args
+                .get("printPages")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let pdfa = msg
+                .args
+                .get("pdfa")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            // Absorbed flush (cycle 3, S1′ mechanism): the
+            // shim held this gesture's changes-flush and ran
+            // it as a full saveFile so the editor gets its
+            // EndSave round-trip (which merges the changes
+            // into the document state) — but NOTHING is
+            // converted or written here; the gesture's own
+            // save, which follows, persists the merged bin.
+            if msg.args.get("absorb").and_then(|v| v.as_bool()).unwrap_or(false) {
+                eprintln!("joffice: SAVE-ABSORBED seq={js_seq} (round-trip only, no write)");
+                reply_save(
+                    shell,
+                    reply,
+                    ctx,
+                    &serde_json::json!({ "ok": true }),
+                );
+                save_done(shell, true);
+                return;
+            }
             use base64::Engine;
             let t_dec = Instant::now();
             let bin = match base64::engine::general_purpose::STANDARD.decode(b64) {
@@ -3538,6 +4511,60 @@ fn handle_bridge(
                 }
             };
 
+            // ViewOnly (cycle 3): a PDF window never writes its
+            // bound file. A print intent prints the ORIGINAL
+            // bytes through the step-4 path; a plain save is a
+            // no-op success with a banner (annotation state in
+            // the viewer is simply not persisted); Save As /
+            // Download-As parks a byte-copy dialog below.
+            if policy == Policy::ViewOnly {
+                let src = doc_path.clone().expect("view-only doc has a path");
+                if print_intent {
+                    let _ = std::fs::remove_file(&tmp_bin);
+                    begin_print(
+                        shell,
+                        Some((reply.clone(), ctx.clone())),
+                        src,
+                        false,
+                        print_pages,
+                        Some(origin),
+                    );
+                    return;
+                }
+                if !save_as && file_type == 0 {
+                    let _ = std::fs::remove_file(&tmp_bin);
+                    show_save_banner(shell, "PDFs open read-only — changes were not saved.");
+                    eprintln!("joffice: VIEWONLY-SAVE refused write (no-op success)");
+                    reply_save(
+                        shell,
+                        reply,
+                        ctx,
+                        &serde_json::json!({ "ok": true, "unedited": true }),
+                    );
+                    save_done(shell, true);
+                    return;
+                }
+                // Save As / Download-As: fall through to the
+                // Dialog route with copy_source set.
+            }
+
+            // Print intent (cycle 3, step 4): export the bin to
+            // a temp PDF, self-slice the requested range, then
+            // the native print dialog. The bridge reply resolves
+            // when the job is sent or cancelled.
+            if print_intent && policy != Policy::ViewOnly {
+                begin_print_export(
+                    shell,
+                    reply.clone(),
+                    ctx.clone(),
+                    tmp_bin,
+                    kind,
+                    print_pages,
+                    origin,
+                );
+                return;
+            }
+
             // Route decision.
             enum Route {
                 Bound(i32),
@@ -3549,7 +4576,7 @@ fn handle_bridge(
             } else {
                 match policy {
                     Policy::InPlace | Policy::InPlaceMacro => Route::Bound(origin_code),
-                    Policy::SaveAsOnly => Route::Dialog,
+                    Policy::SaveAsOnly | Policy::ViewOnly => Route::Dialog,
                     Policy::AskOnce => {
                         // The persistent preference applies only
                         // to the formats round 2 §D allows to
@@ -3577,6 +4604,31 @@ fn handle_bridge(
             match route {
                 Route::Bound(code) => {
                     let dest = doc_path.clone().expect("bound route has a path");
+                    if unmodified && *shell.save_failed_outstanding.borrow() {
+                        eprintln!(
+                            "joffice: SAVE-UNEDITED refused: a failed save is outstanding; converting for real"
+                        );
+                    }
+                    if unmodified && !*shell.save_failed_outstanding.borrow() {
+                        // §6a (KAO round 1): an unedited document
+                        // is never converted — Ctrl+S on an
+                        // unedited bound doc is a no-op success.
+                        // (Also covers the AskOnce keep-pref
+                        // route: nothing to write, nothing to
+                        // ask about.)
+                        let _ = std::fs::remove_file(&tmp_bin);
+                        eprintln!(
+                            "joffice: SAVE-UNEDITED no-op (code={code}, origin={origin})"
+                        );
+                        reply_save(
+                            shell,
+                            reply,
+                            ctx,
+                            &serde_json::json!({ "ok": true, "unedited": true }),
+                        );
+                        save_done(shell, true);
+                        return;
+                    }
                     convert_and_write(
                         shell,
                         reply.clone(),
@@ -3587,6 +4639,7 @@ fn handle_bridge(
                         seq,
                         origin,
                         AfterWrite::Bound,
+                        pdfa,
                     );
                 }
                 Route::Dialog | Route::AskOnce => {
@@ -3652,6 +4705,13 @@ fn handle_bridge(
                         filters: Vec::new(),
                         doc_path: doc_path.clone(),
                         origin_code,
+                        pdfa,
+                        unmodified,
+                        copy_source: if policy == Policy::ViewOnly {
+                            doc_path.clone()
+                        } else {
+                            None
+                        },
                     });
                     if is_askonce {
                         show_askonce(shell);
@@ -3663,6 +4723,48 @@ fn handle_bridge(
             return;
         }
 
+
+        "printRequest" => {
+            // The shim's Print(json) (cycle 3): the editor's
+            // print flow asks the host to print. For a document
+            // editor, printing = a print-intent PDF export of
+            // the current bin (the reply here only acks the
+            // kick-off; the export's own saveFile cycle carries
+            // the outcome). For a ViewOnly PDF window, the
+            // ORIGINAL bytes go straight to the print path.
+            let pages = msg
+                .args
+                .get("pages")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            let policy = shell.doc.borrow().as_ref().map(|d| d.policy);
+            if policy == Some(Policy::ViewOnly) {
+                let src = shell.doc.borrow().as_ref().and_then(|d| d.path.clone());
+                match src {
+                    Some(src) => {
+                        begin_print(
+                            shell,
+                            Some((reply.clone(), ctx.clone())),
+                            src,
+                            false,
+                            pages,
+                            None,
+                        );
+                    }
+                    None => reply_json(
+                        reply,
+                        ctx,
+                        &serde_json::json!({ "ok": false, "error": "no PDF open" }),
+                    ),
+                }
+                return;
+            }
+            *shell.print_editor_spec.borrow_mut() = pages;
+            eval_in_view(shell, "window.__joPrintExport && window.__joPrintExport()");
+            eprintln!("joffice: PRINT-REQUEST export kicked");
+            reply_json(reply, ctx, &serde_json::json!({ "ok": true }));
+        }
 
         "createNew" => {
             *shell.current_path.borrow_mut() = None;
@@ -3872,7 +4974,34 @@ fn save_done(shell: &Rc<Shell>, success: bool) {
         let mut n = shell.saves_active.borrow_mut();
         *n = n.saturating_sub(1);
     }
+    *shell.save_reply_seq.borrow_mut() = None;
     maybe_finish_close(shell, success);
+}
+
+/// Dual-channel save-reply delivery (cycle 3): deferred
+/// postMessage replies (native-dialog completions) were
+/// observed arriving in the shim as EMPTY objects — a
+/// cancelled Save As then read as a bound success. Every
+/// save completion therefore ALSO goes through
+/// evaluate_javascript into the shim's waiter registry.
+fn deliver_save_reply_js(shell: &Rc<Shell>, v: &serde_json::Value) {
+    let Some(seq) = *shell.save_reply_seq.borrow() else {
+        return;
+    };
+    let js = format!(
+        "window.__joDeliverSaveReply && window.__joDeliverSaveReply({seq}, {v})"
+    );
+    eval_in_view(shell, &js);
+}
+
+fn reply_save(
+    shell: &Rc<Shell>,
+    reply: &ScriptMessageReply,
+    ctx: &Context,
+    v: &serde_json::Value,
+) {
+    reply_json(reply, ctx, v);
+    deliver_save_reply_js(shell, v);
 }
 
 /// Convert the staged Editor.bin to `code` and write it to
@@ -3890,6 +5019,7 @@ fn convert_and_write(
     seq: u64,
     origin: String,
     after: AfterWrite,
+    pdfa: bool,
 ) {
     let kind = kind_of_code(code).unwrap_or(EditorKind::Word);
     // The macro check applies when both the target and the
@@ -3911,6 +5041,7 @@ fn convert_and_write(
         tmp_bin,
         code,
         Some(kind.canvas_code()),
+        pdfa,
         move |result| {
             match result {
                 Ok(bytes) => {
@@ -3928,7 +5059,8 @@ fn convert_and_write(
                             note_save_success(&shell_c);
                             match after {
                                 AfterWrite::Bound => {
-                                    reply_json(
+                                    reply_save(
+                                        &shell_c,
                                         &reply,
                                         &ctx,
                                         &serde_json::json!({ "ok": true }),
@@ -3944,14 +5076,16 @@ fn convert_and_write(
                                         code,
                                         false,
                                     );
-                                    reply_json(
+                                    reply_save(
+                                        &shell_c,
                                         &reply,
                                         &ctx,
                                         &serde_json::json!({ "ok": true, "adopted": true }),
                                     );
                                 }
                                 AfterWrite::Export => {
-                                    reply_json(
+                                    reply_save(
+                                        &shell_c,
                                         &reply,
                                         &ctx,
                                         &serde_json::json!({ "ok": true, "export": true }),
@@ -3977,9 +5111,14 @@ fn take_pending_save(shell: &Rc<Shell>) -> Option<PendingSave> {
 /// Cancel the parked save: reply cancelled (the shim owes the
 /// editor its EndSave(1) — round 2 restatement 3), clean up.
 fn cancel_pending_save(shell: &Rc<Shell>) {
+    eprintln!(
+        "joffice: CANCEL-PENDING pending={}",
+        shell.pending_save.borrow().is_some()
+    );
     if let Some(p) = take_pending_save(shell) {
         let _ = std::fs::remove_file(&p.tmp_bin);
-        reply_json(
+        reply_save(
+            shell,
             &p.reply,
             &p.ctx,
             &serde_json::json!({ "ok": false, "cancelled": true }),
@@ -4011,8 +5150,23 @@ fn show_save_dialog(shell: &Rc<Shell>) {
     );
     let _ = dialog.set_current_folder(Some(&gtk4::gio::File::for_path(&preset_dir)));
     dialog.set_current_name(&preset_name);
+    let (filter_code, copy_source) = {
+        let p = shell.pending_save.borrow();
+        let p = p.as_ref();
+        (
+            p.map(|p| p.filter_code).unwrap_or(fmt::DOCX),
+            p.and_then(|p| p.copy_source.clone()),
+        )
+    };
+    // A ViewOnly Save As offers ONLY the PDF copy (cycle 3);
+    // everything else offers the family's full choice list.
+    let choices: Vec<(i32, &str)> = if copy_source.is_some() {
+        vec![(fmt::PDF, "PDF")]
+    } else {
+        save_as_choices(kind)
+    };
     let mut filter_objs: Vec<(FileFilter, i32)> = Vec::new();
-    for (code, label) in save_as_choices(kind).iter() {
+    for (code, label) in choices.iter() {
         let f = FileFilter::new();
         f.set_name(Some(label));
         if let Some(ext) = ext_of_code(*code) {
@@ -4021,9 +5175,16 @@ fn show_save_dialog(shell: &Rc<Shell>) {
         dialog.add_filter(&f);
         filter_objs.push((f, *code));
     }
-    // The native filter is added first, which is the choice the
-    // dialog opens on; the response handler reads the ACTIVE
-    // filter back, so the default never has to be forced here.
+    // Preselect the pending save's target filter (cycle 3
+    // fix): the native filter is added first and the portal
+    // opens on it, so an explicit Download-As target (PDF)
+    // left the DOCX filter "active" and the response
+    // adjudication rejected the .pdf name as another editor's
+    // format. The response handler reads the ACTIVE filter
+    // back — it must be the intended one.
+    if let Some((f, _)) = filter_objs.iter().find(|(_, c)| *c == filter_code) {
+        dialog.set_filter(f);
+    }
     if let Some(p) = shell.pending_save.borrow_mut().as_mut() {
         p.filters = filter_objs;
     }
@@ -4031,6 +5192,11 @@ fn show_save_dialog(shell: &Rc<Shell>) {
     let shell_c = shell.clone();
     dialog.connect_response(move |d, resp| {
         *shell_c.active_dialog.borrow_mut() = None;
+        eprintln!(
+            "joffice: SAVE-DIALOG response={resp:?} file={:?} filter={:?}",
+            d.file().and_then(|f| f.path()),
+            d.filter().and_then(|f| f.name())
+        );
         if resp != ResponseType::Accept {
             cancel_pending_save(&shell_c);
             return;
@@ -4096,6 +5262,62 @@ fn show_save_dialog(shell: &Rc<Shell>) {
         let Some(p) = take_pending_save(&shell_c) else {
             return;
         };
+        // Byte-copy completions (cycle 3): a ViewOnly Save As
+        // copies the PDF; an UNEDITED document saved as its own
+        // format copies the original bytes (§6a — never
+        // converted). A copy onto itself is identity: succeed
+        // without touching the file.
+        let copy_from = p.copy_source.clone().or_else(|| {
+            if p.unmodified
+                && format == p.origin_code
+                && !*shell_c.save_failed_outstanding.borrow()
+            {
+                p.doc_path.clone()
+            } else {
+                None
+            }
+        });
+        if let Some(src) = copy_from {
+            let _ = std::fs::remove_file(&p.tmp_bin);
+            let same = src.canonicalize().ok() == path.canonicalize().ok();
+            let result = if same {
+                Ok(())
+            } else {
+                std::fs::read(&src)
+                    .map_err(|e| format!("read copy source: {e}"))
+                    .and_then(|bytes| {
+                        write_save_checked(&shell_c, &path, &bytes, p.seq).map(|_| ())
+                    })
+            };
+            match result {
+                Ok(()) => {
+                    eprintln!(
+                        "joffice: SAVE-COPY {} -> {} (viewonly={} same={})",
+                        src.display(),
+                        path.display(),
+                        p.copy_source.is_some(),
+                        same
+                    );
+                    if p.copy_source.is_none() {
+                        // §6a Save As adopts the new path, like
+                        // a converted Save As would.
+                        set_doc_state(&shell_c, Some(path.clone()), format, false);
+                        *shell_c.current_path.borrow_mut() = Some(path.clone());
+                        shell_c.note_document_opened(&path);
+                        refresh_chrome(&shell_c);
+                    }
+                    reply_save(
+                        &shell_c,
+                        &p.reply,
+                        &p.ctx,
+                        &serde_json::json!({ "ok": true, "unedited": true }),
+                    );
+                    save_done(&shell_c, true);
+                }
+                Err(e) => save_fail(&shell_c, &p.reply, e, &p.origin),
+            }
+            return;
+        }
         let after = if code_is_native(format) {
             AfterWrite::Adopt
         } else {
@@ -4111,6 +5333,7 @@ fn show_save_dialog(shell: &Rc<Shell>) {
             p.seq,
             p.origin.clone(),
             after,
+            p.pdfa,
         );
     });
     dialog.show();
@@ -4339,6 +5562,27 @@ fn show_askonce(shell: &Rc<Shell>) {
                 return;
             };
             let dest = p.doc_path.clone().expect("askonce has a bound path");
+            if p.unmodified && *shell_c.save_failed_outstanding.borrow() {
+                eprintln!(
+                    "joffice: SAVE-UNEDITED askonce-keep refused: a failed save is outstanding; converting for real"
+                );
+            }
+            if p.unmodified && !*shell_c.save_failed_outstanding.borrow() {
+                // §6a (cycle 3): "Keep format" on an unedited
+                // document writes nothing — there is nothing to
+                // convert. (The ask still happened; the write
+                // is the no-op.)
+                let _ = std::fs::remove_file(&p.tmp_bin);
+                eprintln!("joffice: SAVE-UNEDITED askonce-keep no-op");
+                reply_save(
+                    &shell_c,
+                    &p.reply,
+                    &p.ctx,
+                    &serde_json::json!({ "ok": true, "unedited": true }),
+                );
+                save_done(&shell_c, true);
+                return;
+            }
             convert_and_write(
                 &shell_c,
                 p.reply.clone(),
@@ -4349,6 +5593,7 @@ fn show_askonce(shell: &Rc<Shell>) {
                 p.seq,
                 p.origin.clone(),
                 AfterWrite::Bound,
+                p.pdfa,
             );
         });
     }
@@ -4714,6 +5959,52 @@ fn main() {
     // Parse CLI args ONCE, before the app exists. GApplication re-fires
     // activate on a second launch; re-parsing args there would be stale.
     let args: Vec<String> = std::env::args().collect();
+    // Hidden x2t CLI mode (marathon 2 cycle 3, KAO round 2 §F):
+    // `joffice-shell --x2t <params.xml>` runs ONE conversion
+    // through the same disciplined spawn the UI uses and exits
+    // with x2t's code — CLI retests and in-shell exports are the
+    // same experiment by construction. No GTK is started.
+    if args.len() >= 3 && args[1] == "--x2t" {
+        let params_path = PathBuf::from(&args[2]);
+        let x2t = std::env::var_os("JOFFICE_X2T")
+            .map(PathBuf::from)
+            .filter(|p| p.exists())
+            .or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|e| e.parent().map(|p| p.join("../converter/x2t")))
+                    .filter(|p| p.exists())
+            })
+            .unwrap_or_else(|| PathBuf::from("x2t"));
+        // Same generated converter configuration the shell
+        // runs with (the CLI mode constructs no Shell).
+        {
+            let rt_root = x2t.parent().and_then(|c| c.parent()).map(|p| p.to_path_buf());
+            let sdkjs = std::env::var_os("JOFFICE_SDKJS")
+                .map(PathBuf::from)
+                .filter(|p| p.is_dir())
+                .or_else(|| rt_root.as_ref().map(|r| r.join("sdkjs")))
+                .unwrap_or_else(|| PathBuf::from("sdkjs"));
+            let webapps = std::env::var_os("JOFFICE_WEBAPPS")
+                .map(PathBuf::from)
+                .filter(|p| p.is_dir())
+                .or_else(|| rt_root.as_ref().map(|r| r.join("web-apps")))
+                .unwrap_or_else(|| PathBuf::from("web-apps"));
+            generate_doctrenderer_config(&x2t, &sdkjs, &webapps);
+        }
+        match run_x2t(&x2t, &params_path, &[]) {
+            Ok(out) => {
+                use std::io::Write;
+                let _ = std::io::stdout().write_all(&out.stdout);
+                let _ = std::io::stderr().write_all(&out.stderr);
+                std::process::exit(out.status.code().unwrap_or(1));
+            }
+            Err(e) => {
+                eprintln!("joffice: --x2t mode failed: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
     let mut pending_file: Option<PathBuf> = None;
     let mut i = 1;
     while i < args.len() {
@@ -5108,6 +6399,54 @@ fn main() {
         *shell.badge_label.borrow_mut() = Some(badge_label.clone());
         vbox.append(&badge_label);
 
+        // Action row (cycle 3): native Export as PDF… / Print…
+        // entries beside the badge. Export drives the editor's
+        // own Download-As machinery (asc_DownloadAs → the
+        // saveFile export route); Print drives the print-intent
+        // export for document editors, or the original-bytes
+        // path for a ViewOnly PDF. Visible only with a document
+        // open (refresh_chrome).
+        let action_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        action_row.set_margin_start(12);
+        action_row.set_margin_end(12);
+        action_row.set_margin_top(3);
+        action_row.set_margin_bottom(3);
+        let export_btn = gtk4::Button::with_label("Export as PDF…");
+        let print_btn = gtk4::Button::with_label("Print…");
+        action_row.append(&export_btn);
+        action_row.append(&print_btn);
+        action_row.set_visible(false);
+        *shell.action_row.borrow_mut() = Some(action_row.clone());
+        vbox.append(&action_row);
+        {
+            let shell_e = shell.clone();
+            export_btn.connect_clicked(move |_| {
+                eval_in_view(&shell_e, "window.__joExportPdf && window.__joExportPdf()");
+            });
+        }
+        {
+            let shell_p = shell.clone();
+            print_btn.connect_clicked(move |_| {
+                let (policy, src) = {
+                    let doc = shell_p.doc.borrow();
+                    (
+                        doc.as_ref().map(|d| d.policy),
+                        doc.as_ref().and_then(|d| d.path.clone()),
+                    )
+                };
+                if policy == Some(Policy::ViewOnly) {
+                    if let Some(src) = src {
+                        begin_print(&shell_p, None, src, false, None, None);
+                    }
+                } else {
+                    eval_in_view(
+                        &shell_p,
+                        "window.__joPrintExport && window.__joPrintExport()",
+                    );
+                }
+            });
+        }
+
         // Autosave banner (restatement 7): 'changes'-origin save
         // failures surface here, never as a modal.
         let save_banner_label = gtk4::Label::new(None);
@@ -5196,6 +6535,7 @@ fn main() {
             window.maximize();
         }
         window.present();
+        probe_print_environment();
     });
 
     // Run with a FILTERED argv: GtkApplication's own option parser

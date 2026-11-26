@@ -81,9 +81,25 @@
         lastPushedModified: null, // last onDocumentModifiedChanged value
         handshakeSent: false,
         cellEditing: false,
+        replyWaiters: {},     // seq -> settle fn (dual-channel replies)
         nextOrigin: null      // 'changes' when LocalFileSaveChanges delegates
     };
     window.__joSave = joSave;
+
+    // Dual-channel save-reply delivery (cycle 3): Rust evaluates
+    // this in the top frame; the top frame forwards to the
+    // editor frame, whose copy settles the seq's waiter.
+    window.__joDeliverSaveReply = function (seq, res) {
+        if (joSave.replyWaiters[seq]) {
+            joSave.replyWaiters[seq](res);
+            return true;
+        }
+        var ref = getEditor();
+        if (ref.ew && ref.ew !== window && ref.ew.__joDeliverSaveReply) {
+            return ref.ew.__joDeliverSaveReply(seq, res);
+        }
+        return false;
+    };
 
     // Inserted-image bookkeeping: dialog handle -> {name,
     // localName}; localName -> info. LocalFileGetImageUrl must
@@ -174,7 +190,30 @@
             return;
         }
         joSave.pendingSeq = null;
+        if (joSave.absorbSeq === seq && joSave.absorbResolve) {
+            var absorbRes = joSave.absorbResolve;
+            joSave.absorbSeq = null;
+            joSave.absorbResolve = null;
+            absorbRes();
+        }
         var code = JO_ENDSAVE_CODE[outcome];
+        // bin_index assertion (cycle 3, round 2 §B): the bin
+        // this EndSave(0) vouches for was captured at
+        // History.Index == lastBinIndex; if UserSavedIndex has
+        // since moved, the bytes and the bookkeeping disagree —
+        // downgrade to a failure EndSave rather than lie.
+        if (code === 0 && joSave.lastBinIndex !== null && joSave.lastBinSeq === seq) {
+            try {
+                var usi = window.AscCommon && window.AscCommon.History
+                    ? window.AscCommon.History.UserSavedIndex : null;
+                if (usi !== null && usi !== joSave.lastBinIndex) {
+                    joLedger('SAVE_INDEX_MISMATCH', seq, {
+                        binIndex: joSave.lastBinIndex, userSavedIndex: usi
+                    });
+                    code = 1;
+                }
+            } catch (e) { /* assertion is best-effort */ }
+        }
         var ref = getEditor();
         var w = ref.ew || window;
         joLedger('endsave', seq, { outcome: outcome, code: code });
@@ -184,6 +223,10 @@
             console.error('[jOffice] DesktopOfflineAppDocumentEndSave MISSING at EndSave time');
         }
         joCheckDisagree('endsave');
+        // The cycle closes AFTER the real EndSave ran (its
+        // LastUserSavedIndex clear is the one legitimate
+        // mid-cycle write). Deferred requests re-run from here.
+        joOnCycleEnd(code === 0);
     }
 
     // The modified handshake (round 2 §B): right after EndLoad,
@@ -194,6 +237,8 @@
     function joHandshake() {
         if (joSave.handshakeSent) return;
         joSave.handshakeSent = true;
+        joOpenStage.stage = 'ready';
+        console.log('[jOffice][measure] OPEN_STAGE ready t=' + Date.now());
         var ref = getEditor();
         var direct = null;
         try {
@@ -249,6 +294,10 @@
                 var wrapped = function (isSaveAs, password, isForce, docinfo, options) {
                     joSave.started = true;
                     joSave.startSaveSeen = true;
+                    // A save cycle opens (cycle 3): from here to
+                    // EndSave, asc_Save requests are serialized
+                    // by the wrapper above, never re-entered.
+                    joSave.cycle = { t: Date.now(), orphanLogged: false };
                     joLedger('startsave', joSave.pendingSeq, { isSaveAs: !!isSaveAs });
                     return orig.apply(this, arguments);
                 };
@@ -257,6 +306,228 @@
                 console.log('[jOffice][save-ledger] StartSave wrap asserted');
             }
         }, 25);
+    })();
+
+    // -----------------------------------------------------------
+    // Save serialization (marathon 2 cycle 3, KAO round 2 §A —
+    // the cycle-2 CSV/TXT failure fix). Verified against the
+    // pinned 9.3.8 sources: all three editors define
+    // asc_Save(isNoUserSave, isSaveAs, isResaveAttack, options),
+    // and every asc_Save with IsUserSave writes
+    // editor.LastUserSavedIndex = History.UserSavedIndex BEFORE
+    // the canSave gate. sdkjs holds ONE LastUserSavedIndex slot
+    // and EndSave(error) restores UserSavedIndex from it — so a
+    // second asc_Save landing while a save cycle is open
+    // silently moves the restore point (the flaw in round 1's
+    // EndSave fan-out, withdrawn in round 2). The discipline:
+    //   - same-gesture requests are gated for one macrotask and
+    //     only the best-ranked runs (RANK flush 0 < user 1 <
+    //     saveas 2) — the cycle-2 collision was a flush and a
+    //     user save arriving in the same gesture;
+    //   - during an open cycle, requests NEVER touch sdkjs:
+    //     they land in a single best-ranked deferred slot and
+    //     are re-run (saveas always; user/flush only when the
+    //     cycle ended ok AND the document still has changes) or
+    //     dropped with a SAVE_DROPPED ledger line;
+    //   - a property trap on editor.LastUserSavedIndex raises
+    //     LUSI_WRITE_IN_CYCLE on any mid-cycle write that is not
+    //     EndSave's own clear (undefined);
+    //   - the bin_index assertion: History.Index captured when
+    //     the bin bytes are taken must equal History.
+    //     UserSavedIndex when a bound_ok EndSave is delivered,
+    //     else the EndSave is downgraded to code 1.
+    // Reset_SavedIndex timing (round 2's open check, answered
+    // from the pinned source): in Local mode askSaveChanges
+    // invokes its callback SYNCHRONOUSLY, so History.
+    // Reset_SavedIndex(IsUserSave) runs INSIDE asc_Save, before
+    // StartSave — UserSavedIndex has already advanced when the
+    // bin is captured, which is what makes the assertion
+    // meaningful for the async paths it guards.
+    // -----------------------------------------------------------
+    joSave.deferred = null;   // { ed, orig, args, kind, rank }
+    joSave.gateTimer = null;
+    joSave.gateList = null;
+    joSave.cycle = null;      // { t, orphanLogged } StartSave..EndSave
+    joSave.lastBinIndex = null;
+    joSave.lastBinSeq = null;
+    joSave.trailingFlush = false;
+    joSave.gesture = false;
+    joSave.gestureTimer = null;
+    joSave.heldFlush = null;
+    joSave.absorbRunning = false;
+    joSave.absorbPending = false;
+    joSave.absorbNext = false;
+    joSave.absorbSeq = null;
+    joSave.absorbResolve = null;
+    joSave.absorbPromise = null;
+    joSave.flushTimer = null;
+    joSave.printPages = null;
+    // Open-stage breadcrumbs (cycle 3, step 5).
+    var joOpenStage = { stage: 'idle', t0: 0, beat: null };
+    window.__joOpenStage = joOpenStage;
+
+    function joSaveKind(args) {
+        if (args[1]) return 'saveas';
+        if (args[3] && (args[3].fileType !== undefined || args[3].isNaturalDownload)) return 'saveas';
+        if (args[0] === true) return 'flush';
+        return 'user';
+    }
+    var JO_SAVE_RANK = { flush: 0, user: 1, saveas: 2 };
+
+    function joSerializedSave(ed, orig, args) {
+        var kind = joSaveKind(args);
+        var req = { ed: ed, orig: orig, args: args, kind: kind, rank: JO_SAVE_RANK[kind] };
+        if (joSave.cycle) {
+            if (!joSave.deferred || req.rank >= joSave.deferred.rank) {
+                joSave.deferred = req;
+            }
+            joLedger('SAVE_DEFERRED', null, { kind: kind, kept: joSave.deferred.kind });
+            return;
+        }
+        if (!joSave.gateList) joSave.gateList = [];
+        joSave.gateList.push(req);
+        if (joSave.gateTimer === null) {
+            joSave.gateTimer = setTimeout(function () {
+                joSave.gateTimer = null;
+                var list = joSave.gateList;
+                joSave.gateList = null;
+                if (!list || !list.length) return;
+                var best = list[0];
+                for (var i = 1; i < list.length; i++) {
+                    if (list[i].rank >= best.rank) best = list[i];
+                }
+                if (list.length > 1) {
+                    joLedger('SAVE_PICK', null, {
+                        picked: best.kind,
+                        from: list.map(function (r) { return r.kind; }).join('+')
+                    });
+                }
+                // Gesture flag (cycle 3, S1′): askSaveChanges
+                // flushes changes SYNCHRONOUSLY inside asc_Save,
+                // before StartSave opens the cycle and before
+                // the gesture's own LocalFileSave exists — the
+                // debounce/fold checks keyed on pendingSeq and
+                // cycle both miss it, and the flush's delegated
+                // save wrote the pending edit into the ORIGINAL
+                // during a Save As (the cycle-2 S1 leak). While
+                // a gesture is being applied, LocalFileSaveChanges
+                // folds: the changes are inside the bin this
+                // gesture is about to capture.
+                joSave.gesture = true;
+                if (joSave.gestureTimer !== null) clearTimeout(joSave.gestureTimer);
+                joSave.gestureTimer = setTimeout(function () {
+                    joSave.gestureTimer = null;
+                    joSave.gesture = false;
+                }, 15000);
+                best.orig.apply(best.ed, best.args);
+            }, 0);
+        }
+    }
+
+    function joOnCycleEnd(ok) {
+        joSave.cycle = null;
+        var d = joSave.deferred;
+        joSave.deferred = null;
+        if (!d) return;
+        if (d.kind === 'saveas') {
+            joLedger('SAVE_RERUN', null, { kind: d.kind });
+            joSerializedSave(d.ed, d.orig, d.args);
+            return;
+        }
+        var dirty = true;
+        try {
+            if (typeof d.ed.Have_Changes === 'function') dirty = !!d.ed.Have_Changes();
+            else if (typeof d.ed.isDocumentModified === 'function') dirty = !!d.ed.isDocumentModified();
+        } catch (e) { /* keep the permissive default */ }
+        if (ok && dirty) {
+            joLedger('SAVE_RERUN', null, { kind: d.kind });
+            joSerializedSave(d.ed, d.orig, d.args);
+        } else {
+            joLedger('SAVE_DROPPED', null, { kind: d.kind, ok: ok, dirty: dirty });
+        }
+    }
+
+    // Document-URL trap (cycle 3, I1): EndLoad forces
+    // g_oDocumentUrls.documentUrl to a file:// URL, and the
+    // document image loaders (GlobalLoaders / editorscommon)
+    // build file:///.../media/<name> URLs from it and load
+    // them DIRECTLY — bypassing LocalFileGetImageUrlCorrect —
+    // so WebKit blocks every stored image. Trap the property:
+    // whatever sdkjs assigns, the stored value is our
+    // joffice:// base, and getImageUrl yields
+    // joffice:///docbase/media/<name>, which the scheme
+    // handler serves from the staged extraction.
+    (function installDocUrlTrap() {
+        setInterval(function () {
+            var ac = window.AscCommon || (getEditor().ew && getEditor().ew.AscCommon);
+            var urls = ac && ac.g_oDocumentUrls;
+            if (!urls || urls.__joTrapped) return;
+            try {
+                Object.defineProperty(urls, 'documentUrl', {
+                    configurable: true,
+                    enumerable: true,
+                    get: function () { return 'joffice:///docbase'; },
+                    set: function (v) {
+                        if (!urls.__joLogged) {
+                            urls.__joLogged = true;
+                            console.log('[jOffice] documentUrl trapped (sdkjs assigned: ' + v + ')');
+                        }
+                    }
+                });
+                urls.__joTrapped = true;
+            } catch (e) { /* retry next tick */ }
+        }, 25);
+    })();
+
+    (function installSaveGuards() {
+        setInterval(function () {
+            var ref = getEditor();
+            var ed = ref && ref.editor;
+            if (!ed) return;
+            if (typeof ed.asc_Save === 'function' && !ed.asc_Save.__joWrapped) {
+                var orig = ed.asc_Save;
+                var wrapped = function () {
+                    joSerializedSave(ed, orig, Array.prototype.slice.call(arguments));
+                };
+                wrapped.__joWrapped = true;
+                try {
+                    ed.asc_Save = wrapped;
+                    console.log('[jOffice][save-ledger] asc_Save serialization wrap asserted');
+                } catch (e) { /* prototype-only object; retry next tick */ }
+            }
+            if (!ed.__joLusiTrapped) {
+                try {
+                    var cur = ed.LastUserSavedIndex;
+                    Object.defineProperty(ed, 'LastUserSavedIndex', {
+                        configurable: true,
+                        enumerable: true,
+                        get: function () { return cur; },
+                        set: function (v) {
+                            if (joSave.cycle && v !== undefined) {
+                                joLedger('LUSI_WRITE_IN_CYCLE', joSave.pendingSeq, {
+                                    value: v,
+                                    stack: (new Error().stack || '').split('\n').slice(1, 4).join(' | ')
+                                });
+                            }
+                            cur = v;
+                        }
+                    });
+                    ed.__joLusiTrapped = true;
+                    console.log('[jOffice][save-ledger] LastUserSavedIndex trap asserted');
+                } catch (e) { /* leave untrapped; the ledger notes it once */
+                    ed.__joLusiTrapped = 'failed';
+                }
+            }
+        }, 25);
+        // SAVE_ORPHAN watchdog (round 2 §A): a cycle open for
+        // over two minutes is a lost EndSave by definition.
+        setInterval(function () {
+            if (joSave.cycle && !joSave.cycle.orphanLogged
+                && Date.now() - joSave.cycle.t > 120000) {
+                joSave.cycle.orphanLogged = true;
+                joLedger('SAVE_ORPHAN', joSave.pendingSeq, { ageMs: Date.now() - joSave.cycle.t });
+            }
+        }, 30000);
     })();
 
     // Entry points Rust calls (via evaluate_javascript on the
@@ -278,6 +549,40 @@
         var started = ew.__joSave ? !!ew.__joSave.started : false;
         return JSON.stringify({ started: started });
     };
+    // Export as PDF… / Print… (cycle 3): driven by the native
+    // action bar and by the printRequest bridge. Both go
+    // through the editor's own Download-As machinery
+    // (asc_DownloadAs → asc_Save with isSaveAs) — never
+    // asc_nativeGetFile directly — so the save ledger, the
+    // serialization wrapper, and the EndSave contract all
+    // apply unchanged. Print adds isPdfPrint, which the
+    // LocalFileSave JSON options carry to Rust as the print
+    // intent.
+    window.__joExportPdf = function () {
+        var ref = getEditor();
+        if (!ref.editor || typeof ref.editor.asc_DownloadAs !== 'function') return false;
+        ref.editor.asc_DownloadAs(joDownloadOptions(513, false));
+        return true;
+    };
+    window.__joPrintExport = function () {
+        var ref = getEditor();
+        if (!ref.editor || typeof ref.editor.asc_DownloadAs !== 'function') return false;
+        ref.editor.asc_DownloadAs(joDownloadOptions(513, true));
+        return true;
+    };
+    // The Download-As options object sdkjs expects (pinned
+    // AdvancedOptions.js): a real asc_CDownloadOptions, not a
+    // bare literal — StartSave reads fileType / isPdfPrint /
+    // nativeOptions off it.
+    function joDownloadOptions(fileType, isPrint) {
+        var A = window.Asc || (getEditor().ew && getEditor().ew.Asc);
+        if (A && typeof A.asc_CDownloadOptions === 'function') {
+            var o = new A.asc_CDownloadOptions(fileType, false);
+            if (isPrint) o.isPdfPrint = true;
+            return o;
+        }
+        return { fileType: fileType, isPdfPrint: !!isPrint, isNaturalDownload: false };
+    }
     window.__joSaveStarted = function () {
         var ref = getEditor();
         var ew = ref.ew || window;
@@ -390,7 +695,9 @@
         IsProtectionSupport: function () { return false; },
         isBlockchainSupport: function () { return false; },
         IsSupportMedia: function () { return false; },
-        IsFilePrinting: function () { return false; },
+        // Printing exists (cycle 3): the probe gates the
+        // web-apps print UI, so it answers true now.
+        IsFilePrinting: function () { return true; },
         isSupportMacroses: function () { return false; },
         isSupportPlugins: function () { return false; },
         // Synchronous answers from local caches (marathon 2
@@ -419,8 +726,21 @@
         // until the staged copy lands). Anything else passes
         // through unchanged. (Marathon 2 cycle 2.)
         LocalFileGetImageUrlCorrect: function (url) {
+            // Inserted images (cycle 2): rewrite only names the
+            // insert path staged. Document-STORED media (cycle
+            // 3, I1): EndLoad forces documentUrl to
+            // file:///<doc path>, so EVERY stored image arrives
+            // here as file:///.../media/<name> — rewrite those
+            // to the docmedia route too; Rust extracted the
+            // document's media at open and serves it from the
+            // same handler. file: only: a name the extraction
+            // did not stage simply 404s there instead of being
+            // blocked as a file:// subresource.
             var m = /\/media\/([^\/\?#]+)$/.exec(url || '');
             if (m && joImages.byName[m[1]]) return 'joffice:///docmedia/' + m[1];
+            if (m && typeof url === 'string' && url.indexOf('file:') === 0) {
+                return 'joffice:///docmedia/' + m[1];
+            }
             return url;
         },
 
@@ -456,7 +776,28 @@
         PluginInstall: function () { console.log('[jOffice] stub PluginInstall'); },
         PluginUninstall: function () { console.log('[jOffice] stub PluginUninstall'); },
         PreloadCryptoImage: function () { console.log('[jOffice] stub PreloadCryptoImage'); },
-        Print: function () { console.log('[jOffice] stub Print'); },
+        // Printing (cycle 3, step 4): sdkjs's _printDesktop
+        // hands us the desktop options JSON — nativeOptions
+        // carries the range the editor's own print dialog
+        // collected. Rust owns the rest: for document editors
+        // it kicks a print-intent PDF export back through
+        // asc_Save (the range rides along via joSave.
+        // printPages); for a ViewOnly PDF it prints the
+        // original bytes directly.
+        Print: function (json) {
+            var pages = null;
+            try {
+                var o = JSON.parse(json || '{}');
+                var no = o.nativeOptions || (o.advancedOptions && o.advancedOptions.nativeOptions);
+                if (no && no.pages != null) pages = String(no.pages);
+                else if (o.pages != null) pages = String(o.pages);
+            } catch (e) { /* range stays null = all pages */ }
+            joSave.printPages = pages;
+            console.log('[jOffice] Print requested pages=' + pages);
+            bridge('printRequest', { pages: pages }).catch(function (e) {
+                console.error('[jOffice] printRequest failed: ' + (e && e.message ? e.message : e));
+            });
+        },
         Print_Start: function () { console.log('[jOffice] stub Print_Start'); },
         Print_Page: function () { console.log('[jOffice] stub Print_Page'); },
         Print_End: function () { console.log('[jOffice] stub Print_End'); },
@@ -546,8 +887,46 @@
             // the user did not explicitly start get the banner
             // treatment on failure, never a modal (Kagi round 2
             // restatement 7).
+            //
+            // Cycle 3 (round 2 §A, second layer): the flush
+            // carries serialized CHANGES, not a document — the
+            // real desktop host owes it no EndSave. The shim's
+            // delegation to a full LocalFileSave is what made
+            // AskOnce documents emit the paired flush+user saves
+            // that collided in cycle 2; the cycle-3 serialization
+            // wrapper (gate + cycle + deferred slot) is what
+            // keeps the pair from colliding now, NOT any
+            // suppression of the flush itself. The pinned flow
+            // explains the pair: inside ONE asc_Save,
+            // askSaveChanges' synchronous callback runs
+            // Apply_Changes → saveChanges → THIS function first,
+            // and only then does asc_Save reach StartSave + the
+            // document LocalFileSave.
+            // Delegate IMMEDIATELY (cycle-3 final form,
+            // reverting the debounce/fold/hold experiments):
+            // the gesture's bin only contains the current
+            // changes if this flush's save round-trip
+            // completes before the gesture's StartSave
+            // snapshot — the immediate delegation is what
+            // cycle 2 shipped and what the s1b ledger
+            // proves (flush EndSave precedes startsave,
+            // both bins carry the edit). Debouncing,
+            // folding, and absorbing were each tried and
+            // each silently dropped the edit from the
+            // written file. The one fold kept: a flush
+            // arriving while ANOTHER save is in flight
+            // (pendingSeq set) trails — that save is a
+            // different gesture, the editor stays dirty,
+            // and the changes re-flush afterwards.
+            if (joSave.pendingSeq !== null) {
+                joSave.trailingFlush = true;
+                joLedger('SAVE_TRAILING_FLUSH', joSave.pendingSeq, {});
+                return;
+            }
             joSave.nextOrigin = 'changes';
-            return window.AscDesktopEditor.LocalFileSave(_param, _password, _docinfo, _fileType, _jsonOptions);
+            window.AscDesktopEditor.LocalFileSave.apply(
+                window.AscDesktopEditor,
+                [_param, _password, _docinfo, _fileType, _jsonOptions]);
         },
 
         // Called by sdkjs when the editor is ready to open a document.
@@ -557,6 +936,25 @@
         LocalStartOpen: function () {
             if (startOpenDone) return;
             startOpenDone = true;
+            // Stage breadcrumbs for the large-file diagnosis
+            // (cycle 3, step 5): the stage variable + a 1 Hz
+            // heartbeat, mirrored to the shell's stdout by the
+            // console forwarder — the drive pairs each beat with
+            // WebProcess CPU from /proc to classify busy vs
+            // waiting per stage.
+            joOpenStage.stage = 'convert_requested';
+            joOpenStage.t0 = Date.now();
+            if (!joOpenStage.beat) {
+                joOpenStage.beat = setInterval(function () {
+                    console.log('[jOffice][heartbeat] stage=' + joOpenStage.stage
+                        + ' t=' + Date.now());
+                    if (joOpenStage.stage === 'ready'
+                        && Date.now() - joOpenStage.t0 > 600000) {
+                        clearInterval(joOpenStage.beat);
+                        joOpenStage.beat = null;
+                    }
+                }, 1000);
+            }
             setTimeout(function () {
                 bridge('pendingFile').then(function (pending) {
                     if (!pending || !pending.handle) {
@@ -571,9 +969,15 @@
                     return bridge('convertFile', { path: pending.handle }).then(function (res) {
                         if (!res || !res.data) throw new Error('convertFile returned no data');
                         if (res.name) currentDocName = res.name;
+                        joOpenStage.stage = 'received';
+                        console.log('[jOffice][measure] OPEN_STAGE received t=' + Date.now()
+                            + ' b64_chars=' + res.data.length);
+                        var bin = _b64ToBytes(res.data);
+                        joOpenStage.stage = 'decoded';
+                        console.log('[jOffice][measure] OPEN_STAGE decoded t=' + Date.now()
+                            + ' bin_bytes=' + bin.length);
                         console.log('[jOffice][measure] OPEN_STAGE endload_begin t=' + Date.now()
                             + ' bin_bytes=' + Math.floor(res.data.length * 3 / 4));
-                        var bin = _b64ToBytes(res.data);
                         // INSTRUMENTATION (Kagi round 3): log which loader
                         // path executes. If DesktopOfflineAppDocumentEndLoad
                         // is namespaced / absent, the fallback may itself
@@ -586,7 +990,9 @@
                             // _len is the decoded byte length. Passing the
                             // Uint8Array itself breaks Base64.decode inside
                             // getBinaryArray (cycle 2 fix).
+                            joOpenStage.stage = 'endload_in';
                             window.DesktopOfflineAppDocumentEndLoad(pending.name || '', res.data, bin.length);
+                            joOpenStage.stage = 'endload_out';
                             console.log('[jOffice][measure] OPEN_STAGE endload_done t=' + Date.now());
                             setTimeout(joHandshake, 300);
                         } else {
@@ -650,16 +1056,67 @@
             var isSaveAs = param && param.indexOf('saveas=true') !== -1;
             var origin = joSave.nextOrigin || 'user';
             joSave.nextOrigin = null;
+            // A document save supersedes a debounced changes
+            // flush (cycle 3): the flush's changes are inside
+            // the bin this save is about to write.
+            if (joSave.flushTimer !== null && origin !== 'changes') {
+                clearTimeout(joSave.flushTimer);
+                joSave.flushTimer = null;
+                joLedger('SAVE_FLUSH_SUPERSEDED', null, { origin: origin });
+            }
+            // The gesture's own document save ends the gesture
+            // window (cycle 3, S1′): flushes fold only while
+            // the gesture is still between asc_Save and here.
+            if (origin !== 'changes' && joSave.gesture) {
+                joSave.gesture = false;
+                if (joSave.gestureTimer !== null) {
+                    clearTimeout(joSave.gestureTimer);
+                    joSave.gestureTimer = null;
+                }
+            }
             var ref = getEditor();
             // Every LocalFileSave takes the next sequence number
             // and becomes the pending save owed exactly one
             // EndSave (round 2 §C). Assigned before any early
             // return so even a guard failure closes the save out.
+            if (joSave.pendingSeq !== null) {
+                // SAVE_REENTRY (cycle 3, round 2 §G): the
+                // serialization layers above make this
+                // unreachable; if it ever fires, the ledger is
+                // the evidence — the save still proceeds (a host
+                // call is never dropped).
+                joLedger('SAVE_REENTRY', joSave.pendingSeq, { origin: origin });
+            }
             var seq = ++joSave.seq;
+            if (joSave.absorbPending) {
+                joSave.absorbSeq = seq;
+                joSave.absorbPending = false;
+            }
             joSave.pendingSeq = seq;
+            // The Download-As JSON options (cycle 3): the fifth
+            // argument LocalFileSave always received and the
+            // shim always ignored. It carries isPrint (a print
+            // export) and, merged by asc_Save, the desktop
+            // nativeOptions with the print range.
+            var opts = {};
+            try { opts = jsonOptions ? JSON.parse(jsonOptions) : {}; } catch (e) { opts = {}; }
+            var printPages = null;
+            if (opts.nativeOptions && opts.nativeOptions.pages != null) {
+                printPages = String(opts.nativeOptions.pages);
+            } else if (joSave.printPages != null) {
+                printPages = String(joSave.printPages);
+            }
+            joSave.printPages = null;
+            var unmodified = false;
+            try {
+                unmodified = ref.editor && typeof ref.editor.isDocumentModified === 'function'
+                    ? !ref.editor.isDocumentModified() : false;
+            } catch (e) { /* leave false */ }
             joLedger('localfilesave', seq, {
-                saveAs: isSaveAs, fileType: fileType || 0, origin: origin
+                saveAs: isSaveAs, fileType: fileType || 0, origin: origin,
+                isPrint: !!opts.isPrint, unmodified: unmodified
             });
+            var proceed = function () {
             joCheckDisagree('save');
             console.log('[jOffice][measure] SAVE_STAGE begin seq=' + seq + ' t=' + Date.now());
             if (!ref.editor) {
@@ -685,14 +1142,71 @@
                 var b64 = (typeof binData === 'string') ? btoa(binData) : _bytesToB64(new Uint8Array(binData));
                 console.log('[jOffice][measure] SAVE_STAGE getfile seq=' + seq
                     + ' ms=' + (Date.now() - tGet) + ' bin_bytes=' + Math.floor(b64.length * 3 / 4));
+                // bin_index for the EndSave assertion (cycle 3):
+                // the history position these bytes represent.
+                try {
+                    if (window.AscCommon && window.AscCommon.History) {
+                        joSave.lastBinIndex = window.AscCommon.History.Index;
+                        joSave.lastBinSeq = seq;
+                    }
+                } catch (e) { /* assertion input only */ }
                 // Rust owns the dialogs and the format policy: it
                 // routes Save As / SaveAsOnly / AskOnce from here.
+                // Dual-channel reply (cycle 3): deferred
+                // replies (native dialogs) intermittently
+                // arrive as EMPTY objects through the
+                // postMessage return_value — a cancelled Save
+                // As then looked like a bound success. Rust
+                // therefore ALSO delivers every save
+                // completion by evaluating
+                // window.__joDeliverSaveReply(seq, res) in
+                // this frame; whichever channel delivers a
+                // WELL-FORMED reply (one carrying `ok`) wins.
+                var settleSaveReply = null;
+                var replyPromise = new Promise(function (resolve) {
+                    settleSaveReply = resolve;
+                });
+                joSave.replyWaiters[seq] = function (res) {
+                    if (settleSaveReply) {
+                        var s = settleSaveReply;
+                        settleSaveReply = null;
+                        delete joSave.replyWaiters[seq];
+                        s(res);
+                    }
+                };
+                var absorbThis = !!joSave.absorbNext;
+                joSave.absorbNext = false;
                 bridge('saveFile', {
                     data: b64, saveAs: isSaveAs, fileType: fileType || 0,
-                    origin: origin, seq: seq
+                    origin: origin, seq: seq,
+                    unmodified: unmodified,
+                    absorb: absorbThis,
+                    printIntent: !!opts.isPrint,
+                    printPages: printPages,
+                    pdfa: !!(opts.pdfa || opts.isPDFA)
                 })
                     .then(function (res) {
+                        if (res && typeof res.ok !== 'undefined') {
+                            if (joSave.replyWaiters[seq]) {
+                                joSave.replyWaiters[seq](res);
+                            }
+                        } else {
+                            console.log('[jOffice][save-ledger] saveFile postMessage reply seq=' + seq + ' garbled (' + JSON.stringify(res) + '); awaiting JS-channel delivery');
+                        }
+                    })
+                    .catch(function (e) {
+                        if (joSave.replyWaiters[seq]) {
+                            joSave.replyWaiters[seq]({ ok: false, failed: true });
+                        }
+                    });
+                replyPromise
+                    .then(function (res) {
                         console.log('[jOffice][measure] SAVE_STAGE bridge_done seq=' + seq + ' t=' + Date.now());
+                        console.log('[jOffice][save-ledger] saveFile reply seq=' + seq + ' res=' + JSON.stringify(res));
+                        if (res && res.failed) {
+                            joEndSave(seq, 'failed');
+                            return;
+                        }
                         if (res && res.cancelled) {
                             // A cancelled dialog still owes the
                             // editor its one EndSave(1): StartSave
@@ -705,6 +1219,13 @@
                             // Export: the bound file was NOT
                             // saved; dirty state must be exactly
                             // what it was before (corrected S2).
+                            joEndSave(seq, 'export_ok');
+                            return;
+                        }
+                        if (res && res.printed !== undefined) {
+                            // A print (cycle 3): an export-class
+                            // completion — the document's dirty
+                            // state is untouched by printing.
                             joEndSave(seq, 'export_ok');
                             return;
                         }
@@ -722,6 +1243,8 @@
                 console.error('[jOffice] LocalFileSave error: ' + (e && e.message ? e.message : e));
                 joEndSave(seq, 'failed');
             }
+            };
+            proceed();
         },
 
         LocalFileCreate: function (type) {
