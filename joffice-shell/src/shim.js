@@ -264,7 +264,12 @@
                         // the first thing to check on a spinner.
                         if (typeof window.DesktopOfflineAppDocumentEndLoad === 'function') {
                             console.log('[jOffice] using DesktopOfflineAppDocumentEndLoad');
-                            window.DesktopOfflineAppDocumentEndLoad(pending.name || '', bin, bin.length);
+                            // Contract (sdkjs Local/common.js): _data is a
+                            // BASE64 STRING (or binary_content:// URL);
+                            // _len is the decoded byte length. Passing the
+                            // Uint8Array itself breaks Base64.decode inside
+                            // getBinaryArray (cycle 2 fix).
+                            window.DesktopOfflineAppDocumentEndLoad(pending.name || '', res.data, bin.length);
                         } else {
                             console.warn('[jOffice] DesktopOfflineAppDocumentEndLoad MISSING, using fallback openDocument');
                             var ref = getEditor();
@@ -299,7 +304,9 @@
                 if (res && res.data) {
                     var bin = _b64ToBytes(res.data);
                     if (typeof window.DesktopOfflineAppDocumentEndLoad === 'function') {
-                        window.DesktopOfflineAppDocumentEndLoad(res.name || '', bin, bin.length);
+                        // Base64 string + decoded byte length, as in
+                        // LocalStartOpen (see the contract note there).
+                        window.DesktopOfflineAppDocumentEndLoad(res.name || '', res.data, bin.length);
                     }
                 }
             }).catch(function (e) {

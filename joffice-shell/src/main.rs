@@ -44,6 +44,11 @@ use webkit6::prelude::*;
 /// display-isolated. Never file://, never http://localhost.
 const EDITOR_SCHEME: &str = "joffice";
 const EDITOR_ORIGIN: &str = "joffice://";
+/// The desktop font scheme: sdkjs's desktop font loader fetches
+/// "ascdesktop://fonts/" + font-path (Local/common.js
+/// CFontFileLoader.LoadFontAsync). The Qt shell serves it from the
+/// app fonts; we serve it from the assembled fonts root.
+const FONT_SCHEME: &str = "ascdesktop";
 
 /// AscDesktopEditor shim, injected into the TOP frame before any page script.
 /// Defines window.AscDesktopEditor on top of the Rust bridge.
@@ -62,6 +67,25 @@ window.joffice = {
 // shell is the build authority for its runtime: stamp it here.
 window.__ABOUT_BUILD_INFO__ = ' (jOffice shell; web-apps f50e7e32, sdkjs 0cde84e8)';
 window.__ABOUT_LEGAL__ = 'Euro-Office Desktop Editors: free software under the GNU Affero General Public License v3. Native shell: jOffice (Rust, GTK4, WebKitGTK), AGPL-3.0.';
+// Native-environment bag the Qt/CEF shell injects per page as
+// window.RendererProcessVariable (Desktop.js captures it into its
+// module-scoped `nativevars`). Its theme readers are unguarded
+// (systemThemeType does nativevars.theme && ...), so a missing bag
+// turned into the "save a backup copy" warning dialog (cycle 2,
+// boot16). Values describe this shell honestly: Linux, no local
+// theme packs, no default printer, English keyboard. The
+// window.nativevars alias costs nothing and covers any other
+// reader of the plainer name.
+window.RendererProcessVariable = {
+    os: 'linux',
+    theme: {},
+    localthemes: [],
+    keyboard: { langs: ['en'] },
+    rtl: false,
+    helpUrl: '',
+    defaultPrinterName: ''
+};
+window.nativevars = window.RendererProcessVariable;
 window.__jofficeErrors = [];
 window.addEventListener('error', function (e) {
   window.__jofficeErrors.push('error: ' + e.message + ' @ ' + e.filename + ':' + e.lineno);
@@ -138,6 +162,10 @@ struct Shell {
     /// Served under the /core-fonts/ prefix with its own containment
     /// root. None = not found (font file requests will 404).
     core_fonts_dir: Option<PathBuf>,
+    /// Root the ascdesktop://fonts/ handler serves from. Assembled
+    /// to mirror the paths AllFonts.js names (core-fonts/<family>/,
+    /// desktopeditors/fonts/). None = not found (font fetches 404).
+    fonts_root: Option<PathBuf>,
     /// x2t converter binary (from the `core` build). None = not found.
     x2t: Option<PathBuf>,
     /// File to open on startup (--file). Consumed once via take().
@@ -169,6 +197,13 @@ impl Shell {
             .map(PathBuf::from)
             .or_else(|| Some(webapps_dir.join("../core-fonts")))
             .and_then(|d| d.canonicalize().ok());
+        // fonts root lookup: $JOFFICE_FONTSROOT first, then the
+        // sibling of web-apps.
+        let fonts_root = std::env::var_os("JOFFICE_FONTSROOT")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| Some(webapps_dir.join("../fonts-root")))
+            .and_then(|d| d.canonicalize().ok());
         // x2t lookup: $JOFFICE_X2T first, then the packaged layout
         // (<exe-dir>/../converter/x2t, mirroring the upstream deb),
         // then system paths and the core build tree.
@@ -196,6 +231,7 @@ impl Shell {
             webapps_dir,
             sdkjs_dir,
             core_fonts_dir,
+            fonts_root,
             x2t,
             pending_file: RefCell::new(pending_file),
             handles: Rc::new(RefCell::new(handles)),
@@ -395,6 +431,60 @@ fn x2t_convert_async(
 // URI scheme: serve web-apps from disk on joffice://
 // ---------------------------------------------------------------------------
 
+/// Percent-encode a URL query value (unreserved set passes through).
+fn query_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Build the editor entry URL. With a pending file, this is the
+/// api/documents desktop bootstrap with the document described in
+/// query parameters (the page builds a DocsAPI.DocEditor config
+/// from them and iframes the matching editor app). The document
+/// key is a stable FNV-1a hash of the canonical path: the same
+/// file reopens as the same document. Without a file, fall back to
+/// the bare editor app — a known-incomplete start state (the
+/// desktop product's start window is a separate native surface
+/// this shell does not have yet).
+fn editor_entry_url(pending: Option<&PathBuf>) -> String {
+    let Some(path) = pending else {
+        return "joffice:///apps/documenteditor/main/index.html".to_string();
+    };
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let doctype = match ext.as_str() {
+        "xlsx" | "xls" | "ods" | "csv" | "tsv" => "cell",
+        "pptx" | "ppt" | "odp" => "slide",
+        "pdf" => "pdf",
+        _ => "word",
+    };
+    let title = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in canon.to_string_lossy().bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!(
+        "joffice:///apps/api/documents/index.html?type=desktop&doctype={doctype}&key=joffice-{hash:016x}&url=_offline_&title={}&filetype={}&mode=edit&lang=en",
+        query_escape(&title),
+        query_escape(&ext),
+    )
+}
+
 fn content_type(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
         "html" | "htm" => "text/html",
@@ -409,8 +499,27 @@ fn content_type(path: &Path) -> &'static str {
         "woff" => "font/woff",
         "woff2" => "font/woff2",
         "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "ttc" => "font/collection",
         _ => "application/octet-stream",
     }
+}
+
+/// Finish a scheme request with a full response carrying
+/// `Access-Control-Allow-Origin: *`. Plain `finish()` sends no
+/// CORS header, and WebKit then refuses cross-origin reads of
+/// otherwise-200 responses (the ascdesktop font fetches failed
+/// exactly that way in cycle 2: "Origin joffice:// is not allowed
+/// by Access-Control-Allow-Origin. Status code: 200").
+fn finish_ok(req: &URISchemeRequest, data: &[u8], mime: &str) {
+    let stream = gtk4::gio::MemoryInputStream::from_bytes(&gtk4::glib::Bytes::from(data));
+    let response = webkit6::URISchemeResponse::new(&stream, data.len() as i64);
+    response.set_status(200, None);
+    response.set_content_type(mime);
+    let headers = webkit6::soup::MessageHeaders::new(webkit6::soup::MessageHeadersType::Response);
+    headers.append("Access-Control-Allow-Origin", "*");
+    response.set_http_headers(headers);
+    req.finish_with_response(&response);
 }
 
 /// Serve a joffice:// URI from the web-apps directory, or from the
@@ -475,9 +584,7 @@ fn handle_uri_scheme(shell: &Shell, req: &URISchemeRequest) {
     match file_path.canonicalize() {
         Ok(canon) if canon.starts_with(&root) => match std::fs::read(&canon) {
             Ok(data) => {
-                let stream =
-                    gtk4::gio::MemoryInputStream::from_bytes(&gtk4::glib::Bytes::from(&data));
-                req.finish(&stream, data.len() as i64, Some(content_type(&canon)));
+                finish_ok(req, &data, content_type(&canon));
             }
             Err(_) => {
                 let mut err = gtk4::glib::Error::new(
@@ -508,6 +615,53 @@ fn handle_uri_scheme(shell: &Shell, req: &URISchemeRequest) {
     }
 }
 
+/// Serve ascdesktop://fonts/<path> from the fonts root. The font
+/// loader's Ids are the paths AllFonts.js names ("/core-fonts/...",
+/// "/desktopeditors/fonts/...", a few build-machine
+/// "/usr/share/fonts/..." paths we cannot satisfy and let 404).
+/// Same defenses as the editor scheme: percent-decode, strip
+/// query, canonicalize + containment (copies, not symlinks, in the
+/// assembled root — a symlink would canonicalize outside it).
+fn handle_font_scheme(shell: &Shell, req: &URISchemeRequest) {
+    let uri = req.uri().unwrap_or_default();
+    let not_found = |req: &URISchemeRequest, uri: &str| {
+        eprintln!("joffice: font 404: {uri}");
+        let mut err = gtk4::glib::Error::new(
+            gtk4::gio::IOErrorEnum::NotFound,
+            &format!("joffice: font not found: {uri}"),
+        );
+        req.finish_error(&mut err);
+    };
+    let Some(root) = &shell.fonts_root else {
+        not_found(req, &uri);
+        return;
+    };
+    let rest = uri.strip_prefix("ascdesktop://").unwrap_or("");
+    // Host must be "fonts"; the remainder is the font path.
+    let Some((host, path)) = rest.split_once('/') else {
+        not_found(req, &uri);
+        return;
+    };
+    if host != "fonts" {
+        not_found(req, &uri);
+        return;
+    }
+    let path_part = path.split(['?', '#']).next().unwrap_or("");
+    let decoded = gtk4::glib::uri_unescape_string(path_part, None::<&str>)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| path_part.to_string());
+    let file_path = root.join(decoded.trim_start_matches('/'));
+    match file_path.canonicalize() {
+        Ok(canon) if canon.starts_with(root) => match std::fs::read(&canon) {
+            Ok(data) => {
+                finish_ok(req, &data, content_type(&canon));
+            }
+            Err(_) => not_found(req, &uri),
+        },
+        _ => not_found(req, &uri),
+    }
+}
+
 // After a save completes, if a window close is pending, destroy the
 // window now that the document is safely written. Called from the
 // saveFile reply paths on the main thread.
@@ -531,9 +685,12 @@ fn handle_bridge(
     msg: &BridgeMsg,
 ) {
     // ORIGIN CHECK: only the editor origin may call the bridge.
-    // view.uri() is the top-frame URI; a same-origin iframe could in
-    // principle reach the handler, but the shim is TopFrame-only and
-    // the editor origin is ours. Known limitation, documented.
+    // view.uri() is the top-frame URI. Since cycle 2 the scripts
+    // inject into ALL frames (the editor app runs in an iframe
+    // under the api/documents entry page, mirroring how CEF exposes
+    // the native object), so any frame of OUR origin can reach the
+    // handler. The origin itself is the trust boundary; per-frame
+    // attribution is a known limitation, documented.
     let uri = view.uri().unwrap_or_default();
     if !uri.starts_with(EDITOR_ORIGIN) {
         reply_err(reply, format!("bridge rejected: untrusted origin {uri}"));
@@ -898,13 +1055,23 @@ fn main() {
             handle_uri_scheme(&shell_scheme, req);
         });
 
+        // The desktop font scheme. CORS-enabled + secure so the
+        // editor page's XHR loader may read it cross-origin; NOT
+        // display-isolated (that would block the fetch entirely).
+        security.register_uri_scheme_as_cors_enabled(FONT_SCHEME);
+        security.register_uri_scheme_as_secure(FONT_SCHEME);
+        let shell_fonts = shell.clone();
+        context.register_uri_scheme(FONT_SCHEME, move |req| {
+            handle_font_scheme(&shell_fonts, req);
+        });
+
         // WebView with JS bridge + shim, injected into TOP frame only.
         let manager = UserContentManager::new();
         manager.register_script_message_handler_with_reply("joffice", None);
 
         let bootstrap = UserScript::new(
             BOOTSTRAP_JS,
-            UserContentInjectedFrames::TopFrame,
+            UserContentInjectedFrames::AllFrames,
             UserScriptInjectionTime::Start,
             &[],
             &[],
@@ -913,7 +1080,7 @@ fn main() {
 
         let shim = UserScript::new(
             SHIM_JS,
-            UserContentInjectedFrames::TopFrame,
+            UserContentInjectedFrames::AllFrames,
             UserScriptInjectionTime::Start,
             &[],
             &[],
@@ -1019,8 +1186,15 @@ fn main() {
             );
         }
 
-        // Load the editor from the custom scheme.
-        view.load_uri("joffice:///apps/documenteditor/main/index.html");
+        // Load the editor through the desktop entry contract
+        // (cycle 2): the product enters via
+        // apps/api/documents/index.html (deployed from
+        // index.html.desktop), whose URL parameters become the
+        // DocInfo that gates LocalStartOpen. Loading the editor
+        // app directly leaves it waiting for a config that can
+        // never arrive (cycle 1's finding).
+        let entry = editor_entry_url(shell.pending_file.borrow().as_ref());
+        view.load_uri(&entry);
 
         // Console messages to stdout for debugging (WebKitGTK 6.0).
         if let Some(settings) = webkit6::prelude::WebViewExt::settings(&view) {
