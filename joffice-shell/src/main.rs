@@ -186,7 +186,8 @@ fn present_save_error(shell: &Rc<Shell>, msg: &str, origin: &str) {
         (st.count, st.window.is_some())
     };
     let time = gtk4::glib::DateTime::now_local()
-        .format("%H:%M")
+        .ok()
+        .and_then(|dt| dt.format("%H:%M").ok())
         .map(|s| s.to_string())
         .unwrap_or_default();
     let text = if count > 1 {
@@ -685,12 +686,13 @@ fn gen_uuid() -> String {
 }
 
 fn default_user_name() -> String {
-    let real = gtk4::glib::real_name();
-    let real = real.as_str().trim();
+    // glib 0.20: real_name()/user_name() return OsString.
+    let real = gtk4::glib::real_name().to_string_lossy().into_owned();
+    let real = real.trim();
     if !real.is_empty() && real != "Unknown" {
         return real.to_string();
     }
-    gtk4::glib::user_name().to_string()
+    gtk4::glib::user_name().to_string_lossy().into_owned()
 }
 
 fn load_config() -> JofficeConfig {
@@ -2213,6 +2215,16 @@ fn x2t_convert_sync(
     let tmpdir = std::env::temp_dir();
     let out_path = tmpdir.join(format!("{stem}.out"));
     let params_path = tmpdir.join(format!("{stem}.xml"));
+    // PRIVATE per-conversion temp dir (marathon 2 cycle 2 drive
+    // finding): x2t unpacks the source package into a FIXED-NAME
+    // "<m_sTempDir>/<family>_unpacked/" tree and merges with
+    // whatever already sits there. Passing the shared system temp
+    // dir made documents silently gain other documents' parts —
+    // media.docx came back with basic.docx's header, footer and
+    // footnotes plus a vbaProject stub left by an earlier
+    // conversion. One private dir per conversion, removed after.
+    let work_temp = tmpdir.join(format!("{stem}-tmp"));
+    std::fs::create_dir_all(&work_temp).map_err(|e| format!("create x2t temp dir: {e}"))?;
 
     // x2t infers from extensions: the input extension must be right.
     // Copy the input to a temp file with its real extension if needed.
@@ -2287,7 +2299,7 @@ fn x2t_convert_sync(
         xml_escape(&from_tmp.display().to_string()),
         xml_escape(&out_path.display().to_string()),
         format_to,
-        xml_escape(&tmpdir.display().to_string()),
+        xml_escape(&work_temp.display().to_string()),
         extra
     );
     std::fs::write(&params_path, params).map_err(|e| format!("write x2t params: {e}"))?;
@@ -2299,6 +2311,7 @@ fn x2t_convert_sync(
 
     let _ = std::fs::remove_file(&params_path);
     let _ = std::fs::remove_file(&from_tmp);
+    let _ = std::fs::remove_dir_all(&work_temp);
 
     if !out.status.success() {
         return Err(format!(
@@ -3823,10 +3836,14 @@ fn handle_bridge(
 /// cell's carries signature handling the others lack), then
 /// pinned here. None = not yet pinned (log-only).
 fn endsave_pin(kind: EditorKind) -> Option<&'static str> {
+    // Pinned from live drives, marathon 2 cycle 2 (2026-11-26):
+    // each editor's EndSave source hashed as served by the pinned
+    // 9.3.8 sdkjs. A sdkjs update that changes any EndSave must
+    // trip SDK_DRIFT and be re-pinned deliberately.
     match kind {
-        EditorKind::Word => None,
-        EditorKind::Cell => None,
-        EditorKind::Slide => None,
+        EditorKind::Word => Some("a249eff5c40340a2"),
+        EditorKind::Cell => Some("47f784e2c1fa5299"),
+        EditorKind::Slide => Some("0b6ef59832b81bea"),
     }
 }
 
@@ -4641,6 +4658,40 @@ fn build_launcher(
 // ---------------------------------------------------------------------------
 
 fn main() {
+    // GSettings schemas (marathon 2 cycle 2 drive finding): the
+    // native file chooser is a hard GLib-GIO-ERROR ("No GSettings
+    // schemas are installed on the system") on hosts without GTK
+    // schemas in the system profile — the whole shell died the
+    // first time Save As opened one. If the runtime ships a
+    // compiled schema dir and the environment does not already
+    // provide one, point GLib at it before anything GTK starts.
+    if std::env::var_os("GSETTINGS_SCHEMA_DIR").is_none() {
+        if let Ok(exe) = std::env::current_exe() {
+            let bin_dir = exe.parent().map(|p| p.to_path_buf());
+            let candidates: Vec<std::path::PathBuf> = bin_dir
+                .iter()
+                .flat_map(|d| {
+                    [
+                        d.join("gschemas.compiled"),
+                        d.join("../share/gsettings-schemas/gschemas.compiled"),
+                        d.join("share/gsettings-schemas/gschemas.compiled"),
+                    ]
+                })
+                .collect();
+            for cand in &candidates {
+                if cand.exists() {
+                    if let Some(dir) = cand.parent() {
+                        std::env::set_var("GSETTINGS_SCHEMA_DIR", dir);
+                        eprintln!(
+                            "joffice: GSETTINGS_SCHEMA_DIR={} (bundled)",
+                            dir.display()
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+    }
     // Self-tests for the hand-rolled primitives format
     // detection depends on (marathon 2 cycle 2): a broken
     // inflate or sha256 must fail loudly here, never silently
@@ -4932,13 +4983,13 @@ fn main() {
         // the cache is what makes the DESKTOP path work.
         {
             let drop_target = gtk4::DropTarget::new(
-                gtk4::gio::FileList::static_type(),
+                gtk4::gdk::FileList::static_type(),
                 gtk4::gdk::DragAction::COPY,
             );
             let shell_drop = shell.clone();
             let view_drop = view.clone();
             drop_target.connect_drop(move |_, value, _, _| {
-                let Ok(list) = value.get::<gtk4::gio::FileList>() else {
+                let Ok(list) = value.get::<gtk4::gdk::FileList>() else {
                     return false;
                 };
                 let mut cache = Vec::new();

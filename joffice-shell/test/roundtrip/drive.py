@@ -101,7 +101,9 @@ def typetext(text):
 def click(x, y):
     w = tool("wlrctl")
     run([w, "pointer", "move", "-10000", "-10000"])
+    time.sleep(0.4)
     run([w, "pointer", "move", str(x), str(y)])
+    time.sleep(0.4)
     run([w, "pointer", "click", "left"])
     print(f"click {x},{y}")
 

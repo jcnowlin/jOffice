@@ -32,8 +32,13 @@ FMT_TO = {"docx": 65, "docm": 75, "dotx": 76, "xlsx": 257, "pptx": 129,
 
 
 def convert(src, dst, fmt_to, fmt_from=None, csv_delim=None):
-    tmp = os.path.join(OUT, "_tmp")
-    os.makedirs(tmp, exist_ok=True)
+    # PRIVATE temp dir per conversion: x2t unpacks into a
+    # fixed-name "<m_sTempDir>/<family>_unpacked/" tree and
+    # merges with stale content — a shared _tmp made media.docx
+    # inherit basic.docx's headers/footnotes (cycle-2 finding).
+    import tempfile
+
+    tmp = tempfile.mkdtemp(prefix="r0-", dir=OUT)
     extra = ""
     if fmt_from is not None:
         extra += f"  <m_nFormatFrom>{fmt_from}</m_nFormatFrom>\n"
