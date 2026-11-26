@@ -288,6 +288,17 @@ fn format_for_path(path: &Path) -> i32 {
     }
 }
 
+/// Write bytes to `dest` via a same-directory temp file + rename,
+/// so a crash mid-save never leaves a truncated document.
+fn write_atomic(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = dir.join(format!(".{}.tmp", temp_stem("savewrite")));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, dest).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -704,6 +715,12 @@ fn handle_bridge(
             let path = shell.pending_file.borrow_mut().take();
             match path {
                 Some(p) => {
+                    // The pending file IS the document being opened:
+                    // it becomes the save target. (Cycle 3: without
+                    // this, current_path stayed None for --file
+                    // opens — convertFile does not set it — and every
+                    // Ctrl+S fell into the Save As dialog branch.)
+                    *shell.current_path.borrow_mut() = Some(p.clone());
                     let name = p
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
@@ -868,10 +885,20 @@ fn handle_bridge(
                     let reply_c2 = reply_c.clone();
                     let ctx_c2 = ctx_c.clone();
                     let shell_c2 = shell_c.clone();
+                    let dest = path.clone();
                     x2t_convert_async(&shell_c2.clone(), tmp_bin_c.clone(), fmt_to, Some(fmt::BIN), move |result| match result {
-                        Ok(_) => {
-                            reply_json(&reply_c2, &ctx_c2, &serde_json::json!({ "ok": true }));
-                            maybe_destroy_after_save(&shell_c2);
+                        Ok(bytes) => {
+                            // Cycle 3 fix: the converter returns the
+                            // output BYTES — write them to the target
+                            // path. The October code replied ok and
+                            // discarded them: save was a silent no-op.
+                            match write_atomic(&dest, &bytes) {
+                                Ok(()) => {
+                                    reply_json(&reply_c2, &ctx_c2, &serde_json::json!({ "ok": true }));
+                                    maybe_destroy_after_save(&shell_c2);
+                                }
+                                Err(e) => reply_err(&reply_c2, format!("save write: {e}")),
+                            }
                         }
                         Err(e) => reply_err(&reply_c2, e),
                     });
@@ -886,10 +913,19 @@ fn handle_bridge(
             let reply_c = reply.clone();
             let ctx_c = ctx.clone();
             let shell_c = shell.clone();
+            let dest = path.clone();
             x2t_convert_async(&shell_c.clone(), tmp_bin, fmt_to, Some(fmt::BIN), move |result| match result {
-                Ok(_) => {
-                    reply_json(&reply_c, &ctx_c, &serde_json::json!({ "ok": true }));
-                    maybe_destroy_after_save(&shell_c);
+                Ok(bytes) => {
+                    // Write the converted bytes to the document
+                    // path (see the dialog branch: this write is
+                    // the actual save; October discarded the bytes).
+                    match write_atomic(&dest, &bytes) {
+                        Ok(()) => {
+                            reply_json(&reply_c, &ctx_c, &serde_json::json!({ "ok": true }));
+                            maybe_destroy_after_save(&shell_c);
+                        }
+                        Err(e) => reply_err(&reply_c, format!("save write: {e}")),
+                    }
                 }
                 Err(e) => reply_err(&reply_c, e),
             });
