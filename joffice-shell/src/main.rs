@@ -57,9 +57,17 @@ window.joffice = {
     return window.webkit.messageHandlers.joffice.postMessage({ cmd: cmd, args: args || {} });
   }
 };
+// Build stamp the web-apps deploy build normally injects into the
+// page (About dialog version label reads the bare global). The
+// shell is the build authority for its runtime: stamp it here.
+window.__ABOUT_BUILD_INFO__ = ' (jOffice shell; web-apps f50e7e32, sdkjs 0cde84e8)';
+window.__ABOUT_LEGAL__ = 'Euro-Office Desktop Editors: free software under the GNU Affero General Public License v3. Native shell: jOffice (Rust, GTK4, WebKitGTK), AGPL-3.0.';
 window.__jofficeErrors = [];
 window.addEventListener('error', function (e) {
   window.__jofficeErrors.push('error: ' + e.message + ' @ ' + e.filename + ':' + e.lineno);
+  if (e.error && e.error.stack) {
+    console.error('[jOffice-stack] ' + e.error.stack);
+  }
 });
 window.addEventListener('unhandledrejection', function (e) {
   var r = e.reason;
@@ -119,6 +127,17 @@ impl HandleTable {
 struct Shell {
     /// Directory containing the web-apps checkout (editor JS), canonicalized.
     webapps_dir: PathBuf,
+    /// Directory containing the sdkjs checkout, canonicalized. The
+    /// editor pages reference ../../../../sdkjs/... — sdkjs is a
+    /// SIBLING of web-apps in the real layout, served under the
+    /// /sdkjs/ prefix of the same origin with its own containment
+    /// root. None = not found (sdkjs requests will 404).
+    sdkjs_dir: Option<PathBuf>,
+    /// Directory with the core font files AllFonts.js names as
+    /// "/core-fonts/<file>" (the deb installs it beside the editors).
+    /// Served under the /core-fonts/ prefix with its own containment
+    /// root. None = not found (font file requests will 404).
+    core_fonts_dir: Option<PathBuf>,
     /// x2t converter binary (from the `core` build). None = not found.
     x2t: Option<PathBuf>,
     /// File to open on startup (--file). Consumed once via take().
@@ -140,12 +159,34 @@ struct Shell {
 }
 
 impl Shell {
-    fn new(webapps_dir: PathBuf, pending_file: Option<PathBuf>) -> Rc<Self> {
+    fn new(webapps_dir: PathBuf, sdkjs_dir: Option<PathBuf>, pending_file: Option<PathBuf>) -> Rc<Self> {
         let webapps_dir = webapps_dir.canonicalize().unwrap_or(webapps_dir);
-        let x2t = ["/usr/local/bin/x2t", "/usr/bin/x2t", "./x2t", "../core/build/bin/x2t"]
-            .iter()
+        let sdkjs_dir = sdkjs_dir.and_then(|d| d.canonicalize().ok());
+        // core-fonts lookup: $JOFFICE_COREFONTS first, then the
+        // sibling of web-apps (the deb layout).
+        let core_fonts_dir = std::env::var_os("JOFFICE_COREFONTS")
+            .filter(|v| !v.is_empty())
             .map(PathBuf::from)
-            .find(|p| p.exists());
+            .or_else(|| Some(webapps_dir.join("../core-fonts")))
+            .and_then(|d| d.canonicalize().ok());
+        // x2t lookup: $JOFFICE_X2T first, then the packaged layout
+        // (<exe-dir>/../converter/x2t, mirroring the upstream deb),
+        // then system paths and the core build tree.
+        let x2t = std::env::var_os("JOFFICE_X2T")
+            .map(PathBuf::from)
+            .filter(|p| p.exists())
+            .or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|e| e.parent().map(|p| p.join("../converter/x2t")))
+                    .filter(|p| p.exists())
+            })
+            .or_else(|| {
+                ["/usr/local/bin/x2t", "/usr/bin/x2t", "./x2t", "../core/build/bin/x2t"]
+                    .iter()
+                    .map(PathBuf::from)
+                    .find(|p| p.exists())
+            });
         let mut handles = HandleTable::new();
         // Register --file at startup so it is resolvable as a handle.
         if let Some(p) = &pending_file {
@@ -153,6 +194,8 @@ impl Shell {
         }
         Rc::new(Self {
             webapps_dir,
+            sdkjs_dir,
+            core_fonts_dir,
             x2t,
             pending_file: RefCell::new(pending_file),
             handles: Rc::new(RefCell::new(handles)),
@@ -370,9 +413,14 @@ fn content_type(path: &Path) -> &'static str {
     }
 }
 
-/// Serve a joffice:// URI from the web-apps directory.
+/// Serve a joffice:// URI from the web-apps directory, or from the
+/// sdkjs sibling directory for /sdkjs/ paths (the editor pages
+/// reference ../../../../sdkjs/... — a sibling tree, not part of
+/// web-apps). Each tree has its own containment root.
 /// Defenses: percent-decode, strip query/fragment, canonicalize and
-/// assert the result stays under webapps_dir (blocks ../../ traversal).
+/// assert the result stays under its tree's root (blocks ../../
+/// traversal; canonicalize also resolves symlinks, so a symlink
+/// pointing out of the tree fails containment and 404s).
 fn handle_uri_scheme(shell: &Shell, req: &URISchemeRequest) {
     let uri = req.uri().unwrap_or_default();
     let rest = uri.strip_prefix(EDITOR_ORIGIN).unwrap_or("");
@@ -382,7 +430,40 @@ fn handle_uri_scheme(shell: &Shell, req: &URISchemeRequest) {
     let decoded = gtk4::glib::uri_unescape_string(path_part, None::<&str>)
         .map(|s| s.to_string())
         .unwrap_or_else(|| path_part.to_string());
-    let file_path = shell.webapps_dir.join(decoded.trim_start_matches('/'));
+    let rel = decoded.trim_start_matches('/');
+
+    // Route /sdkjs/* to the sdkjs tree, /core-fonts/* to the
+    // core-fonts tree; everything else to web-apps.
+    let (root, sub) = match rel.strip_prefix("sdkjs/") {
+        Some(sub) => match &shell.sdkjs_dir {
+            Some(dir) => (dir.clone(), sub.to_string()),
+            None => {
+                eprintln!("joffice: scheme 404 (no sdkjs tree): {uri}");
+                let mut err = gtk4::glib::Error::new(
+                    gtk4::gio::IOErrorEnum::NotFound,
+                    &format!("joffice: sdkjs tree not configured: {uri}"),
+                );
+                req.finish_error(&mut err);
+                return;
+            }
+        },
+        None => match rel.strip_prefix("core-fonts/") {
+            Some(sub) => match &shell.core_fonts_dir {
+                Some(dir) => (dir.clone(), sub.to_string()),
+                None => {
+                    eprintln!("joffice: scheme 404 (no core-fonts tree): {uri}");
+                    let mut err = gtk4::glib::Error::new(
+                        gtk4::gio::IOErrorEnum::NotFound,
+                        &format!("joffice: core-fonts tree not configured: {uri}"),
+                    );
+                    req.finish_error(&mut err);
+                    return;
+                }
+            },
+            None => (shell.webapps_dir.clone(), rel.to_string()),
+        },
+    };
+    let file_path = root.join(&sub);
 
     let file_path = if file_path.is_dir() {
         file_path.join("index.html")
@@ -392,7 +473,7 @@ fn handle_uri_scheme(shell: &Shell, req: &URISchemeRequest) {
 
     // Canonicalize and verify containment. Nonexistent -> 404 (safe).
     match file_path.canonicalize() {
-        Ok(canon) if canon.starts_with(&shell.webapps_dir) => match std::fs::read(&canon) {
+        Ok(canon) if canon.starts_with(&root) => match std::fs::read(&canon) {
             Ok(data) => {
                 let stream =
                     gtk4::gio::MemoryInputStream::from_bytes(&gtk4::glib::Bytes::from(&data));
@@ -415,6 +496,9 @@ fn handle_uri_scheme(shell: &Shell, req: &URISchemeRequest) {
             req.finish_error(&mut err);
         }
         Err(_) => {
+            // Misses are diagnostic gold (a wrong root or a
+            // generated-file gap both look like this): log every 404.
+            eprintln!("joffice: scheme 404: {uri}");
             let mut err = gtk4::glib::Error::new(
                 gtk4::gio::IOErrorEnum::NotFound,
                 &format!("joffice: not found: {uri}"),
@@ -688,13 +772,33 @@ fn main() {
             _ => i += 1,
         }
     }
-
-    // Resolve the web-apps dir: <exe-dir>/../web-apps, or ./web-apps.
-    let webapps_dir = std::env::current_exe()
+    // Test-drive support, env-driven because GtkApplication rejects
+    // unknown CLI options before our parsing runs: with
+    // JOFFICE_SNAPSHOT=<path> set (and JOFFICE_SNAPSHOT_AFTER=<secs>,
+    // default 20), the shell snapshots the WebView's rendered page
+    // to the PNG path and exits. A page snapshot bypasses the
+    // compositor — and any lock screen over it — and proves what the
+    // EDITOR rendered, which is the thing being graded.
+    let snapshot_path: Option<PathBuf> = std::env::var_os("JOFFICE_SNAPSHOT")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let snapshot_after_secs: u64 = std::env::var("JOFFICE_SNAPSHOT_AFTER")
         .ok()
-        .and_then(|e| e.parent().map(|p| p.to_path_buf()))
-        .map(|exe_dir| exe_dir.join("../web-apps"))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+
+    // Resolve the web-apps dir: $JOFFICE_WEBAPPS, else
+    // <exe-dir>/../web-apps, or ./web-apps.
+    let webapps_dir = std::env::var_os("JOFFICE_WEBAPPS")
+        .map(PathBuf::from)
         .filter(|p| p.join("apps/documenteditor/main/index.html").exists())
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(|p| p.to_path_buf()))
+                .map(|exe_dir| exe_dir.join("../web-apps"))
+                .filter(|p| p.join("apps/documenteditor/main/index.html").exists())
+        })
         .or_else(|| {
             let cwd = std::env::current_dir().ok()?;
             let p = cwd.join("web-apps");
@@ -706,7 +810,21 @@ fn main() {
         })
         .unwrap_or_else(|| PathBuf::from("../web-apps"));
 
-    let shell = Shell::new(webapps_dir, pending_file);
+    // Resolve the sdkjs dir (sibling of web-apps): $JOFFICE_SDKJS,
+    // else <web-apps>/../sdkjs.
+    let sdkjs_dir = std::env::var_os("JOFFICE_SDKJS")
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .or_else(|| {
+            let p = webapps_dir.join("../sdkjs");
+            if p.is_dir() {
+                Some(p)
+            } else {
+                None
+            }
+        });
+
+    let shell = Shell::new(webapps_dir, sdkjs_dir, pending_file);
 
     let app = Application::builder()
         .application_id("io.nowlin.jOffice")
@@ -866,6 +984,41 @@ fn main() {
             false
         });
 
+        // Snapshot mode (test drives): capture the rendered page
+        // after the delay, write the PNG, and exit.
+        if let Some(snap_path) = snapshot_path.clone() {
+            let view_snap = view.clone();
+            gtk4::glib::timeout_add_local_once(
+                std::time::Duration::from_secs(snapshot_after_secs),
+                move || {
+                    let snap_path_c = snap_path.clone();
+                    view_snap.snapshot(
+                        webkit6::SnapshotRegion::Visible,
+                        webkit6::SnapshotOptions::NONE,
+                        None::<&gtk4::gio::Cancellable>,
+                        move |result| match result {
+                            Ok(texture) => match texture.save_to_png(&snap_path_c) {
+                                Ok(()) => println!(
+                                    "joffice: snapshot written to {}",
+                                    snap_path_c.display()
+                                ),
+                                Err(e) => eprintln!("joffice: snapshot write failed: {e}"),
+                            },
+                            Err(e) => eprintln!("joffice: snapshot failed: {e}"),
+                        },
+                    );
+                    // Give the async snapshot callback time to land,
+                    // then exit.
+                    gtk4::glib::timeout_add_local_once(
+                        std::time::Duration::from_secs(5),
+                        move || {
+                            std::process::exit(0);
+                        },
+                    );
+                },
+            );
+        }
+
         // Load the editor from the custom scheme.
         view.load_uri("joffice:///apps/documenteditor/main/index.html");
 
@@ -884,5 +1037,12 @@ fn main() {
         window.present();
     });
 
-    app.run();
+    // Run with a FILTERED argv: GtkApplication's own option parser
+    // fatally rejects options it does not know ("Unknown option
+    // --file"), and ours are parsed above from the real argv. Only
+    // the program name goes through; our flags never reach GLib.
+    // (Found in cycle 1's first --file test drive: the documented
+    // October CLI could never have started the app.)
+    let prog = std::env::args().next().unwrap_or_else(|| "joffice-shell".to_string());
+    app.run_with_args(&[prog]);
 }

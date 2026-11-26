@@ -62,6 +62,143 @@
     }
 
     window.AscDesktopEditor = {
+        // Host feature bag. desktopinit.js sets window.desktop = this
+        // object and web-apps mutates .features (e.g. singlewindow).
+        features: {},
+
+        // The host command channel. web-apps' Desktop controller
+        // treats AscDesktopEditor as `native` and calls
+        // native.execCommand('webapps:features' | 'editor:config' |
+        // 'title:button' | 'doc:onready' | ...) for shell-side
+        // services (title-bar buttons, alt hints, feature flags).
+        // WITHOUT this method the Desktop controller module throws
+        // during load and Common.Controllers.Desktop never defines
+        // (first-boot failure, cycle 1: "native.execCommand is not
+        // a function" -> "Desktop.isActive is not a function").
+        // This shell draws no title-bar buttons and has no shell
+        // services to offer yet: accept every command, log it (the
+        // log IS the feature-negotiation record), change nothing.
+        execCommand: function (cmd, param) {
+            console.log('[jOffice] execCommand: ' + cmd);
+        },
+
+        // Called by the Desktop controller on document ready; in
+        // the Qt shell it answers asynchronously with the recents
+        // list via on_native_message. This shell keeps no recents
+        // store yet — fire-and-forget no-op.
+        LocalFileRecents: function () {
+            console.log('[jOffice] LocalFileRecents (no recents store)');
+        },
+
+        // -------------------------------------------------------
+        // Host-surface completion (cycle 1). sdkjs references 79
+        // AscDesktopEditor members; a missing one is a TypeError
+        // wherever the call is unguarded (GetInstallPlugins killed
+        // boot exactly that way). Policy: every referenced member
+        // exists; capability probes report this shell's REAL state
+        // (no crypto, signatures, media, or print pipeline yet);
+        // value getters return the source-verified desktop
+        // defaults; action methods log and no-op. Nothing here
+        // pretends a feature works.
+        // -------------------------------------------------------
+
+        // Encryption mode flag — a NUMBER property in sdkjs
+        // (compared against 0, assigned by sdkjs itself).
+        CryptoMode: 0,
+
+        // editorscommon UpdateSystemPlugins does
+        // JSON.parse(GetInstallPlugins()) and touches [0] and [1],
+        // each {url, pluginsData[]}. A fresh desktop install ships
+        // an empty sdkjs-plugins dir (verified in the official
+        // Euro-Office 9.3.8 deb): two entries, no plugins.
+        GetInstallPlugins: function () {
+            return JSON.stringify([
+                { url: 'joffice:///sdkjs-plugins/', pluginsData: [] },
+                { url: 'joffice:///sdkjs-plugins-user/', pluginsData: [] }
+            ]);
+        },
+
+        // device_scale.js: guarded call, expects an array of
+        // numbers (the plugin-framework copy of this list is
+        // [1, 1.25, 1.5, ..., 5] in sdkjs common/plugins.js).
+        GetSupportedScaleValues: function () {
+            return [1, 1.25, 1.5, 1.75, 2, 2.25, 2.5, 2.75, 3, 3.5, 4, 4.5, 5];
+        },
+
+        // commonDefines.js: guarded, desktop default is 28.
+        GetFontThumbnailHeight: function () { return 28; },
+
+        // libfont/engine.js: guarded; empty = no desktop
+        // dictionaries path (spellcheck dictionaries not wired).
+        getDictionariesPath: function () { return ''; },
+
+        getEngineVersion: function () { return '9.3.8'; },
+
+        // Capability probes — honest negatives.
+        IsSignaturesSupport: function () { return false; },
+        IsProtectionSupport: function () { return false; },
+        isBlockchainSupport: function () { return false; },
+        IsSupportMedia: function () { return false; },
+        IsFilePrinting: function () { return false; },
+        isSupportMacroses: function () { return false; },
+        isSupportPlugins: function () { return false; },
+        IsImageFile: function () { return false; },
+        IsLocalFileExist: function () { return false; },
+
+        // Image helpers (media/drawing paths, not yet wired).
+        GetImageFormat: function () { return ''; },
+        GetImageOriginalSize: function () { return { width: 0, height: 0 }; },
+        LocalFileGetImageUrlCorrect: function (url) { return url; },
+
+        // Change-tracking count for the Local save path.
+        LocalFileGetOpenChangesCount: function () { return 0; },
+
+        // Logged no-ops: crypto, signatures, printing, media,
+        // plugins, external conversion. A call is never an error;
+        // the log line is the record that the path was reached.
+        AddChanges: function () { console.log('[jOffice] stub AddChanges'); },
+        CallInAllWindows: function () { console.log('[jOffice] stub CallInAllWindows'); },
+        CallMediaPlayerCommand: function () { console.log('[jOffice] stub CallMediaPlayerCommand'); },
+        CompareDocumentUrl: function () { console.log('[jOffice] stub CompareDocumentUrl'); },
+        CryptoDownloadAs: function () { console.log('[jOffice] stub CryptoDownloadAs'); },
+        GetDefaultCertificate: function () { console.log('[jOffice] stub GetDefaultCertificate'); return ''; },
+        GetDropFiles: function () { console.log('[jOffice] stub GetDropFiles'); return []; },
+        GetEncryptedHeader: function () { console.log('[jOffice] stub GetEncryptedHeader'); return ''; },
+        LoadJS: function () { console.log('[jOffice] stub LoadJS'); },
+        MediaStart: function () { console.log('[jOffice] stub MediaStart'); },
+        MergeDocumentUrl: function () { console.log('[jOffice] stub MergeDocumentUrl'); },
+        NativeViewerOpen: function () { console.log('[jOffice] stub NativeViewerOpen'); },
+        OnSave: function () { console.log('[jOffice] stub OnSave'); },
+        OpenFileCrypt: function () { console.log('[jOffice] stub OpenFileCrypt'); },
+        PluginInstall: function () { console.log('[jOffice] stub PluginInstall'); },
+        PluginUninstall: function () { console.log('[jOffice] stub PluginUninstall'); },
+        PreloadCryptoImage: function () { console.log('[jOffice] stub PreloadCryptoImage'); },
+        Print: function () { console.log('[jOffice] stub Print'); },
+        Print_Start: function () { console.log('[jOffice] stub Print_Start'); },
+        Print_Page: function () { console.log('[jOffice] stub Print_Page'); },
+        Print_End: function () { console.log('[jOffice] stub Print_End'); },
+        RemoveAllSignatures: function () { console.log('[jOffice] stub RemoveAllSignatures'); },
+        RemoveFile: function () { console.log('[jOffice] stub RemoveFile'); },
+        RemoveSignature: function () { console.log('[jOffice] stub RemoveSignature'); },
+        ResaveFile: function () { console.log('[jOffice] stub ResaveFile'); },
+        SaveQuestion: function () { console.log('[jOffice] stub SaveQuestion'); },
+        SelectCertificate: function () { console.log('[jOffice] stub SelectCertificate'); return ''; },
+        SetAdvancedOptions: function () { console.log('[jOffice] stub SetAdvancedOptions'); },
+        SetLocalRestrictions: function () { console.log('[jOffice] stub SetLocalRestrictions'); },
+        Sign: function () { console.log('[jOffice] stub Sign'); },
+        SpellCheck: function () { console.log('[jOffice] stub SpellCheck'); },
+        ViewCertificate: function () { console.log('[jOffice] stub ViewCertificate'); },
+        buildCryptedEnd: function () { console.log('[jOffice] stub buildCryptedEnd'); },
+        buildCryptedStart: function () { console.log('[jOffice] stub buildCryptedStart'); },
+        emulateCloudPrinting: function () { console.log('[jOffice] stub emulateCloudPrinting'); },
+        localSaveToDrawingFormat: function () { console.log('[jOffice] stub localSaveToDrawingFormat'); },
+        nativeClipboardWrite: function () { console.log('[jOffice] stub nativeClipboardWrite'); },
+        onDocumentContentReady: function () { console.log('[jOffice] stub onDocumentContentReady'); },
+        onDocumentModifiedChanged: function () { console.log('[jOffice] stub onDocumentModifiedChanged'); },
+        openExternalReference: function () { console.log('[jOffice] stub openExternalReference'); },
+        sendSystemMessage: function () { console.log('[jOffice] stub sendSystemMessage'); },
+        startExternalConvertation: function () { console.log('[jOffice] stub startExternalConvertation'); },
+
         IsLocalFile: function () { return true; },
         GetEditorId: function () { return 'joffice'; },
         CheckNeedWheel: function () { return true; },
