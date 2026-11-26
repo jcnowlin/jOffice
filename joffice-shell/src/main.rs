@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use webkit6::javascriptcore::{Context, Value};
 use webkit6::{
     NavigationAction, NavigationPolicyDecision, PolicyDecisionType, ScriptMessageReply,
@@ -114,6 +115,41 @@ fn reply_err(reply: &ScriptMessageReply, msg: String) {
     reply.return_error_message(&msg);
 }
 
+/// Reply a SAVE failure: log it, tell the shim (reply_err → the
+/// shim signals EndSave(1)), AND show the user a native alert —
+/// round 2 §4: x2t/save errors are surfaced, never silent.
+/// EndSave(1) alone shows nothing in this editor build (drive
+/// F4: the failure was in the log, the UI sat quiet), so the
+/// native dialog is the user-visible half.
+fn reply_save_err(shell: &Rc<Shell>, reply: &ScriptMessageReply, msg: String) {
+    eprintln!("joffice: SAVE-ERROR {msg}");
+    if let Some(win) = shell.window.borrow().as_ref() {
+        let err_win = gtk4::Window::builder()
+            .title("Save failed")
+            .transient_for(win)
+            .modal(false)
+            .default_width(440)
+            .build();
+        let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+        vbox.set_margin_top(16);
+        vbox.set_margin_bottom(16);
+        vbox.set_margin_start(16);
+        vbox.set_margin_end(16);
+        let label = gtk4::Label::new(Some(&msg));
+        label.set_wrap(true);
+        label.set_halign(gtk4::Align::Start);
+        let button = gtk4::Button::with_label("OK");
+        button.set_halign(gtk4::Align::End);
+        let win_c = err_win.clone();
+        button.connect_clicked(move |_| win_c.close());
+        vbox.append(&label);
+        vbox.append(&button);
+        err_win.set_child(Some(&vbox));
+        err_win.present();
+    }
+    reply_err(reply, msg);
+}
+
 /// Opaque handle table: JS gets handle IDs, never raw filesystem paths.
 /// No literal-path fallback — a path is only resolvable if it was
 /// registered (via a dialog or --file at startup).
@@ -147,6 +183,221 @@ impl HandleTable {
     }
 }
 
+/// A document file's identity stamp at open time (marathon 2,
+/// Kagi round 2 §4): before a save renames over the file, the
+/// stamp is re-taken and compared — a mismatch means someone
+/// else changed the document under us, and the save refuses
+/// loudly instead of silently overwriting their work.
+#[derive(Clone, PartialEq, Debug)]
+struct FileStamp {
+    size: u64,
+    mtime: Option<std::time::SystemTime>,
+    inode: u64,
+}
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let md = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    let inode = {
+        use std::os::unix::fs::MetadataExt;
+        md.ino()
+    };
+    #[cfg(not(unix))]
+    let inode = 0;
+    Some(FileStamp {
+        size: md.len(),
+        mtime: md.modified().ok(),
+        inode,
+    })
+}
+
+/// FNV-1a 64-bit — a build-identity hash for the runtime manifest
+/// log (not cryptographic; it answers "which bytes are these").
+fn fnv_file(path: &Path) -> Option<String> {
+    let data = std::fs::read(path).ok()?;
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in &data {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Some(format!("{hash:016x}"))
+}
+
+/// Does this font family name claim CJK coverage? (Kagi round 2
+/// §5: the fallback is chosen by the coverage the real font
+/// claims.) The principled source is the ranges table inside
+/// font_selection.bin; parsing that binary format is out of
+/// scope for this cycle, so the decision uses the family name
+/// against the CJK families plausibly present in a generated
+/// set. Limitation recorded in marathon2/CYCLES.md.
+fn is_cjk_family(name: &str) -> bool {
+    const CJK: &[&str] = &[
+        "nanum", "noto sans cjk", "noto serif cjk", "source han",
+        "malgun", "gulim", "batang", "dotum", "gungsuh",
+        "ms gothic", "ms mincho", "yu gothic", "yu mincho", "meiryo",
+        "simsun", "simhei", "fangsong", "kaiti",
+        "microsoft yahei", "microsoft jhenghei", "pingfang",
+        "hiragino", "wenquanyi", "undotum", "unbatang", "baekmuk",
+        "ipagothic", "ipamincho", "kochi", "sazanami",
+        "droid sans fallback", "noto sans kr", "noto sans jp",
+        "noto sans sc", "noto sans tc", "noto sans hk",
+        "apple sd gothic", "applegothic", "applemyungjo",
+    ];
+    let n = name.to_lowercase();
+    CJK.iter().any(|c| n.contains(c))
+}
+
+/// The generated web AllFonts.js, parsed once at startup: the
+/// file list the editor will request, the family name behind
+/// each file index, and the served paths of the two designated
+/// fallbacks (Noto Sans CJK for CJK claims, Liberation Sans
+/// otherwise). Drives the scheme handler's FONT_MISS decision.
+#[derive(Default)]
+struct FontIndex {
+    /// __fonts_files entries, in order (the loader's Ids).
+    files: Vec<String>,
+    /// file index -> family name (from __fonts_infos; an info
+    /// entry references up to four face files of one family).
+    name_by_file: HashMap<usize, String>,
+    /// family name -> its REGULAR face's file index (the first
+    /// value in the infos entry). The web file list is numbered
+    /// ("014"), so the regular face cannot be found by filename
+    /// — it must come from the entry structure. (Drive F1b:
+    /// picking by iteration order served Liberation Sans BOLD
+    /// as the fallback.)
+    regular_by_name: HashMap<String, usize>,
+    cjk_fallback: Option<String>,
+    latin_fallback: Option<String>,
+}
+
+impl FontIndex {
+    fn load(sdkjs_dir: Option<&Path>) -> FontIndex {
+        let mut index = FontIndex::default();
+        let Some(dir) = sdkjs_dir else { return index };
+        let Ok(text) = std::fs::read_to_string(dir.join("common/AllFonts.js")) else {
+            return index;
+        };
+        index.files = parse_js_string_array(&text, "__fonts_files");
+        (index.name_by_file, index.regular_by_name) = parse_fonts_infos(&text);
+        // Fallbacks are the families' REGULAR faces.
+        index.latin_fallback = index
+            .regular_by_name
+            .get("Liberation Sans")
+            .and_then(|i| index.files.get(*i).cloned());
+        index.cjk_fallback = index
+            .regular_by_name
+            .iter()
+            .find(|(name, _)| name.starts_with("Noto Sans CJK"))
+            .and_then(|(_, i)| index.files.get(*i).cloned())
+            .or_else(|| index.latin_fallback.clone());
+        index
+    }
+
+    fn name_for_path(&self, id: &str) -> Option<String> {
+        let pos = self.files.iter().position(|f| f == id)?;
+        self.name_by_file.get(&pos).cloned()
+    }
+
+    /// (served path, fallback family name) for a missing font, or
+    /// None when no fallback exists in the generated set.
+    fn fallback_for(&self, real_name: &str) -> Option<(String, String)> {
+        if is_cjk_family(real_name) {
+            if let Some(p) = &self.cjk_fallback {
+                return Some((p.clone(), "Noto Sans CJK".to_string()));
+            }
+        }
+        self.latin_fallback
+            .as_ref()
+            .map(|p| (p.clone(), "Liberation Sans".to_string()))
+    }
+}
+
+/// Extract a `window["<key>"] = [ "a", "b", ... ];` string array
+/// from AllFonts.js text. Tolerant scanner, not a JS parser —
+/// the generator's output format is regular.
+fn parse_js_string_array(text: &str, key: &str) -> Vec<String> {
+    let Some(start) = text.find(key) else { return Vec::new() };
+    let Some(open) = text[start..].find('[') else { return Vec::new() };
+    let body_start = start + open + 1;
+    let Some(close) = text[body_start..].find(']') else { return Vec::new() };
+    let body = &text[body_start..body_start + close];
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_str = false;
+    let mut escaped = false;
+    for ch in body.chars() {
+        if in_str {
+            if escaped {
+                cur.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                out.push(std::mem::take(&mut cur));
+                in_str = false;
+            } else {
+                cur.push(ch);
+            }
+        } else if ch == '"' {
+            in_str = true;
+        }
+    }
+    out
+}
+
+/// Extract __fonts_infos entries: `["Name",i0,f0,i1,f1,...]`.
+/// Every non-negative integer in an entry is a file index of
+/// that family (regular/bold/italic/bold-italic faces) — map
+/// them all to the family name. Returns (name_by_file,
+/// regular_by_name): the first value of an entry is the
+/// family's regular face.
+fn parse_fonts_infos(text: &str) -> (HashMap<usize, String>, HashMap<String, usize>) {
+    let mut map = HashMap::new();
+    let mut regular = HashMap::new();
+    let Some(start) = text.find("__fonts_infos") else { return (map, regular) };
+    let Some(open) = text[start..].find('[') else { return (map, regular) };
+    let mut rest = &text[start + open + 1..];
+    loop {
+        // Find the next entry start `["`.
+        let Some(e) = rest.find("[\"") else { break };
+        rest = &rest[e + 2..];
+        let Some(q) = rest.find('"') else { break };
+        let name = rest[..q].to_string();
+        rest = &rest[q + 1..];
+        let Some(close) = rest.find(']') else { break };
+        let nums = &rest[..close];
+        // Entries are (file-index, style-flag) pairs: only the
+        // even-position VALUES are file indexes. (The token list
+        // starts with an empty token from the comma after the
+        // name — positions must be counted over parsed values,
+        // not raw tokens; counting raw tokens inverts the pairs
+        // and maps the flags. Caught by the cycle-1 F1 drive:
+        // every name lookup missed.)
+        let values: Vec<i64> = nums
+            .split(',')
+            .filter_map(|tok| tok.trim().parse::<i64>().ok())
+            .collect();
+        for (pos, n) in values.iter().enumerate() {
+            if pos % 2 == 0 && *n >= 0 {
+                map.insert(*n as usize, name.clone());
+            }
+        }
+        if let Some(first) = values.first() {
+            if *first >= 0 {
+                regular.insert(name.clone(), *first as usize);
+            }
+        }
+        rest = &rest[close + 1..];
+        // Stop at the end of the infos array (a `]` at depth 0
+        // appears as "]\n" followed by a non-entry); the loop's
+        // entry search simply fails when entries run out.
+        if rest.trim_start().starts_with(']') {
+            break;
+        }
+    }
+    (map, regular)
+}
+
 /// Shared shell state.
 struct Shell {
     /// Directory containing the web-apps checkout (editor JS), canonicalized.
@@ -162,10 +413,46 @@ struct Shell {
     /// Served under the /core-fonts/ prefix with its own containment
     /// root. None = not found (font file requests will 404).
     core_fonts_dir: Option<PathBuf>,
-    /// Root the ascdesktop://fonts/ handler serves from. Assembled
-    /// to mirror the paths AllFonts.js names (core-fonts/<family>/,
-    /// desktopeditors/fonts/). None = not found (font fetches 404).
+    /// Root the ascdesktop://fonts/ handler serves from. Since
+    /// marathon 2 this is the allfontsgen --output-web directory:
+    /// the generated web AllFonts.js names exactly the files here.
+    /// None = not found (font fetches 404).
     fonts_root: Option<PathBuf>,
+    /// The ORIGINAL fonts root (the allfontsgen --input): x2t's
+    /// m_sFontDir. None = font params omitted from conversions.
+    fonts_src_dir: Option<PathBuf>,
+    /// The generated native AllFonts.js for x2t (m_sAllFontsPath).
+    /// font_selection.bin sits beside it (x2t finds it there).
+    x2t_allfonts: Option<PathBuf>,
+    /// Blank templates for the launcher's New buttons
+    /// (converter/empty/<locale>/). None = New buttons disabled.
+    templates_dir: Option<PathBuf>,
+    /// Parsed generated web AllFonts.js (fallback decisions).
+    font_index: FontIndex,
+    /// Font substitutions served this session, in order:
+    /// (real family name, fallback family name). Drives the
+    /// banner and the save-time reminder (Kagi round 2 §5).
+    substitutions: RefCell<Vec<(String, String)>>,
+    /// The save-time substitution reminder has been shown.
+    save_toasted: RefCell<bool>,
+    /// The substitution banner widgets (set after window build).
+    banner_revealer: RefCell<Option<gtk4::Revealer>>,
+    banner_label: RefCell<Option<gtk4::Label>>,
+    /// Identity stamp of the currently open document at open /
+    /// last save (external-change check, §4).
+    doc_stamp: RefCell<Option<(PathBuf, FileStamp)>>,
+    /// Save sequence numbers (§4 overlapping saves): each saveFile
+    /// takes the next number; a completion whose number is not
+    /// newer than the last written one is superseded and skipped.
+    save_seq: RefCell<u64>,
+    save_written_seq: RefCell<u64>,
+    /// When the launcher opens a NEW document: the suggested
+    /// save-as name. The pendingFile handler then does NOT set
+    /// current_path (first save prompts via the dialog).
+    open_as_new: RefCell<Option<String>>,
+    /// The WebView (set after construction; the close handler
+    /// needs it to trigger save-on-close).
+    view: RefCell<Option<WebView>>,
     /// x2t converter binary (from the `core` build). None = not found.
     x2t: Option<PathBuf>,
     /// File to open on startup (--file). Consumed once via take().
@@ -198,11 +485,13 @@ impl Shell {
             .or_else(|| Some(webapps_dir.join("../core-fonts")))
             .and_then(|d| d.canonicalize().ok());
         // fonts root lookup: $JOFFICE_FONTSROOT first, then the
-        // sibling of web-apps.
+        // sibling of web-apps. Marathon 2: the allfontsgen
+        // --output-web directory (fonts-gen/web/fonts) — the
+        // generated web AllFonts.js paths are relative to it.
         let fonts_root = std::env::var_os("JOFFICE_FONTSROOT")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
-            .or_else(|| Some(webapps_dir.join("../fonts-root")))
+            .or_else(|| Some(webapps_dir.join("../fonts-gen/web/fonts")))
             .and_then(|d| d.canonicalize().ok());
         // x2t lookup: $JOFFICE_X2T first, then the packaged layout
         // (<exe-dir>/../converter/x2t, mirroring the upstream deb),
@@ -222,16 +511,55 @@ impl Shell {
                     .map(PathBuf::from)
                     .find(|p| p.exists())
             });
+        // fonts source root (x2t m_sFontDir): $JOFFICE_FONTSDIR,
+        // else the sibling fonts-src.
+        let fonts_src_dir = std::env::var_os("JOFFICE_FONTSDIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| Some(webapps_dir.join("../fonts-src")))
+            .and_then(|d| d.canonicalize().ok());
+        // native AllFonts.js for x2t: $JOFFICE_ALLFONTS, else the
+        // sibling fonts-gen/x2t/AllFonts.js.
+        let x2t_allfonts = std::env::var_os("JOFFICE_ALLFONTS")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| Some(webapps_dir.join("../fonts-gen/x2t/AllFonts.js")))
+            .filter(|p| p.exists());
+        // Templates: <converter dir>/empty/en-US (the converter
+        // ships blank new.docx/new.xlsx/new.pptx per locale).
+        let templates_dir = x2t.as_ref().and_then(|x| {
+            let d = x.parent()?.join("empty/en-US");
+            if d.join("new.docx").exists() {
+                Some(d)
+            } else {
+                None
+            }
+        });
+        let font_index = FontIndex::load(sdkjs_dir.as_deref());
+
         let mut handles = HandleTable::new();
         // Register --file at startup so it is resolvable as a handle.
         if let Some(p) = &pending_file {
             handles.insert(p.clone());
         }
-        Rc::new(Self {
+        let shell = Rc::new(Self {
             webapps_dir,
             sdkjs_dir,
             core_fonts_dir,
             fonts_root,
+            fonts_src_dir,
+            x2t_allfonts,
+            templates_dir,
+            font_index,
+            substitutions: RefCell::new(Vec::new()),
+            save_toasted: RefCell::new(false),
+            banner_revealer: RefCell::new(None),
+            banner_label: RefCell::new(None),
+            doc_stamp: RefCell::new(None),
+            save_seq: RefCell::new(0),
+            save_written_seq: RefCell::new(0),
+            open_as_new: RefCell::new(None),
+            view: RefCell::new(None),
             x2t,
             pending_file: RefCell::new(pending_file),
             handles: Rc::new(RefCell::new(handles)),
@@ -239,7 +567,135 @@ impl Shell {
             current_path: RefCell::new(None),
             active_dialog: RefCell::new(None),
             close_pending: RefCell::new(false),
-        })
+        });
+        shell.log_manifest();
+        shell
+    }
+
+    /// Runtime manifest at boot (Kagi round 1 instrumentation):
+    /// which x2t, which font maps, how many fonts — so a drive
+    /// log states the exact runtime it graded.
+    fn log_manifest(&self) {
+        let x2t_desc = match &self.x2t {
+            Some(p) => format!(
+                "{} fnv={}",
+                p.display(),
+                fnv_file(p).unwrap_or_else(|| "?".to_string())
+            ),
+            None => "NOT FOUND".to_string(),
+        };
+        eprintln!("joffice: MANIFEST x2t: {x2t_desc}");
+        if let Some(dir) = &self.sdkjs_dir {
+            let af = dir.join("common/AllFonts.js");
+            eprintln!(
+                "joffice: MANIFEST web AllFonts.js: {} fnv={} ({} files in generated index)",
+                af.display(),
+                fnv_file(&af).unwrap_or_else(|| "?".to_string()),
+                self.font_index.files.len()
+            );
+        }
+        if let Some(p) = &self.x2t_allfonts {
+            eprintln!(
+                "joffice: MANIFEST x2t AllFonts.js: {} fnv={}",
+                p.display(),
+                fnv_file(p).unwrap_or_else(|| "?".to_string())
+            );
+        }
+        eprintln!(
+            "joffice: MANIFEST fonts src: {:?}, fonts root (web): {:?}",
+            self.fonts_src_dir, self.fonts_root
+        );
+        eprintln!(
+            "joffice: MANIFEST font index: {} named files, cjk fallback: {:?}, latin fallback: {:?}",
+            self.font_index.name_by_file.len(),
+            self.font_index.cjk_fallback,
+            self.font_index.latin_fallback
+        );
+    }
+
+    /// Record that `path` is the open document and stamp it
+    /// (external-change check + recents, §4).
+    fn note_document_opened(&self, path: &Path) {
+        *self.doc_stamp.borrow_mut() = file_stamp(path).map(|s| (path.to_path_buf(), s));
+        let uri = gtk4::gio::File::for_path(path).uri();
+        gtk4::RecentManager::default().add_item(&uri);
+    }
+
+    /// Before writing a save over `dest`: refuse if the file on
+    /// disk no longer matches the stamp taken at open / last
+    /// save. (Only checked when the stamp is for this path —
+    /// a Save As target has no stamp and nothing to protect.)
+    fn check_unchanged(&self, dest: &Path) -> Result<(), String> {
+        let recorded = self.doc_stamp.borrow().clone();
+        if let Some((stamped_path, stamp)) = recorded {
+            if stamped_path == dest {
+                match file_stamp(dest) {
+                    Some(now) if now == stamp => Ok(()),
+                    Some(_) => Err(format!(
+                        "save refused: {} changed on disk since it was opened (another app or a sync client touched it). Save As to keep both copies.",
+                        dest.display()
+                    )),
+                    None => Err(format!(
+                        "save refused: {} disappeared from disk since it was opened.",
+                        dest.display()
+                    )),
+                }
+            } else {
+                Ok(())
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    /// After a successful save write: refresh the stamp, and
+    /// show the once-per-session substitution reminder (§5).
+    fn note_save_completed(&self, dest: &Path) {
+        *self.doc_stamp.borrow_mut() = file_stamp(dest).map(|s| (dest.to_path_buf(), s));
+        let subs = self.substitutions.borrow();
+        if !subs.is_empty() && !*self.save_toasted.borrow() {
+            *self.save_toasted.borrow_mut() = true;
+            drop(subs);
+            self.refresh_banner(true);
+        }
+    }
+
+    /// (Re)build the substitution banner text and reveal it.
+    /// `save_reminder` adds the §5 save-time line.
+    fn refresh_banner(&self, save_reminder: bool) {
+        let subs = self.substitutions.borrow();
+        if subs.is_empty() {
+            return;
+        }
+        let list = subs
+            .iter()
+            .map(|(real, fb)| format!("{real} (shown as {fb})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        drop(subs);
+        let mut text = format!("Fonts not installed: {list}. Layout may differ.");
+        if save_reminder {
+            text.push_str(" Saved with substituted fonts — check layout before sharing.");
+        }
+        if let Some(label) = self.banner_label.borrow().as_ref() {
+            label.set_text(&text);
+        }
+        if let Some(rev) = self.banner_revealer.borrow().as_ref() {
+            rev.set_reveal_child(true);
+        }
+    }
+
+    /// Record a font substitution (deduped) and show the banner.
+    fn note_substitution(&self, real: &str, fallback: &str) {
+        {
+            let mut subs = self.substitutions.borrow_mut();
+            let entry = (real.to_string(), fallback.to_string());
+            if subs.contains(&entry) {
+                return;
+            }
+            subs.push(entry);
+        }
+        self.refresh_banner(false);
     }
 }
 
@@ -288,15 +744,94 @@ fn format_for_path(path: &Path) -> i32 {
     }
 }
 
-/// Write bytes to `dest` via a same-directory temp file + rename,
-/// so a crash mid-save never leaves a truncated document.
+/// Write bytes to `dest` as a document save (marathon 2, Kagi
+/// round 2 §4 — the parts of save safety atomic rename alone
+/// does NOT give you):
+///   * Symlinks: the destination is canonicalized first, so the
+///     rename lands on the real target instead of replacing the
+///     link itself and leaving the target stale.
+///   * The temp file is fsynced, then renamed, then the PARENT
+///     DIRECTORY is fsynced — without the last step a power loss
+///     can lose the rename itself.
+///   * The existing file's permissions are copied onto the temp
+///     file, so a save never silently changes the document's mode.
+///   * The temp name is hidden and document-named
+///     (.~<name>.joffice-tmp-…) so a crash leftover is neither
+///     mistaken for a document nor eagerly uploaded by sync
+///     tools; stale leftovers in the directory are swept.
+/// Ok(()) is returned only after rename + directory fsync —
+/// callers clear the editor's modified flag on our ok reply,
+/// so ok must mean durable.
 fn write_atomic(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = dir.join(format!(".{}.tmp", temp_stem("savewrite")));
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, dest).inspect_err(|_| {
+    use std::io::Write;
+    // Canonicalize the target: an existing file resolves its
+    // symlinks; a new file canonicalizes its parent instead.
+    let dest_canon = match dest.canonicalize() {
+        Ok(c) => c,
+        Err(_) => {
+            let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+            let canon_parent = parent
+                .canonicalize()
+                .unwrap_or_else(|_| parent.to_path_buf());
+            match dest.file_name() {
+                Some(name) => canon_parent.join(name),
+                None => dest.to_path_buf(),
+            }
+        }
+    };
+    let dir = dest_canon
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let name = dest_canon
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "document".to_string());
+
+    // Sweep stale temp leftovers from crashed saves (>1 h old).
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let fname = entry.file_name().to_string_lossy().into_owned();
+            if fname.starts_with(".~") && fname.contains(".joffice-tmp-") {
+                let stale = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .map(|t| {
+                        t.elapsed()
+                            .map(|d| d > std::time::Duration::from_secs(3600))
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if stale {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
+    let tmp = dir.join(format!(
+        ".~{name}.joffice-tmp-{}",
+        temp_stem("save")
+    ));
+    let write_result = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        // Preserve the replaced file's permissions.
+        if let Ok(md) = std::fs::metadata(&dest_canon) {
+            let _ = f.set_permissions(md.permissions());
+        }
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, &dest_canon)?;
+        // Fsync the parent directory so the rename is durable.
+        let dir_file = std::fs::File::open(&dir)?;
+        dir_file.sync_all()?;
+        Ok(())
+    })();
+    if write_result.is_err() {
         let _ = std::fs::remove_file(&tmp);
-    })
+    }
+    write_result
 }
 
 fn xml_escape(s: &str) -> String {
@@ -329,6 +864,8 @@ fn x2t_convert_sync(
     from: &Path,
     format_to: i32,
     format_from: Option<i32>,
+    font_dir: Option<&Path>,
+    allfonts_path: Option<&Path>,
 ) -> Result<Vec<u8>, String> {
     let stem = temp_stem("x2t");
     let tmpdir = std::env::temp_dir();
@@ -345,6 +882,28 @@ fn x2t_convert_sync(
     if let Some(f) = format_from {
         extra.push_str(&format!("  <m_nFormatFrom>{f}</m_nFormatFrom>\n"));
     }
+    // Font wiring (marathon 2, Kagi round 2 §2): two separate
+    // elements, read independently. m_sFontDir points at the
+    // ORIGINAL fonts root (the allfontsgen --input), and
+    // m_sAllFontsPath at the generated NATIVE AllFonts.js —
+    // font_selection.bin sits beside it and x2t finds it there
+    // (there is no selection element in the XML schema).
+    if let Some(d) = font_dir {
+        extra.push_str(&format!(
+            "  <m_sFontDir>{}</m_sFontDir>\n",
+            xml_escape(&d.display().to_string())
+        ));
+    } else {
+        // Preserve the pre-marathon-2 shape when no font root is
+        // configured: an empty element, x2t uses its defaults.
+        extra.push_str("  <m_sFontDir />\n");
+    }
+    if let Some(p) = allfonts_path {
+        extra.push_str(&format!(
+            "  <m_sAllFontsPath>{}</m_sAllFontsPath>\n",
+            xml_escape(&p.display().to_string())
+        ));
+    }
     if format_to == fmt::CSV || format_to == fmt::TXT {
         // CSV/TXT need encoding + delimiter or x2t exits 89.
         // Element name is m_nCsvDelimiter (not m_cCsvDelimiter).
@@ -360,7 +919,6 @@ fn x2t_convert_sync(
   <m_sFileTo>{}</m_sFileTo>
   <m_nFormatTo>{}</m_nFormatTo>
   <m_sTempDir>{}</m_sTempDir>
-  <m_sFontDir />
   <m_sTitle>jOffice</m_sTitle>
   <m_bIsNoBase64>true</m_bIsNoBase64>
 {}</TaskQueueDataConvert>"#,
@@ -410,9 +968,18 @@ fn x2t_convert_async(
             return;
         }
     };
+    let font_dir = shell.fonts_src_dir.clone();
+    let allfonts = shell.x2t_allfonts.clone();
     let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
     std::thread::spawn(move || {
-        let result = x2t_convert_sync(&x2t, &from, format_to, format_from);
+        let result = x2t_convert_sync(
+            &x2t,
+            &from,
+            format_to,
+            format_from,
+            font_dir.as_deref(),
+            allfonts.as_deref(),
+        );
         let _ = tx.send(result);
     });
     // Poll the channel from the main thread; reply there (WebKit calls
@@ -626,51 +1193,191 @@ fn handle_uri_scheme(shell: &Shell, req: &URISchemeRequest) {
     }
 }
 
-/// Serve ascdesktop://fonts/<path> from the fonts root. The font
-/// loader's Ids are the paths AllFonts.js names ("/core-fonts/...",
-/// "/desktopeditors/fonts/...", a few build-machine
-/// "/usr/share/fonts/..." paths we cannot satisfy and let 404).
-/// Same defenses as the editor scheme: percent-decode, strip
-/// query, canonicalize + containment (copies, not symlinks, in the
-/// assembled root — a symlink would canonicalize outside it).
+/// Finish a font-scheme request with an explicit status and
+/// headers over a stream (marathon 2). Unlike finish_error, an
+/// explicit response lets the loader's XHR complete with a real
+/// status the JS wrap can act on, and lets us label substituted
+/// fonts (X-JOffice-Font-Substitute) and true misses
+/// (X-JOffice-Font: missing).
+fn finish_font(
+    req: &URISchemeRequest,
+    status: u32,
+    stream: &impl gtk4::gio::prelude::IsA<gtk4::gio::InputStream>,
+    len: i64,
+    mime: &str,
+    extra_headers: &[(&str, &str)],
+) {
+    let response = webkit6::URISchemeResponse::new(stream, len);
+    response.set_status(status, None);
+    response.set_content_type(mime);
+    let headers = webkit6::soup::MessageHeaders::new(webkit6::soup::MessageHeadersType::Response);
+    headers.append("Access-Control-Allow-Origin", "*");
+    // The font XHR is cross-origin (joffice:// page, ascdesktop://
+    // fonts): without this, JS cannot read the labeling headers
+    // back (getResponseHeader returns null) even though the
+    // response carries them.
+    headers.append(
+        "Access-Control-Expose-Headers",
+        "X-JOffice-Font-Substitute, X-JOffice-Font",
+    );
+    for (k, v) in extra_headers {
+        headers.append(k, v);
+    }
+    response.set_http_headers(headers);
+    req.finish_with_response(&response);
+}
+
+fn finish_font_empty(req: &URISchemeRequest, status: u32, extra_headers: &[(&str, &str)]) {
+    let stream = gtk4::gio::MemoryInputStream::from_bytes(&gtk4::glib::Bytes::from(&[][..]));
+    finish_font(req, status, &stream, 0, "application/octet-stream", extra_headers);
+}
+
+/// Serve a font file as a GFileInputStream hand-off: WebKit
+/// pulls the bytes itself instead of the handler reading the
+/// whole file on the main thread (Kagi round 2 §6 — synchronous
+/// whole-file reads in a custom-scheme handler serialize every
+/// font request and freeze the UI). Returns false if the file
+/// cannot be opened.
+fn serve_font_file(
+    req: &URISchemeRequest,
+    canon: &Path,
+    extra_headers: &[(&str, &str)],
+) -> bool {
+    let file = gtk4::gio::File::for_path(canon);
+    match file.read(None::<&gtk4::gio::Cancellable>) {
+        Ok(stream) => {
+            let len = std::fs::metadata(canon).map(|m| m.len() as i64).unwrap_or(-1);
+            finish_font(req, 200, &stream, len, content_type(canon), extra_headers);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Serve ascdesktop://fonts/<path> from the fonts root (the
+/// allfontsgen --output-web directory). The font loader's Ids
+/// are the paths the generated web AllFonts.js names.
+///
+/// Marathon 2 (Kagi round 2 §5/§6/§7): Rust decides missing vs
+/// slow, and a miss is answered IMMEDIATELY and LABELED — never
+/// left hanging:
+///   * file present → stream it (ledger: FONT-REQ result=ok).
+///   * file missing → serve the designated fallback (chosen by
+///     the coverage the real font claims: CJK → Noto Sans CJK,
+///     else Liberation Sans) with an X-JOffice-Font-Substitute
+///     header naming real→fallback; log FONT_MISS; record the
+///     substitution for the banner. The document loads with a
+///     stand-in instead of freezing at 53% forever.
+///   * no fallback → an explicit 404 with X-JOffice-Font:
+///     missing; the JS wrap treats it as a final failure and
+///     lets the load proceed without the font.
+/// Every request is ledger-logged with its result and the
+/// hand-off latency, for comparison against the JS ledger.
+/// Resolve a font id to a servable file. Ids come in three
+/// shapes, one per AllFonts.js layout: numeric (generated web
+/// layout — an index whose file entry is itself the name),
+/// root-relative paths (the deb's layout), and absolute paths
+/// (the generated desktop layout: the editor-facing AllFonts.js
+/// is the path-keyed one — its selection bin records are
+/// path-keyed and the desktop font manager joins bin against
+/// __fonts_files by path; numeric entries break substitution
+/// lookups such as Calibri→Carlito — see marathon2/CYCLES.md).
+/// Absolute ids are only served from inside the fonts root or
+/// the fonts source dir, never arbitrary paths.
+fn resolve_font_file(shell: &Shell, id: &str) -> Option<PathBuf> {
+    let root = shell.fonts_root.as_ref()?;
+    let mut candidates = vec![root.join(id)];
+    if id.starts_with('/') {
+        candidates.push(PathBuf::from(id));
+    } else {
+        candidates.push(PathBuf::from(format!("/{id}")));
+    }
+    for cand in candidates {
+        if let Ok(canon) = cand.canonicalize() {
+            if !canon.is_file() {
+                continue;
+            }
+            let in_root = canon.starts_with(root);
+            let in_src = shell
+                .fonts_src_dir
+                .as_ref()
+                .map(|s| canon.starts_with(s))
+                .unwrap_or(false);
+            if in_root || in_src {
+                return Some(canon);
+            }
+        }
+    }
+    None
+}
+
 fn handle_font_scheme(shell: &Shell, req: &URISchemeRequest) {
+    let t0 = Instant::now();
     let uri = req.uri().unwrap_or_default();
-    let not_found = |req: &URISchemeRequest, uri: &str| {
-        eprintln!("joffice: font 404: {uri}");
-        let mut err = gtk4::glib::Error::new(
-            gtk4::gio::IOErrorEnum::NotFound,
-            &format!("joffice: font not found: {uri}"),
-        );
-        req.finish_error(&mut err);
-    };
     let Some(root) = &shell.fonts_root else {
-        not_found(req, &uri);
+        eprintln!("joffice: FONT-REQ uri={uri} result=no-fonts-root");
+        finish_font_empty(req, 404, &[("X-JOffice-Font", "missing")]);
         return;
     };
     let rest = uri.strip_prefix("ascdesktop://").unwrap_or("");
     // Host must be "fonts"; the remainder is the font path.
     let Some((host, path)) = rest.split_once('/') else {
-        not_found(req, &uri);
+        finish_font_empty(req, 404, &[("X-JOffice-Font", "missing")]);
         return;
     };
     if host != "fonts" {
-        not_found(req, &uri);
+        finish_font_empty(req, 404, &[("X-JOffice-Font", "missing")]);
         return;
     }
     let path_part = path.split(['?', '#']).next().unwrap_or("");
     let decoded = gtk4::glib::uri_unescape_string(path_part, None::<&str>)
         .map(|s| s.to_string())
         .unwrap_or_else(|| path_part.to_string());
-    let file_path = root.join(decoded.trim_start_matches('/'));
-    match file_path.canonicalize() {
-        Ok(canon) if canon.starts_with(root) => match std::fs::read(&canon) {
-            Ok(data) => {
-                finish_ok(req, &data, content_type(&canon));
-            }
-            Err(_) => not_found(req, &uri),
-        },
-        _ => not_found(req, &uri),
+    let id = decoded.trim_start_matches('/').to_string();
+    if let Some(canon) = resolve_font_file(shell, &id) {
+        let bytes = std::fs::metadata(&canon).map(|m| m.len()).unwrap_or(0);
+        if serve_font_file(req, &canon, &[]) {
+            eprintln!(
+                "joffice: FONT-REQ id={id} result=ok bytes={bytes} ms={}",
+                t0.elapsed().as_millis()
+            );
+            return;
+        }
     }
+    // Missing. Decide the labeled answer.
+    let real_name = shell
+        .font_index
+        .name_for_path(&id)
+        .or_else(|| shell.font_index.name_for_path(&format!("/{id}")))
+        .unwrap_or_else(|| id.clone());
+    if let Some((fb_path, fb_name)) = shell.font_index.fallback_for(&real_name) {
+        if let Some(canon) = resolve_font_file(shell, fb_path.trim_start_matches('/')) {
+            {
+                // ASCII only in the header value: libsoup drops
+                // or mangles non-ASCII header bytes, and drive
+                // F1b showed the JS side then never sees the
+                // label. "A->B" it is.
+                let header = format!("{real_name}->{fb_name}");
+                if serve_font_file(req, &canon, &[("X-JOffice-Font-Substitute", &header)]) {
+                    eprintln!(
+                        "joffice: FONT_MISS id={id} real={real_name} fallback={fb_name} ms={}",
+                        t0.elapsed().as_millis()
+                    );
+                    eprintln!(
+                        "joffice: FONT-REQ id={id} result=substitute fallback={fb_name} ms={}",
+                        t0.elapsed().as_millis()
+                    );
+                    shell.note_substitution(&real_name, &fb_name);
+                    return;
+                }
+            }
+        }
+    }
+    eprintln!(
+        "joffice: FONT-REQ id={id} result=missing real={real_name} ms={}",
+        t0.elapsed().as_millis()
+    );
+    finish_font_empty(req, 404, &[("X-JOffice-Font", "missing")]);
 }
 
 // After a save completes, if a window close is pending, destroy the
@@ -682,6 +1389,68 @@ fn maybe_destroy_after_save(shell: &Rc<Shell>) {
             win.destroy();
         }
     }
+}
+
+/// Sanity-check converted output before it replaces a document
+/// (marathon 2, Kagi round 2 §4 "the wrong output gets written"):
+/// for the zip-family formats the output must be a zip, and for
+/// OOXML it must carry [Content_Types].xml. A converter that
+/// failed halfway must never hand us bytes we then rename over
+/// the user's document.
+fn save_output_sane(dest: &Path, bytes: &[u8]) -> bool {
+    let ext = dest
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "docx" | "xlsx" | "pptx" | "odt" | "ods" | "odp" => {
+            if !bytes.starts_with(b"PK\x03\x04") {
+                return false;
+            }
+            if matches!(ext.as_str(), "docx" | "xlsx" | "pptx") {
+                // Zip local headers store entry names in plain
+                // text; [Content_Types].xml must be among them.
+                let needle: &[u8] = b"[Content_Types].xml";
+                if !bytes.windows(needle.len()).any(|w| w == needle) {
+                    return false;
+                }
+            }
+            true
+        }
+        _ => !bytes.is_empty(),
+    }
+}
+
+/// Shared tail of every save (marathon 2 §4): sanity check →
+/// external-change check → sequence guard → atomic write →
+/// stamp refresh. Returns Ok(true) when bytes were written,
+/// Ok(false) when a newer save already landed (this one is
+/// superseded; replying ok is honest — the newer content is
+/// what's on disk). Err surfaces to the user via the shim.
+fn write_save_checked(
+    shell: &Shell,
+    dest: &Path,
+    bytes: &[u8],
+    seq: u64,
+) -> Result<bool, String> {
+    if !save_output_sane(dest, bytes) {
+        return Err(format!(
+            "save refused: the converter output for {} failed the sanity check (not a valid document package). Your original file was not touched.",
+            dest.display()
+        ));
+    }
+    shell.check_unchanged(dest)?;
+    if seq <= *shell.save_written_seq.borrow() {
+        eprintln!(
+            "joffice: save seq={seq} superseded by seq={} — skipped",
+            shell.save_written_seq.borrow()
+        );
+        return Ok(false);
+    }
+    write_atomic(dest, bytes).map_err(|e| format!("save write: {e}"))?;
+    *shell.save_written_seq.borrow_mut() = seq;
+    shell.note_save_completed(dest);
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -720,7 +1489,18 @@ fn handle_bridge(
                     // this, current_path stayed None for --file
                     // opens — convertFile does not set it — and every
                     // Ctrl+S fell into the Save As dialog branch.)
-                    *shell.current_path.borrow_mut() = Some(p.clone());
+                    // Exception (marathon 2): a launcher NEW document
+                    // opens from a template copy in a temp dir —
+                    // that copy must NOT become the save target, or
+                    // the first save would silently land in /tmp.
+                    // open_as_new marks it: no current_path (first
+                    // save prompts), no stamp, no recents entry.
+                    if shell.open_as_new.borrow().is_some() {
+                        *shell.open_as_new.borrow_mut() = None;
+                    } else {
+                        *shell.current_path.borrow_mut() = Some(p.clone());
+                        shell.note_document_opened(&p);
+                    }
                     let name = p
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
@@ -799,6 +1579,7 @@ fn handle_bridge(
             };
             if msg.cmd == "openFile" {
                 *shell.current_path.borrow_mut() = Some(path.clone());
+                shell.note_document_opened(&path);
             }
             let name = path
                 .file_name()
@@ -822,20 +1603,28 @@ fn handle_bridge(
 
         "saveFile" => {
             // JS sends Editor.bin (base64). Convert back via x2t and write.
+            // Marathon 2 (§4): every save takes a sequence number;
+            // completions write through write_save_checked, which
+            // refuses stale, insane, or externally-conflicted saves.
+            let seq = {
+                let mut s = shell.save_seq.borrow_mut();
+                *s += 1;
+                *s
+            };
             let b64 = msg.args.get("data").and_then(|v| v.as_str()).unwrap_or("");
             let save_as = msg.args.get("saveAs").and_then(|v| v.as_bool()).unwrap_or(false);
             use base64::Engine;
             let bin = match base64::engine::general_purpose::STANDARD.decode(b64) {
                 Ok(b) => b,
                 Err(e) => {
-                    reply_err(reply, format!("saveFile: bad base64: {e}"));
+                    reply_save_err(&shell, reply, format!("saveFile: bad base64: {e}"));
                     return;
                 }
             };
             let tmp_bin =
                 std::env::temp_dir().join(format!("{}.bin", temp_stem("save")));
             if let Err(e) = std::fs::write(&tmp_bin, &bin) {
-                reply_err(reply, format!("write temp Editor.bin: {e}"));
+                reply_save_err(&shell, reply, format!("write temp Editor.bin: {e}"));
                 return;
             }
 
@@ -892,15 +1681,18 @@ fn handle_bridge(
                             // output BYTES — write them to the target
                             // path. The October code replied ok and
                             // discarded them: save was a silent no-op.
-                            match write_atomic(&dest, &bytes) {
-                                Ok(()) => {
+                            // Marathon 2: the write goes through the
+                            // checked tail (sanity, external-change,
+                            // sequence) before it may land.
+                            match write_save_checked(&shell_c2, &dest, &bytes, seq) {
+                                Ok(_) => {
                                     reply_json(&reply_c2, &ctx_c2, &serde_json::json!({ "ok": true }));
                                     maybe_destroy_after_save(&shell_c2);
                                 }
-                                Err(e) => reply_err(&reply_c2, format!("save write: {e}")),
+                                Err(e) => reply_save_err(&shell_c2, &reply_c2, e),
                             }
                         }
-                        Err(e) => reply_err(&reply_c2, e),
+                        Err(e) => reply_save_err(&shell_c2, &reply_c2, e),
                     });
                 });
                 dialog.show();
@@ -919,15 +1711,16 @@ fn handle_bridge(
                     // Write the converted bytes to the document
                     // path (see the dialog branch: this write is
                     // the actual save; October discarded the bytes).
-                    match write_atomic(&dest, &bytes) {
-                        Ok(()) => {
+                    // Marathon 2: through the checked tail first.
+                    match write_save_checked(&shell_c, &dest, &bytes, seq) {
+                        Ok(_) => {
                             reply_json(&reply_c, &ctx_c, &serde_json::json!({ "ok": true }));
                             maybe_destroy_after_save(&shell_c);
                         }
-                        Err(e) => reply_err(&reply_c, format!("save write: {e}")),
+                        Err(e) => reply_save_err(&shell_c, &reply_c, e),
                     }
                 }
-                Err(e) => reply_err(&reply_c, e),
+                Err(e) => reply_save_err(&shell_c, &reply_c, e),
             });
         }
 
@@ -944,6 +1737,204 @@ fn handle_bridge(
             reply_err(reply, format!("unknown bridge command: {other}"));
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Window geometry (marathon 2, Kagi round 2 §3)
+//
+// Persist width, height and maximized ONLY — never x/y: on
+// Wayland a client cannot position its own window, and
+// pretending otherwise stores fiction. Saved on close-request
+// from the DEFAULT size (what the user actually chose, not the
+// transient allocation), restored before present().
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WindowGeometry {
+    width: i32,
+    height: i32,
+    maximized: bool,
+}
+
+fn geometry_path() -> PathBuf {
+    gtk4::glib::user_config_dir()
+        .join("joffice")
+        .join("window.json")
+}
+
+fn load_geometry() -> Option<WindowGeometry> {
+    let text = std::fs::read_to_string(geometry_path()).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn save_geometry(win: &ApplicationWindow) {
+    let geo = WindowGeometry {
+        width: win.default_width(),
+        height: win.default_height(),
+        maximized: win.is_maximized(),
+    };
+    let path = geometry_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(text) = serde_json::to_string(&geo) {
+        let _ = std::fs::write(&path, text);
+    }
+}
+
+/// Recent documents for the launcher: GtkRecentManager items
+/// (the bridge's note_document_opened writes opens into it),
+/// filtered to document files that still exist locally.
+fn recent_documents(limit: usize) -> Vec<(String, PathBuf)> {
+    const EXTS: &[&str] = &[
+        "docx", "xlsx", "pptx", "pdf", "odt", "ods", "odp", "doc", "xls", "ppt", "rtf", "txt",
+        "csv",
+    ];
+    let mgr = gtk4::RecentManager::default();
+    let mut out = Vec::new();
+    for info in mgr.items() {
+        if out.len() >= limit {
+            break;
+        }
+        if !info.exists() {
+            continue;
+        }
+        let uri = info.uri();
+        let Some(path) = gtk4::gio::File::for_uri(&uri).path() else {
+            continue;
+        };
+        let ext = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if !EXTS.contains(&ext.as_str()) {
+            continue;
+        }
+        out.push((info.display_name().to_string(), path));
+    }
+    out
+}
+
+/// Create a working copy of a blank template for a launcher
+/// New button. Returns (copy path, suggested save-as name).
+/// The copy lives in a per-process temp dir; it is the
+/// conversion source for opening, never the save target.
+fn make_new_document(shell: &Shell, ext: &str) -> Option<(PathBuf, String)> {
+    let templates = shell.templates_dir.as_ref()?;
+    let src = templates.join(format!("new.{ext}"));
+    let dir = std::env::temp_dir().join(format!("joffice-new-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).ok()?;
+    let dest = dir.join(format!("Untitled.{ext}"));
+    std::fs::copy(&src, &dest).ok()?;
+    Some((dest, format!("Untitled.{ext}")))
+}
+
+/// The native launcher shown on a no-args start (marathon 2,
+/// Kagi round 2 §3): Open via the native file dialog, New from
+/// the converter's blank templates, and recents from
+/// GtkRecentManager. Every path funnels into open_document,
+/// which loads the editor entry URL for the chosen file.
+fn build_launcher(
+    shell: &Rc<Shell>,
+    window: &ApplicationWindow,
+    open_document: &Rc<dyn Fn(PathBuf, Option<String>)>,
+) -> gtk4::Box {
+    let bx = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
+    bx.set_margin_start(28);
+    bx.set_margin_end(28);
+    bx.set_margin_top(24);
+    bx.set_margin_bottom(24);
+
+    let title = gtk4::Label::new(None);
+    title.set_markup("<b><big>jOffice</big></b>");
+    title.set_halign(gtk4::Align::Start);
+    bx.append(&title);
+
+    // Open…
+    let open_btn = gtk4::Button::with_label("Open…");
+    open_btn.set_halign(gtk4::Align::Start);
+    {
+        let shell_open = shell.clone();
+        let window_open = window.clone();
+        let od_open = open_document.clone();
+        open_btn.connect_clicked(move |_| {
+            if shell_open.active_dialog.borrow().is_some() {
+                return;
+            }
+            let dialog = FileChooserNative::new(
+                Some("Open document"),
+                Some(&window_open),
+                FileChooserAction::Open,
+                Some("_Open"),
+                Some("_Cancel"),
+            );
+            let filter = FileFilter::new();
+            filter.set_name(Some("Documents"));
+            for mime in [
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                "application/pdf",
+                "application/vnd.oasis.opendocument.text",
+            ] {
+                filter.add_mime_type(mime);
+            }
+            dialog.add_filter(&filter);
+            *shell_open.active_dialog.borrow_mut() = Some(dialog.clone());
+            let shell_c = shell_open.clone();
+            let od_c = od_open.clone();
+            dialog.connect_response(move |d, resp| {
+                *shell_c.active_dialog.borrow_mut() = None;
+                if resp == ResponseType::Accept {
+                    if let Some(path) = d.file().and_then(|f| f.path()) {
+                        od_c(path, None);
+                    }
+                }
+            });
+            dialog.show();
+        });
+    }
+    bx.append(&open_btn);
+
+    // New from template.
+    for (label, ext) in [
+        ("New Document", "docx"),
+        ("New Spreadsheet", "xlsx"),
+        ("New Presentation", "pptx"),
+    ] {
+        let btn = gtk4::Button::with_label(label);
+        btn.set_halign(gtk4::Align::Start);
+        btn.set_sensitive(shell.templates_dir.is_some());
+        let shell_c = shell.clone();
+        let od_c = open_document.clone();
+        btn.connect_clicked(move |_| match make_new_document(&shell_c, ext) {
+            Some((path, name)) => od_c(path, Some(name)),
+            None => eprintln!("joffice: launcher: no template available for {ext}"),
+        });
+        bx.append(&btn);
+    }
+
+    // Recents.
+    let rec_label = gtk4::Label::new(None);
+    rec_label.set_markup("<b>Recent documents</b>");
+    rec_label.set_halign(gtk4::Align::Start);
+    rec_label.set_margin_top(10);
+    bx.append(&rec_label);
+    let recents = recent_documents(10);
+    if recents.is_empty() {
+        let none = gtk4::Label::new(Some("No recent documents"));
+        none.set_halign(gtk4::Align::Start);
+        bx.append(&none);
+    } else {
+        for (name, path) in recents {
+            let btn = gtk4::Button::with_label(&name);
+            btn.set_halign(gtk4::Align::Start);
+            let od_c = open_document.clone();
+            btn.connect_clicked(move |_| od_c(path.clone(), None));
+            bx.append(&btn);
+        }
+    }
+    bx
 }
 
 // ---------------------------------------------------------------------------
@@ -1027,11 +2018,18 @@ fn main() {
     app.connect_activate(move |app| {
         let shell = shell_clone.clone();
 
+        // Geometry restore (§3): size from the saved geometry,
+        // maximized applied just before present() below.
+        let saved_geo = load_geometry();
+        let (geo_w, geo_h) = saved_geo
+            .as_ref()
+            .map(|g| (g.width, g.height))
+            .unwrap_or((1280, 900));
         let window = ApplicationWindow::builder()
             .application(app)
             .title("jOffice")
-            .default_width(1280)
-            .default_height(900)
+            .default_width(geo_w)
+            .default_height(geo_h)
             .build();
         *shell.window.borrow_mut() = Some(window.clone());
 
@@ -1044,6 +2042,9 @@ fn main() {
         // wedged save cannot hang the close forever.
         let shell_close = shell.clone();
         window.connect_close_request(move |win| {
+            // Geometry is saved on EVERY close-request (§3),
+            // before any save dance below.
+            save_geometry(win);
             // Already waiting on a save: allow this close through.
             // (Destroying the window does not re-fire close-request,
             // but the guard makes the state machine explicit.)
@@ -1052,16 +2053,14 @@ fn main() {
             }
             if shell_close.current_path.borrow().is_some() {
                 *shell_close.close_pending.borrow_mut() = true;
-                if let Some(child) = win.child() {
-                    if let Ok(view) = child.downcast::<WebView>() {
-                        view.evaluate_javascript(
-                            "window.AscDesktopEditor && window.AscDesktopEditor.LocalFileSave && window.AscDesktopEditor.LocalFileSave('', null, null, 0, null);",
-                            None,
-                            None,
-                            None::<&gtk4::gio::Cancellable>,
-                            |_| {},
-                        );
-                    }
+                if let Some(view) = shell_close.view.borrow().as_ref() {
+                    view.evaluate_javascript(
+                        "window.AscDesktopEditor && window.AscDesktopEditor.LocalFileSave && window.AscDesktopEditor.LocalFileSave('', null, null, 0, null);",
+                        None,
+                        None,
+                        None::<&gtk4::gio::Cancellable>,
+                        |_| {},
+                    );
                 }
                 // Watchdog: destroy after 10s even if the save never lands.
                 let shell_watch = shell_close.clone();
@@ -1222,15 +2221,17 @@ fn main() {
             );
         }
 
-        // Load the editor through the desktop entry contract
-        // (cycle 2): the product enters via
-        // apps/api/documents/index.html (deployed from
-        // index.html.desktop), whose URL parameters become the
-        // DocInfo that gates LocalStartOpen. Loading the editor
-        // app directly leaves it waiting for a config that can
-        // never arrive (cycle 1's finding).
-        let entry = editor_entry_url(shell.pending_file.borrow().as_ref());
-        view.load_uri(&entry);
+        *shell.view.borrow_mut() = Some(view.clone());
+        // The view now lives inside a GtkBox (banner above it),
+        // not as the window's direct child: a box only gives a
+        // child the leftover space when the child asks to expand.
+        // Without this the WebView keeps a ~0 allocation — the
+        // page runs (JS, fonts, onready all fire) but never
+        // paints, snapshots fail, and clicks land nowhere.
+        // (Cycle-1 drive bisect: marathon-1 binary painted under
+        // the identical harness; this was the difference.)
+        view.set_hexpand(true);
+        view.set_vexpand(true);
 
         // Console messages to stdout for debugging (WebKitGTK 6.0).
         if let Some(settings) = webkit6::prelude::WebViewExt::settings(&view) {
@@ -1243,7 +2244,70 @@ fn main() {
             false
         });
 
-        window.set_child(Some(&view));
+        // Window layout (marathon 2): a vertical box holding the
+        // font-substitution banner (hidden until a substitution
+        // happens, §5) above the content — the WebView when a
+        // document is open, the native launcher when not.
+        let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let banner_label = gtk4::Label::new(None);
+        banner_label.set_halign(gtk4::Align::Start);
+        banner_label.set_margin_start(12);
+        banner_label.set_margin_end(12);
+        banner_label.set_margin_top(6);
+        banner_label.set_margin_bottom(6);
+        let banner_revealer = gtk4::Revealer::new();
+        banner_revealer.set_child(Some(&banner_label));
+        banner_revealer.set_reveal_child(false);
+        *shell.banner_label.borrow_mut() = Some(banner_label);
+        *shell.banner_revealer.borrow_mut() = Some(banner_revealer.clone());
+        vbox.append(&banner_revealer);
+
+        let launcher_holder: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
+
+        // Open a document in the editor: swap the launcher for
+        // the WebView (first open) and load the entry URL. The
+        // pending-file machinery (bridge pendingFile) does the
+        // rest, exactly as for a --file launch.
+        let open_document: Rc<dyn Fn(PathBuf, Option<String>)> = {
+            let shell_od = shell.clone();
+            let view_od = view.clone();
+            let vbox_od = vbox.clone();
+            let launcher_od = launcher_holder.clone();
+            Rc::new(move |path: PathBuf, as_new: Option<String>| {
+                *shell_od.open_as_new.borrow_mut() = as_new;
+                *shell_od.pending_file.borrow_mut() = Some(path.clone());
+                if let Some(launcher) = launcher_od.borrow_mut().take() {
+                    vbox_od.remove(&launcher);
+                    vbox_od.append(&view_od);
+                }
+                // Load the editor through the desktop entry
+                // contract (cycle 2): the product enters via
+                // apps/api/documents/index.html (deployed from
+                // index.html.desktop), whose URL parameters
+                // become the DocInfo that gates LocalStartOpen.
+                let entry = editor_entry_url(Some(&path));
+                view_od.load_uri(&entry);
+            })
+        };
+
+        if shell.pending_file.borrow().is_some() {
+            // --file launch: straight into the editor, as before.
+            vbox.append(&view);
+            let entry = editor_entry_url(shell.pending_file.borrow().as_ref());
+            view.load_uri(&entry);
+        } else {
+            // No-args launch: the native launcher (Kagi round 2
+            // §3/§8 — a start window is a feature, not chrome).
+            let launcher = build_launcher(&shell, &window, &open_document);
+            *launcher_holder.borrow_mut() = Some(launcher.clone());
+            vbox.append(&launcher);
+        }
+
+        window.set_child(Some(&vbox));
+        // Geometry restore completes before present() (§3).
+        if saved_geo.as_ref().map(|g| g.maximized).unwrap_or(false) {
+            window.maximize();
+        }
         window.present();
     });
 

@@ -433,6 +433,185 @@
         }
     };
 
+    // -----------------------------------------------------------
+    // Font-load survivability + ledger (marathon 2 cycle 1;
+    // Kagi round 2 §6/§7 is the design authority).
+    //
+    // The stock CFontFileLoader.LoadFontAsync (sdkjs common/Local/
+    // common.js) hangs document loading forever when a font fetch
+    // fails: on a non-200 response it sets Status = 1 and returns
+    // WITHOUT calling the callback, and it has no onerror handler
+    // at all (marathon 1's 53% freeze). This wrap replaces the
+    // prototype method the moment it exists — before the first
+    // font request — with a faithful copy of the original body
+    // plus the survival machinery:
+    //   * Status stays within {-1, 2, 0, 1} (sdkjs compares
+    //     against these exact values; a new one could rehang).
+    //   * The callback fires AT MOST once, on success AND on
+    //     failure — failure now ends the wait instead of freezing.
+    //   * Shim-owned bookkeeping lives in this._jo =
+    //     {phase, t0, bytes, reason}; Status stays clean.
+    //   * Missing vs slow is decided by RUST, not guessed here:
+    //     a missing font gets an immediate labeled answer from
+    //     the scheme handler (fallback bytes + the
+    //     X-JOffice-Font-Substitute header, or an error status
+    //     with X-JOffice-Font: missing). At 10 s still loading we
+    //     log FONT_SLOW and keep waiting; we fail the load only
+    //     after ~90 s with zero download progress (a dead read).
+    //   * Ledger: JS start/end per font Id, logged to the console
+    //     (the shell mirrors console to stdout). Rust logs its
+    //     side per request; the drive compares the two — a Rust
+    //     request with no JS entry means a code path bypassed
+    //     this wrap (Kagi §7's riskiest assumption, tested).
+    // -----------------------------------------------------------
+    window.__joFontSubstitutes = window.__joFontSubstitutes || [];
+    (function installFontLoaderWrap() {
+        // The wrap must be RE-ASSERTED, not installed once: the
+        // CFontFileLoader class appears before its desktop
+        // LoadFontAsync does, and Local/common.js ASSIGNS the
+        // real implementation onto the prototype when it loads —
+        // overwriting any wrap placed earlier (drive 1 of this
+        // cycle: wrap logged as installed, then all 23 font
+        // fetches ran unwrapped — the §7 ledger caught it).
+        // So: poll for the lifetime of the page; whenever the
+        // current prototype method is not ours, replace it.
+        var asserted = 0;
+        setInterval(function () {
+            var loader = window.AscFonts && window.AscFonts.CFontFileLoader;
+            if (loader && loader.prototype
+                && typeof loader.prototype.LoadFontAsync === 'function'
+                && loader.prototype.LoadFontAsync !== joLoadFontAsync) {
+                loader.prototype.LoadFontAsync = joLoadFontAsync;
+                asserted++;
+                console.log('[jOffice][font-ledger] LoadFontAsync wrap asserted (' + asserted + ')');
+            }
+        }, 25);
+
+        function joLoadFontAsync(basePath, callback) {
+            this.callback = callback;
+            if (-1 !== this.Status)
+                return true;
+
+            this.Status = 2;
+            var fontFile = this;
+            var jo = this._jo = {
+                phase: 'loading',
+                t0: (window.performance && performance.now) ? performance.now() : Date.now(),
+                bytes: 0,
+                reason: null
+            };
+            var fired = false;
+            function fireCallbackOnce() {
+                if (fired) return;
+                fired = true;
+                if (null != fontFile.callback)
+                    fontFile.callback();
+                if (fontFile["externalCallback"])
+                    fontFile["externalCallback"]();
+            }
+            function ledgerEnd(reason) {
+                jo.phase = 'done';
+                jo.reason = reason;
+                var now = (window.performance && performance.now) ? performance.now() : Date.now();
+                console.log('[jOffice][font-ledger] JS end id=' + fontFile.Id
+                    + ' status=' + fontFile.Status
+                    + ' ms=' + Math.round(now - jo.t0)
+                    + ' bytes=' + jo.bytes
+                    + ' reason=' + reason);
+            }
+            console.log('[jOffice][font-ledger] JS start id=' + fontFile.Id);
+
+            var xhr = new XMLHttpRequest();
+            xhr.open('GET', "ascdesktop://fonts/" + fontFile.Id, true);
+            xhr.responseType = 'arraybuffer';
+
+            if (xhr.overrideMimeType)
+                xhr.overrideMimeType('text/plain; charset=x-user-defined');
+            else
+                xhr.setRequestHeader('Accept-Charset', 'x-user-defined');
+
+            var lastProgressAt = Date.now();
+            xhr.onprogress = function (e) {
+                lastProgressAt = Date.now();
+                if (e && e.loaded) jo.bytes = e.loaded;
+            };
+
+            // FONT_SLOW at 10 s: log, mark, keep waiting (Kagi §6).
+            var slowTimer = setTimeout(function () {
+                if (fontFile.Status === 2) {
+                    jo.phase = 'slow';
+                    console.log('[jOffice][font-ledger] FONT_SLOW id=' + fontFile.Id + ' (still loading at 10s)');
+                }
+            }, 10000);
+            // Hard fail at ~90 s ONLY when the read shows no
+            // progress at all — a live stream is never killed.
+            var deadTimer = setTimeout(function () {
+                if (fontFile.Status === 2 && Date.now() - lastProgressAt >= 89000) {
+                    console.error('[jOffice][font-ledger] FONT_DEAD id=' + fontFile.Id + ' (no progress in 90s)');
+                    try { xhr.abort(); } catch (e) { /* already gone */ }
+                    fontFile.Status = 1;
+                    ledgerEnd('dead-no-progress-90s');
+                    fireCallbackOnce();
+                }
+            }, 90000);
+
+            xhr.onload = function () {
+                clearTimeout(slowTimer);
+                clearTimeout(deadTimer);
+                if (xhr.status !== 200) {
+                    // THE FIX: the original set Status = 1 here and
+                    // never called the callback — the document load
+                    // waited forever. Fire it: the font is absent,
+                    // the document proceeds without it.
+                    fontFile.Status = 1;
+                    ledgerEnd('http-' + xhr.status);
+                    fireCallbackOnce();
+                    return;
+                }
+
+                var substitute = null;
+                try { substitute = xhr.getResponseHeader('X-JOffice-Font-Substitute'); } catch (e) { /* headers unavailable */ }
+
+                fontFile.Status = 0;
+
+                let fontStreams = AscFonts.g_fonts_streams;
+                let streamIndex = fontStreams.length;
+                if (xhr.response) {
+                    let data = new Uint8Array(xhr.response);
+                    jo.bytes = data.length;
+                    fontStreams[streamIndex] = new AscFonts.FontStream(data, data.length);
+                }
+                else {
+                    fontStreams[streamIndex] = AscFonts.CreateFontData3(xhr.responseText);
+                }
+
+                fontFile.SetStreamIndex(streamIndex);
+
+                if (substitute) {
+                    window.__joFontSubstitutes.push(substitute);
+                    ledgerEnd('substituted:' + substitute);
+                } else {
+                    ledgerEnd('ok');
+                }
+                fireCallbackOnce();
+            };
+
+            xhr.onerror = function () {
+                clearTimeout(slowTimer);
+                clearTimeout(deadTimer);
+                if (fontFile.Status !== 2) return;
+                // The original has NO onerror handler: a scheme
+                // error also froze the load. Same fix as non-200.
+                fontFile.Status = 1;
+                ledgerEnd('network-error');
+                fireCallbackOnce();
+            };
+
+            xhr.send(null);
+            return true;
+        }
+    })();
+
     function _b64ToBytes(b64) {
         var raw = atob(b64);
         var bytes = new Uint8Array(raw.length);
