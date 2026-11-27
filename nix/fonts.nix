@@ -49,7 +49,14 @@ pkgs.stdenv.mkDerivation {
     copy_fonts ${pkgs.caladea} truetype
     copy_fonts ${pkgs.dejavu_fonts} truetype
     copy_fonts ${pkgs.noto-fonts-cjk-sans} opentype/noto-cjk truetype/noto-cjk
-    copy_fonts ${nanumPkg} truetype
+    # nanum ships its files directly under share/fonts (no
+    # truetype/ subdir); the generic copy silently copied
+    # nothing in the first build — the editor's Nanum faces
+    # were missing from the set entirely (cycle 4 finisher,
+    # Phase-3 regression).
+    find ${nanumPkg}/share/fonts -maxdepth 1 \
+      \( -iname '*.ttf' -o -iname '*.otf' -o -iname '*.ttc' \) \
+      -exec cp -v {} $out/fonts/ \;
     # Flat layout is what gen-fonts.sh consumed in cycle 1
     # (fonts-src); duplicate basenames would collide — fail
     # loudly instead of silently dropping a family.

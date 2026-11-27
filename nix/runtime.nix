@@ -4,13 +4,21 @@
 # Layout produced:
 #   $out/share/joffice/runtime/
 #     converter/     x2t + its bundled libs (patchelfed)
-#     sdkjs/         editors/sdkjs from the deb, sdk-all
-#                    caches deleted, common/AllFonts.js =
-#                    the converter map (see fonts note)
-#     sdkjs-deploy/  the renderer tree (a second copy)
-#     web-apps/      editors/web-apps from the deb
+#     sdkjs/         the DEVELOP sdkjs (GitHub pin below),
+#                    sdk-all caches deleted, common/
+#                    AllFonts.js = the converter map
+#                    (see fonts note)
+#     sdkjs-deploy/  the deb's editors/sdkjs (renderer tree)
+#     web-apps/      the DEVELOP web-apps (GitHub pin
+#                    below — NOT the deb's deploy build)
 #     fonts/         deb fonts + nix/fonts.nix files +
 #                    AllFonts.js + font_selection.bin
+#     fonts/core-fonts/ + fonts/desktopeditors/
+#                    the editor-facing font trees the deb's
+#                    path-keyed AllFonts.js names, resolved
+#                    by the shell against the fonts root
+#                    (see the assembly note in the install
+#                    phase)
 #     dictionaries/  from the deb
 #     runtime-manifest.json
 #
@@ -19,12 +27,12 @@
 # design — the same code path serves the staged runtime and
 # the Nix one).
 #
-# Fonts note: the deb's converter/AllFonts.js references a
-# core-fonts tree the deb does not ship, and regenerating the
-# map for this font set needs allfontsgen (see
-# allfontsgen.nix). This derivation therefore ships the deb's
-# converter artifacts as-is; the editor-facing map is the
-# cycle's known gap (graded in N2).
+# Fonts note: the deb's converter/AllFonts.js is the
+# editor-facing map; the trees its paths name ship below.
+# Regenerating the map for exactly this font set (the x2t
+# side) still needs allfontsgen — see allfontsgen.nix; that
+# remains the follow-up's debt, graded in the regression's
+# PDF-export leg.
 { pkgs, lib }:
 
 let
@@ -49,6 +57,24 @@ let
     repo = "sdkjs";
     rev = "0cde84e8dbfb299b53098532c8af142712830cc6";
     hash = "sha256-mbucMiTSgdp5QVpX9j52/dWmCXgHBLrTzjB5L226D8k=";
+  };
+  # The web-apps is ALSO the develop tree, from its own
+  # repo at the pin the shell's bootstrap stamp names
+  # ("web-apps f50e7e32, sdkjs 0cde84e8" in main.rs). The
+  # deb's editors/web-apps is the compiled deploy build:
+  # its index.html loads the sdk-all bundles the develop
+  # sdkjs does not carry, so an editor on the deb's
+  # web-apps dies with a scheme 404 on
+  # /sdkjs/word/sdk-all-min.js (cycle 4 finisher, N2:
+  # the staged runtime works because it pairs develop
+  # web-apps with develop sdkjs; the first Nix build
+  # shipped the deb's web-apps and no editor ever
+  # loaded).
+  webappsSrc = pkgs.fetchFromGitHub {
+    owner = "Euro-Office";
+    repo = "web-apps";
+    rev = "f50e7e32caba70bbe96f9f8b21ad4b7f4009884e";
+    hash = "sha256-M1zzlbkkdhHWfA19RCIMQ0z0gEy08gQQkQNBBgIU/3w=";
   };
 in
 pkgs.stdenv.mkDerivation {
@@ -96,8 +122,46 @@ pkgs.stdenv.mkDerivation {
 
     cp -r $APP/converter $RT/converter
     cp -r ${sdkjsSrc} $RT/sdkjs
+    chmod -R u+w $RT/sdkjs
+    # The develop-mode script manifests: the develop
+    # web-apps loads the sdkjs through
+    # sdkjs/develop/sdkjs/<editor>/scripts.js, a
+    # generated file list the sdkjs build produces and
+    # the raw repo does not carry. The four manifests
+    # are vendored under nix/assets/sdkjs-develop/ —
+    # generated 2026-11-25 against this exact sdkjs pin
+    # (they enumerate the pin's own files; the staged
+    # runtime's editor runs on them). Regenerate if the
+    # sdkjs pin ever moves (cycle 4 finisher, N2).
+    for ed in word cell slide visio; do
+      mkdir -p $RT/sdkjs/develop/sdkjs/$ed
+      cp ${./assets/sdkjs-develop}/$ed/scripts.js \
+         $RT/sdkjs/develop/sdkjs/$ed/scripts.js
+    done
     cp -r $APP/editors/sdkjs $RT/sdkjs-deploy
-    cp -r $APP/editors/web-apps $RT/web-apps
+    cp -r ${webappsSrc}/. $RT/web-apps
+    chmod -R u+w $RT/web-apps
+    # The desktop entry contract: the shell loads
+    # apps/api/documents/index.html, which the vendor
+    # build "deploys" from index.html.desktop. The raw
+    # repo has only the .desktop file; the staged runtime
+    # carries the two byte-identical (verified). Deploy
+    # it the same way (cycle 4 finisher, N2: without
+    # this the entry page itself 404s and no editor
+    # ever loads).
+    cp $RT/web-apps/apps/api/documents/index.html.desktop \
+       $RT/web-apps/apps/api/documents/index.html
+    # Euro-Office theme glue the staged runtime carries
+    # and the web-apps pin does not: a one-line @import
+    # shim onto the fork's theme, and the mobile logo
+    # overrides. Vendored under nix/assets/less/ with
+    # their content unchanged (cycle 4 finisher, N2:
+    # the develop page requests _theme-main.less by
+    # name and 404s without it).
+    cp ${./assets/less/_theme-main.less} \
+       $RT/web-apps/apps/common/main/resources/less/_theme-main.less
+    cp ${./assets/less/_theme-mobile-overrides.less} \
+       $RT/web-apps/apps/common/mobile/resources/less/_theme-mobile-overrides.less
     cp -r $APP/fonts $RT/fonts
     cp -r $APP/dictionaries $RT/dictionaries
     # Fetched sources land read-only; the copies below write
@@ -106,10 +170,13 @@ pkgs.stdenv.mkDerivation {
 
     # The editor-facing font map: the converter's path-keyed
     # file is the same form the desktop shell consumes
-    # (cycle 1). Paths inside it name the vendor layout; the
-    # shell's font index tolerates missing entries (they fail
-    # soft per cycle 1's loader fix) — regeneration for this
-    # exact set is the allfontsgen follow-up.
+    # (cycle 1). Paths inside it name the vendor layout.
+    # Missing entries fail soft only for faces nothing shapes
+    # with; a face a document actually lays out with resolves
+    # to a null face and the text shaper dies (m_pFaceInfo) —
+    # the trees below are what make the named faces
+    # resolvable. Regeneration of the map for this exact set
+    # is the allfontsgen follow-up.
     cp $APP/converter/AllFonts.js $RT/sdkjs/common/AllFonts.js
     cp $APP/converter/AllFonts.js $RT/sdkjs-deploy/common/AllFonts.js
     cp $APP/converter/AllFonts.js $RT/fonts/AllFonts.js
@@ -128,6 +195,34 @@ pkgs.stdenv.mkDerivation {
     # The nixpkgs font files join the deb's in one flat dir
     # (gen-fonts.sh's input layout).
     cp ${fonts}/fonts/* $RT/fonts/ || true
+
+    # The editor-facing font trees (cycle 4 finisher, found
+    # by the Phase-3 regression): the map copied above names
+    # 184 root-relative core-fonts/<sub>/<file> ids and one
+    # desktopeditors/fonts/ id. The loader fetches them
+    # through ascdesktop://fonts/<id>, and the shell resolves
+    # an id against the FONTS ROOT ($JOFFICE_FONTSROOT — this
+    # tree's fonts/): root.join(id), served only from inside
+    # the root. The first Nix build shipped neither tree
+    # under fonts/: every editor font fetch missed, the text
+    # shaper died on a null face, and no document rendered at
+    # all. The staged runtime works because its fonts-root/
+    # carries exactly these trees. Assemble them from the
+    # same sources: the deb's own font files, plus the
+    # nixpkgs families in fonts.nix.
+    mkdir -p $RT/fonts/core-fonts/{asana,caladea,crosextra,liberation,nanum,openoffice,opensans}
+    cp $APP/fonts/ASC.ttf $RT/fonts/core-fonts/ASC.ttf
+    cp -r $APP/fonts/asana/. $RT/fonts/core-fonts/asana/
+    cp -r $APP/fonts/caladea/. $RT/fonts/core-fonts/caladea/
+    cp -r $APP/fonts/crosextra/. $RT/fonts/core-fonts/crosextra/
+    cp ${fonts}/fonts/Liberation*.ttf $RT/fonts/core-fonts/liberation/
+    cp ${fonts}/fonts/NanumBarunGothic.ttf \
+       ${fonts}/fonts/NanumBarunGothicBold.ttf $RT/fonts/core-fonts/nanum/
+    cp $APP/fonts/openoffice/opens___.ttf $RT/fonts/core-fonts/openoffice/
+    cp $APP/fonts/OpenSans-*.ttf $RT/fonts/core-fonts/opensans/
+    mkdir -p $RT/fonts/desktopeditors/fonts/caladea
+    cp $RT/fonts/core-fonts/caladea/caladea-bolditalic.ttf \
+       $RT/fonts/desktopeditors/fonts/caladea/caladea-bolditalic.ttf
 
     # sdkjs caches are fingerprint-invalidated by the shell
     # at runtime; shipping the deb's prebuilt ones would
