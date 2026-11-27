@@ -5720,13 +5720,36 @@ fn modal_parent(shell: &Rc<Shell>) -> Option<gtk4::Window> {
 fn run_nested_modal(win: &gtk4::Window) {
     eprintln!("joffice: MODAL enter thread={:?}", std::thread::current().id());
     let loop_ = gtk4::glib::MainLoop::new(None, false);
-    let quit = loop_.clone();
-    win.connect_destroy(move |_| {
-        eprintln!("joffice: MODAL destroy seen");
-        quit.quit()
-    });
+    // Drive finding (protected cycle): GtkWindow::close() on
+    // this stack HIDES the window — it leaves the screen and
+    // the compositor's toplevel list, but destroy never
+    // fires. A loop keyed only on destroy therefore spins
+    // forever with the dialog invisible. Quit on
+    // close-request as well, and destroy explicitly once
+    // the loop is out.
+    let destroyed = Rc::new(std::cell::Cell::new(false));
+    {
+        let quit = loop_.clone();
+        let destroyed = destroyed.clone();
+        win.connect_destroy(move |_| {
+            destroyed.set(true);
+            eprintln!("joffice: MODAL destroy seen");
+            quit.quit()
+        });
+    }
+    {
+        let quit = loop_.clone();
+        win.connect_close_request(move |_| {
+            eprintln!("joffice: MODAL close-request seen");
+            quit.quit();
+            gtk4::glib::Propagation::Proceed
+        });
+    }
     win.present();
     loop_.run();
+    if !destroyed.get() {
+        win.destroy();
+    }
     eprintln!("joffice: MODAL exit");
 }
 
@@ -5802,7 +5825,7 @@ fn prompt_password_sync(
                 *decided.borrow_mut() = true;
                 *result.borrow_mut() = Some(entry_c.text().to_string());
             }
-            win_c.close();
+            win_c.destroy();
             eprintln!("joffice: PW_OK close returned");
         });
     }
@@ -5814,7 +5837,7 @@ fn prompt_password_sync(
     }
     {
         let win_c = win.clone();
-        cancel.connect_clicked(move |_| win_c.close());
+        cancel.connect_clicked(move |_| win_c.destroy());
     }
     entry.grab_focus();
     run_nested_modal(&win);
@@ -5896,12 +5919,12 @@ fn prompt_new_password_sync(
                 *decided.borrow_mut() = true;
                 *result.borrow_mut() = Some(a);
             }
-            win_c.close();
+            win_c.destroy();
         });
     }
     {
         let win_c = win.clone();
-        cancel.connect_clicked(move |_| win_c.close());
+        cancel.connect_clicked(move |_| win_c.destroy());
     }
     e1.grab_focus();
     run_nested_modal(&win);
@@ -5972,12 +5995,12 @@ fn confirm_sync(shell: &Rc<Shell>, title: &str, body: &str, ok_label: &str) -> b
         let win_c = win.clone();
         ok.connect_clicked(move |_| {
             *result.borrow_mut() = true;
-            win_c.close();
+            win_c.destroy();
         });
     }
     {
         let win_c = win.clone();
-        cancel.connect_clicked(move |_| win_c.close());
+        cancel.connect_clicked(move |_| win_c.destroy());
     }
     run_nested_modal(&win);
     let out = *result.borrow();
