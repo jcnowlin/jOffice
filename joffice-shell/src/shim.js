@@ -135,6 +135,372 @@
     };
     window.__joJournal = joJournal;
 
+    // -----------------------------------------------------------
+    // Cycle 5: PDF window state + PE0 probes.
+    // joPdf.active is set from the open reply (rawPdf) when the
+    // shell opened the PDF under the annotate dev flag
+    // (pdfMode in the reply). PDF windows journal append-only
+    // and never checkpoint (KAO cycle-5 round 2, worst-case
+    // session model): the cycle-4 fold/checkpoint machinery
+    // reads a bin snapshot (asc_nativeGetFile3) that is
+    // meaningless for a PDF, and a fold with a misread
+    // deleteIndex would resurrect or drop annotations on
+    // recovery. PDF recovery is state-based (compiled
+    // snapshots), recovery_degraded = true.
+    // -----------------------------------------------------------
+    var joPdf = { active: false, mode: null, degradedLogged: false };
+    window.__joPdf = joPdf;
+
+    // PE0 (cycle 5 step 3): trap the two api calls whose
+    // arguments decide whether a PDF window may annotate and
+    // may flush. Re-asserted on a poll like the font wrap:
+    // the prototype methods are assigned when apiBase.js
+    // loads and could in principle be overwritten later.
+    (function installPe0Traps() {
+        var asserted = {};
+        setInterval(function () {
+            // PDFEditorApi OVERRIDES asc_setPdfViewer and
+            // asc_Print (pdf/api.js:5164/4335) without calling
+            // the base — trap BOTH prototypes or the probes
+            // see nothing in a PDF window.
+            var protos = [];
+            var base = window.AscCommon && window.AscCommon.baseEditorsApi
+                && window.AscCommon.baseEditorsApi.prototype;
+            if (base) protos.push(['base', base]);
+            var pdfApi = (window.Asc && window.Asc.PDFEditorApi)
+                || window.PDFEditorApi;
+            if (pdfApi && pdfApi.prototype && pdfApi.prototype !== base) {
+                protos.push(['pdf', pdfApi.prototype]);
+            }
+            protos.forEach(function (pair) {
+            var proto = pair[1];
+            ['asc_setPdfViewer', 'asc_setCanSendChanges'].forEach(function (fn) {
+                var cur = proto[fn];
+                if (typeof cur === 'function' && !cur.__joPe0) {
+                    var orig = cur;
+                    var wrapped = function (a) {
+                        try {
+                            joLedger('PE0_CALL', null, {
+                                fn: fn, args: JSON.stringify([a])
+                            });
+                        } catch (e) { /* ledger only */ }
+                        return orig.apply(this, arguments);
+                    };
+                    wrapped.__joPe0 = true;
+                    wrapped.__joOrig = orig;
+                    proto[fn] = wrapped;
+                    if (!asserted[fn]) {
+                        asserted[fn] = true;
+                        console.log('[jOffice][save-ledger] PE0 trap asserted fn=' + fn);
+                    }
+                }
+            });
+            // Step 4: the print path's payload. Round 2: the
+            // compiled unsaved annotations ride one of the
+            // print call's arguments (base64). Log every
+            // argument's shape; decode any long base64 string
+            // and report its head + length (PDF_PRINT_ARG).
+            var curPrint = proto['asc_Print'];
+            if (typeof curPrint === 'function' && !curPrint.__joPe0) {
+                var origPrint = curPrint;
+                var wrappedPrint = function () {
+                    try {
+                        var shapes = [];
+                        for (var i = 0; i < arguments.length; i++) {
+                            var a = arguments[i];
+                            if (typeof a === 'string' && a.length > 100) {
+                                var b = joPdfAsBytes(a);
+                                shapes.push('arg' + i + '=b64str:' + a.length
+                                    + (b ? ' head=' + joPdfHead(b) : ''));
+                                if (b) {
+                                    joLedger('PDF_PRINT_ARG', null, {
+                                        idx: i, bytes: b.length, head: joPdfHead(b)
+                                    });
+                                }
+                            } else {
+                                shapes.push('arg' + i + '=' + (a === null ? 'null'
+                                    : typeof a === 'object' ? 'object' : String(a)));
+                            }
+                        }
+                        joLedger('PDF_PRINT_CALL', null, { args: shapes.join(' ') });
+                    } catch (e) { /* ledger only */ }
+                    return origPrint.apply(this, arguments);
+                };
+                wrappedPrint.__joPe0 = true;
+                wrappedPrint.__joOrig = origPrint;
+                proto['asc_Print'] = wrappedPrint;
+                if (!asserted['asc_Print']) {
+                    asserted['asc_Print'] = true;
+                    console.log('[jOffice][save-ledger] PE0 trap asserted fn=asc_Print');
+                }
+            }
+            });
+        }, 25);
+    })();
+
+    // Resolve the live CPDFDoc for this window's PDF, probing
+    // the candidate accessors in order and logging what each
+    // yields (PDF_DOC_PROBE). Returns the doc or null.
+    function joPdfDoc() {
+        var ref = getEditor();
+        var api = ref && ref.editor;
+        if (!api) return null;
+        var cands = [];
+        // The pinned path (pdf/api.js:105; viewer.js calls
+        // Asc.editor.getPDFDoc()): the direct CPDFDoc accessor.
+        try { cands.push(['api.getPDFDoc()', api.getPDFDoc && api.getPDFDoc()]); } catch (e) { cands.push(['api.getPDFDoc()', 'THROW ' + e]); }
+        try {
+            var rend = api.getDocumentRenderer && api.getDocumentRenderer();
+            cands.push(['renderer.getPDFDoc()', rend && rend.getPDFDoc && rend.getPDFDoc()]);
+        } catch (e) { cands.push(['renderer.getPDFDoc()', 'THROW ' + e]); }
+        try { cands.push(['api.getDocument()', api.getDocument && api.getDocument()]); } catch (e) { cands.push(['api.getDocument()', 'THROW ' + e]); }
+        try { cands.push(['api.getPDFDocument()', api.getPDFDocument && api.getPDFDocument()]); } catch (e) { cands.push(['api.getPDFDocument()', 'THROW ' + e]); }
+        try { cands.push(['api.pdfDocument', api.pdfDocument]); } catch (e) { cands.push(['api.pdfDocument', 'THROW ' + e]); }
+        try { cands.push(['api.doc', api.doc]); } catch (e) { cands.push(['api.doc', 'THROW ' + e]); }
+        for (var i = 0; i < cands.length; i++) {
+            var v = cands[i][1];
+            if (v && typeof v === 'object' && v.History && v.GetPagesCount) {
+                if (!joPdf.docLogged) {
+                    joPdf.docLogged = true;
+                    joLedger('PDF_DOC_PROBE', null, { via: cands[i][0] });
+                }
+                return v;
+            }
+        }
+        if (!joPdf.docLogged) {
+            joPdf.docLogged = true;
+            var seen = cands.map(function (c) {
+                return c[0] + '=' + (c[1] === null ? 'null'
+                    : typeof c[1] === 'object' ? 'object' : String(c[1]));
+            }).join(' ');
+            joLedger('PDF_DOC_PROBE', null, { via: 'NONE', seen: seen });
+        }
+        return null;
+    }
+
+    // The editor's own annotation count (CPDFDoc.annots
+    // concatenates every page's annots). Null when the doc
+    // cannot be resolved — the count gate then fails closed.
+    function joPdfAnnotCount() {
+        var doc = joPdfDoc();
+        if (!doc) return null;
+        try {
+            var a = doc.annots;
+            if (a && typeof a.length === 'number') return a.length;
+        } catch (e) { /* fall through */ }
+        try {
+            var n = 0, pages = doc.GetPagesCount();
+            for (var i = 0; i < pages; i++) {
+                var info = doc.GetPageInfo(i);
+                if (info && info.annots) n += info.annots.length;
+            }
+            return n;
+        } catch (e) { return null; }
+    }
+
+    // Normalize a capture result to bytes: Uint8Array /
+    // ArrayBuffer pass through; a string is tried as base64
+    // (the compiled-changes channel in the desktop contract
+    // is base64, e.g. the Print argument). Anything else is
+    // not bytes — null.
+    function joPdfAsBytes(v) {
+        if (!v) return null;
+        if (v instanceof Uint8Array) return v;
+        if (v instanceof ArrayBuffer) return new Uint8Array(v);
+        if (typeof v === 'string' && v.length > 8) {
+            try { return _b64ToBytes(v); } catch (e) { return null; }
+        }
+        return null;
+    }
+
+    function joPdfHead(bytes) {
+        var s = '';
+        for (var i = 0; i < Math.min(4, bytes.length); i++) {
+            s += String.fromCharCode(bytes[i]);
+        }
+        return s;
+    }
+
+    // Capture the compiled annotation changes from the live
+    // PDF document (cycle 5 step 4). The desktop contract's
+    // compiled form starts with the 4 bytes "%PDF" (pinned
+    // core, applyCompiledChangesPdf). Candidates are probed
+    // in order and every outcome is ledgered
+    // (PDF_CAPTURE_PROBE) — the first candidate yielding
+    // bytes wins. cb({bytes, annotCount, via}) or cb(null).
+    function joPdfCaptureCompiled(cb) {
+        var doc = joPdfDoc();
+        if (!doc) {
+            joLedger('PDF_CAPTURE_PROBE', null, { via: 'NONE', why: 'no doc' });
+            cb(null);
+            return;
+        }
+        // PS2: text still being typed in a free-text annot is
+        // committed only when the active object blurs; blur
+        // BEFORE capturing or the keystrokes are lost.
+        try {
+            if (typeof doc.BlurActiveObject === 'function') {
+                doc.BlurActiveObject();
+                joLedger('PDF_BLUR', null, { ok: 1 });
+            } else {
+                joLedger('PDF_BLUR', null, { ok: 0, why: 'absent' });
+            }
+        } catch (e) {
+            joLedger('PDF_BLUR', null, { ok: 0, why: String(e) });
+        }
+        var annotCount = joPdfAnnotCount();
+        var tries = [];
+        function attempt(name, fn) {
+            try {
+                var v = fn();
+                var b = joPdfAsBytes(v);
+                tries.push(name + '=' + (b ? 'bytes:' + b.length
+                    : v === null || v === undefined ? 'null'
+                    : typeof v));
+                if (b) {
+                    joLedger('PDF_CAPTURE_PROBE', null, {
+                        via: name, tries: tries.join(' ')
+                    });
+                    cb({ bytes: b, annotCount: annotCount, via: name });
+                    return true;
+                }
+            } catch (e) {
+                tries.push(name + '=THROW:' + String(e).slice(0, 60));
+            }
+            return false;
+        }
+        var viewer = null;
+        try { viewer = doc.Viewer || null; } catch (e) { /* probe below */ }
+        if (attempt('viewer.Save', function () { return viewer && viewer.Save(); })) return;
+        var file = null;
+        try { file = doc.GetFile && doc.GetFile(); } catch (e) { /* probe below */ }
+        if (file && !joPdf.fileMethodsLogged) {
+            joPdf.fileMethodsLogged = true;
+            var names = [];
+            try {
+                for (var k in file) {
+                    if (typeof file[k] === 'function') names.push(k);
+                }
+            } catch (e) { /* enumeration only */ }
+            joLedger('PDF_FILE_METHODS', null, {
+                methods: names.join(',').slice(0, 400)
+            });
+        }
+        if (attempt('file.Save', function () { return file && file.Save(); })) return;
+        if (attempt('file.save', function () { return file && file.save(); })) return;
+        if (attempt('viewer.GetFile().Save', function () {
+            var f = viewer && viewer.GetFile && viewer.GetFile();
+            return f && f.Save && f.Save();
+        })) return;
+        joLedger('PDF_CAPTURE_PROBE', null, {
+            via: 'NONE', tries: tries.join(' ')
+        });
+        cb(null);
+    }
+
+    // The PDF save send (cycle 5): mirrors the bin path's
+    // dual-channel reply plumbing exactly, but the payload is
+    // the compiled changes and saveArgs carries pdfChanges +
+    // the editor's annotation count for Rust's count gate.
+    function joPdfSendSave(seq, ctx, cap) {
+        joSave.lastBinIndex = null;
+        var settleSaveReply = null;
+        var replyPromise = new Promise(function (resolve) {
+            settleSaveReply = resolve;
+        });
+        joSave.replyWaiters[seq] = function (res) {
+            if (settleSaveReply) {
+                var s = settleSaveReply;
+                settleSaveReply = null;
+                delete joSave.replyWaiters[seq];
+                s(res);
+            }
+        };
+        var saveArgs = {
+            saveAs: ctx.isSaveAs, fileType: ctx.fileType || 0,
+            origin: ctx.origin, seq: seq,
+            unmodified: ctx.unmodified,
+            absorb: false,
+            histIndex: null,
+            printIntent: ctx.printIntent,
+            printPages: ctx.printPages,
+            pdfa: false,
+            pdfChanges: true,
+            annotCount: cap.annotCount,
+            captureVia: cap.via
+        };
+        var sendSave = function () {
+            bridge('saveFile', saveArgs)
+                .then(function (res) {
+                    if (res && typeof res.ok !== 'undefined') {
+                        if (joSave.replyWaiters[seq]) {
+                            joSave.replyWaiters[seq](res);
+                        }
+                    } else {
+                        console.log('[jOffice][save-ledger] saveFile postMessage reply seq=' + seq + ' garbled (' + JSON.stringify(res) + '); awaiting JS-channel delivery');
+                    }
+                })
+                .catch(function (e) {
+                    if (joSave.replyWaiters[seq]) {
+                        joSave.replyWaiters[seq]({ ok: false, failed: true });
+                    }
+                });
+        };
+        var bytes = cap.bytes;
+        var useUpload = !window.__joForceBase64
+            && bytes.length > 4194304 && !!joJournal.sid;
+        if (useUpload) {
+            joUpload('save', String(seq), bytes, function (ok, sha) {
+                if (!ok) {
+                    console.error('[jOffice] pdf save upload failed seq=' + seq);
+                    if (joSave.replyWaiters[seq]) {
+                        joSave.replyWaiters[seq]({ ok: false, failed: true });
+                    }
+                    return;
+                }
+                joLedger('SAVE_UPLOAD', seq, { bytes: bytes.length, sha256: sha });
+                saveArgs.uploadRef = seq;
+                sendSave();
+            });
+        } else {
+            saveArgs.data = _bytesToB64(bytes);
+            sendSave();
+        }
+        replyPromise
+            .then(function (res) {
+                console.log('[jOffice][save-ledger] saveFile reply seq=' + seq + ' res=' + JSON.stringify(res));
+                if (res && res.failed) {
+                    joEndSave(seq, 'failed');
+                    return;
+                }
+                if (res && res.cancelled) {
+                    joEndSave(seq, 'cancelled');
+                    return;
+                }
+                if (res && res.export) {
+                    joEndSave(seq, 'export_ok');
+                    return;
+                }
+                if (res && res.printed !== undefined) {
+                    joEndSave(seq, 'export_ok');
+                    return;
+                }
+                if (!res || res.ok !== true) {
+                    console.error('[jOffice][save-ledger] saveFile reply seq=' + seq
+                        + ' unrecognized shape; treating as failure');
+                    joLedger('SAVE_REPLY_GARBLED', seq, {});
+                    joEndSave(seq, 'failed');
+                    return;
+                }
+                joSave.boundSaved = true;
+                joEndSave(seq, 'bound_ok');
+            })
+            .catch(function (e) {
+                console.error('[jOffice] LocalFileSave (pdf) failed: ' + (e && e.message ? e.message : e));
+                joEndSave(seq, 'failed');
+            });
+    }
+
     // E0 instrumentation: search a byte array for the drive's
     // marker in UTF-8 and UTF-16LE forms. The marker is set by
     // the drive (window.__joE0Marker) before typing.
@@ -352,6 +718,18 @@
         }
         if (res.recovery) {
             joJournal.pendingRecovery = res.recovery;
+        }
+        // Cycle 5: a rawPdf open reply marks this window as a
+        // PDF window for the journal branch and the save
+        // capture. Any other open clears it.
+        joPdf.active = !!res.rawPdf;
+        joPdf.mode = res.pdfMode || null;
+        joPdf.docLogged = false;
+        joPdf.degradedLogged = false;
+        if (res.rawPdf) {
+            joLedger('PDF_OPEN_STATE', null, {
+                mode: joPdf.mode || '?', annotate: !!res.pdfAnnotate
+            });
         }
     }
 
@@ -628,6 +1006,27 @@
                 + ' pushed=' + pushed + ' direct=' + direct
                 + ' cellEditing=' + joSave.cellEditing
                 + ' overlay=' + !!joSave.overlayForced);
+        }
+        if (joPdf.active) {
+            // Cycle 5 step 9: the oDoc.History mirror. A PDF's
+            // edits live in CPDFDoc.History (an AscPDF.History),
+            // not only in the co-api history the ledger prints;
+            // "unsaved" there means Index has moved past the
+            // saved point. A mirror that disagrees with the
+            // direct query is a PD1 finding, logged with the
+            // same MODIFIED_DISAGREE prefix the drives count.
+            var doc = joPdfDoc();
+            var h = doc && doc.History;
+            if (h && h.Index !== null && h.Index !== undefined
+                && h.SavedIndex !== null && h.SavedIndex !== undefined) {
+                var mirror = h.Index !== h.SavedIndex;
+                if (mirror !== direct) {
+                    console.log('[jOffice][save-ledger] MODIFIED_DISAGREE at=pdf-mirror-' + where
+                        + ' mirror=' + mirror + ' direct=' + direct
+                        + ' histIdx=' + h.Index + ' savedIdx=' + h.SavedIndex
+                        + ' userSavedIdx=' + h.UserSavedIndex);
+                }
+            }
         }
     }
 
@@ -1733,6 +2132,32 @@
                 joEndSave(seq, 'failed');
                 return;
             }
+            if (joPdf.active) {
+                // Cycle 5: a PDF window saves its COMPILED
+                // annotation changes, never an Editor.bin —
+                // asc_nativeGetFile3 is meaningless here. Rust
+                // merges them into the bound file (route A1)
+                // behind the annotation count gate.
+                joPdfCaptureCompiled(function (cap) {
+                    if (!cap) {
+                        console.error('[jOffice] LocalFileSave (pdf) aborted: compiled-changes capture failed');
+                        joEndSave(seq, 'failed');
+                        return;
+                    }
+                    joLedger('PDF_CAPTURED', seq, {
+                        bytes: cap.bytes.length,
+                        head: joPdfHead(cap.bytes),
+                        annotCount: cap.annotCount,
+                        via: cap.via
+                    });
+                    joPdfSendSave(seq, {
+                        isSaveAs: isSaveAs, fileType: fileType || 0,
+                        origin: origin, unmodified: unmodified,
+                        printIntent: !!opts.isPrint, printPages: printPages
+                    }, cap);
+                });
+                return;
+            }
             // INSTRUMENTATION: asc_nativeGetFile must exist or Save
             // hard-fails. Log its presence on first save attempt.
             if (typeof ref.editor.asc_nativeGetFile !== 'function') {
@@ -2193,6 +2618,12 @@
     }
 
     function joJournalCheckpoint(trigger, histLenAfter) {
+        if (joPdf.active) {
+            // Cycle 5: never for PDF windows (see the journal
+            // branch in joJournalRecord). Logged, not silent.
+            joLedger('PDF_CHECKPOINT_REFUSED', null, { trigger: trigger });
+            return;
+        }
         // The CAPTURE is synchronous and exact (asc_native-
         // GetFile3 runs inside the saveChanges call, so the
         // serialized state is the state the triggering record
@@ -2273,6 +2704,33 @@
         if (!joJournalMode() || !joJournal.enabled || !joJournal.sid) return;
         if (joJournal.replaying) return;
         var changes = arrayChanges || [];
+        if (joPdf.active) {
+            // Cycle 5 (round 2 worst-case session model): PDF
+            // windows append raw records ONLY. No trigger
+            // evaluation, no checkpoints — the fold math and
+            // the getFile3 snapshot are meaningless for a PDF,
+            // and a misread deleteIndex on replay would
+            // resurrect, duplicate or drop an annotation that
+            // a later incremental save makes permanent.
+            var pdfHistLen = (deleteIndex === null || deleteIndex === undefined)
+                ? changes.length : deleteIndex + changes.length;
+            joJournal.seq += 1;
+            joJournal.histLen = pdfHistLen;
+            joJournal.openChanges = Math.max(0, pdfHistLen - joJournal.base,
+                joJournal.unsavedFloor || 0);
+            if (!joPdf.degradedLogged) {
+                joPdf.degradedLogged = true;
+                joLedger('PDF_JOURNAL_DEGRADED', null, {
+                    reason: 'append-only records, no checkpoints'
+                });
+            }
+            joJournalSend({
+                epoch: joJournal.epoch, seq: joJournal.seq,
+                deleteIndex: (deleteIndex === undefined ? null : deleteIndex),
+                changes: changes.slice(), excel: excel || null
+            });
+            return;
+        }
         // One-time sample of the real wire form (E0b evidence).
         if (!joJournal.sampleLogged) {
             joJournal.sampleLogged = true;

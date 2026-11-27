@@ -379,6 +379,9 @@ fn refresh_chrome(shell: &Rc<Shell>) {
                         ext_of_code(d.origin_code).unwrap_or("").to_uppercase()
                     ),
                     Policy::ViewOnly => "PDF — opens read-only".to_string(),
+                    Policy::PdfAnnotate => {
+                        "PDF — annotation save (experimental)".to_string()
+                    }
                 };
                 badge.set_text(&text);
                 badge.set_visible(!text.is_empty());
@@ -396,13 +399,20 @@ fn refresh_chrome(shell: &Rc<Shell>) {
     if let Some(row) = shell.action_row.borrow().as_ref() {
         row.set_visible(doc.is_some());
     }
-    // Save a Copy… + Read-only badge: ViewOnly windows only.
+    // Save a Copy…: ViewOnly windows (byte copy) and
+    // PdfAnnotate windows (merged copy when dirty, byte copy
+    // when clean — cycle 5). Read-only badge: ViewOnly only.
     let viewonly = matches!(
         doc.as_ref().map(|d| d.policy),
         Some(Policy::ViewOnly)
     );
+    let copyable = viewonly
+        || matches!(
+            doc.as_ref().map(|d| d.policy),
+            Some(Policy::PdfAnnotate)
+        );
     if let Some(b) = shell.copy_btn.borrow().as_ref() {
-        b.set_visible(viewonly);
+        b.set_visible(copyable);
     }
     if let Some(l) = shell.readonly_label.borrow().as_ref() {
         l.set_visible(viewonly);
@@ -706,6 +716,10 @@ impl SessionState {
             "unsaved_items": self.unsaved(),
             "created_unix": self.created_unix,
             "pid": std::process::id(),
+            // Cycle 5: PDF sessions are recovery-degraded by
+            // design (append-only journal, no replay — the
+            // scan below never offers them).
+            "recovery_degraded": self.origin_code == fmt::PDF,
         });
         let tmp = self.dir.join("manifest.json.tmp");
         if std::fs::write(&tmp, manifest.to_string()).is_ok() {
@@ -996,6 +1010,18 @@ fn scan_recovery_candidates() -> Vec<RecoveryCandidate> {
             None => continue,
         };
         if session_lock_alive(&dir) {
+            continue;
+        }
+        // Cycle 5: PDF sessions are NEVER offered for replay
+        // recovery (round 2 worst-case model: a fold with a
+        // misread deleteIndex would resurrect or drop
+        // annotations). The session stays on disk; state-based
+        // recovery (compiled snapshots) ships off by default.
+        if manifest.get("origin_code").and_then(|v| v.as_i64()) == Some(fmt::PDF as i64) {
+            eprintln!(
+                "joffice: PDF_RECOVERY_DEGRADED sid={} (session kept, no replay offered)",
+                entry.file_name().to_string_lossy()
+            );
             continue;
         }
         // Only sessions with unsaved journal work are offered.
@@ -1425,6 +1451,20 @@ struct PendingSave {
     /// ViewOnly (PDF) Save As: on dialog accept, copy THESE
     /// bytes to the chosen path; no conversion ever runs.
     copy_source: Option<PathBuf>,
+    /// PdfAnnotate (cycle 5): tmp_bin holds the COMPILED
+    /// annotation changes, not an Editor.bin. On dialog
+    /// accept, the merge pipeline runs them into the bound
+    /// PDF and lands the result at the chosen path (behind
+    /// the count gate). A clean document byte-copies instead
+    /// (the §6a rule), exactly like the copy path below.
+    pdf_merge: bool,
+    /// The editor's annotation count at capture time — the
+    /// count gate's expected value (cycle 5 step 7).
+    pdf_annot_count: Option<i64>,
+    /// A plain Save As adopts the chosen path as the new
+    /// bound file; a Download-As (fileType 513) is an export
+    /// and does not rebind.
+    pdf_adopt: bool,
 }
 
 /// A print-intent export parked on the native print dialog
@@ -2268,6 +2308,31 @@ enum Policy {
     /// PDF viewer's view mode. The bound file is NEVER written;
     /// Save As writes a byte-identical copy.
     ViewOnly,
+    /// PDF with annotation save (marathon 2 cycle 5, KAO
+    /// cycle-5 rounds 1+2): opens in the pdfeditor's edit
+    /// (annotate) mode behind the pdf_annotate=experimental
+    /// dev flag. Saves run the x2t 513 + m_bFromChanges merge
+    /// (route A1) and land only through the annotation count
+    /// gate; the bound file is replaced atomically, never
+    /// written in place.
+    PdfAnnotate,
+}
+
+/// Cycle 5 dev flag: PDF annotation save is experimental
+/// until the cycle closes. `JOFFICE_PDF_ANNOTATE=experimental`
+/// opens PDFs in annotate mode under Policy::PdfAnnotate;
+/// anything else keeps the cycle-3 ViewOnly behavior.
+fn pdf_annotate_enabled() -> bool {
+    std::env::var("JOFFICE_PDF_ANNOTATE")
+        .map(|v| v == "experimental")
+        .unwrap_or(false)
+}
+
+/// PE0 probe override: UI language for PDF windows
+/// (the ru run exercises the isXpsViewer locale trap,
+/// web-apps pdfeditor Main.js:1319).
+fn pdf_lang_override() -> Option<String> {
+    std::env::var("JOFFICE_PDF_LANG").ok().filter(|v| !v.is_empty())
 }
 
 fn kind_of_code(code: i32) -> Option<EditorKind> {
@@ -2291,7 +2356,13 @@ fn policy_of_code(code: i32) -> Policy {
         }
         fmt::ODT | fmt::ODS | fmt::ODP | fmt::RTF | fmt::TXT | fmt::CSV => Policy::AskOnce,
         fmt::DOC | fmt::XLS | fmt::PPT => Policy::SaveAsOnly,
-        fmt::PDF => Policy::ViewOnly,
+        fmt::PDF => {
+            if pdf_annotate_enabled() {
+                Policy::PdfAnnotate
+            } else {
+                Policy::ViewOnly
+            }
+        }
         _ => Policy::InPlace,
     }
 }
@@ -3647,10 +3718,30 @@ fn editor_entry_url(pending: Option<&PathBuf>, cfg: &JofficeConfig) -> String {
     // come from the shell config: the real name by default, a
     // persisted UUID for the id.
     // PDFs open in the viewer's view mode (cycle 3, step 6):
-    // annotation tools hidden, nothing writable.
-    let mode = if doctype == "pdf" { "view" } else { "edit" };
+    // annotation tools hidden, nothing writable. Cycle 5: with
+    // the annotate dev flag on, PDFs open in edit mode, which
+    // is the pdfeditor's annotate mode (Main.js:1449 feeds
+    // mode into asc_setPdfViewer); a Russian UI language
+    // forces the viewer regardless (isXpsViewer trap).
+    let (mode, lang) = if doctype == "pdf" {
+        let m = if pdf_annotate_enabled() {
+            "edit"
+        } else {
+            "view"
+        };
+        let l = pdf_lang_override().unwrap_or_else(|| "en".to_string());
+        eprintln!(
+            "joffice: PDF-MODE mode={} lang={} annotate={}",
+            m,
+            l,
+            pdf_annotate_enabled()
+        );
+        (m, l)
+    } else {
+        ("edit", "en".to_string())
+    };
     format!(
-        "joffice:///apps/api/documents/index.html?type=desktop&doctype={doctype}&key=joffice-{hash:016x}&url=_offline_&title={}&filetype={}&mode={mode}&lang=en&userid={}&username={}",
+        "joffice:///apps/api/documents/index.html?type=desktop&doctype={doctype}&key=joffice-{hash:016x}&url=_offline_&title={}&filetype={}&mode={mode}&lang={lang}&userid={}&username={}",
         query_escape(&title),
         query_escape(&ext),
         query_escape(&cfg.user_id),
@@ -4385,6 +4476,7 @@ fn shell_is_dirty(shell: &Rc<Shell>) -> bool {
             d.policy != Policy::InPlace
                 && d.policy != Policy::InPlaceMacro
                 && d.policy != Policy::ViewOnly
+                && d.policy != Policy::PdfAnnotate
                 && !d.is_new
         }
         None => false,
@@ -4864,6 +4956,428 @@ fn parse_page_spec(spec: &str, total: u32) -> Option<Vec<u32>> {
     Some(pages)
 }
 
+/// qpdf for the cycle-5 count gate + validity check.
+/// JOFFICE_QPDF overrides (the staged-runtime rig points it
+/// at the nix-store binary; the packaged build ships qpdf on
+/// PATH). None → the gate fails closed.
+fn find_qpdf() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("JOFFICE_QPDF") {
+        let pb = PathBuf::from(p);
+        if pb.exists() {
+            return Some(pb);
+        }
+    }
+    find_tool("qpdf")
+}
+
+/// What a separate reader finds in a PDF's /Annots arrays,
+/// split the way the count gate needs (cycle 5 step 7):
+/// `user` = annotations the editor's annots list counts
+/// (everything except /Popup companions and /Widget form
+/// fields — the editor tracks fields in a separate model);
+/// `widgets` = form-field widgets, which the gate requires
+/// to be PRESERVED, not equal to anything the editor says.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct PdfAnnotCounts {
+    user: usize,
+    widgets: usize,
+}
+
+fn pdf_annot_count_qpdf(pdf: &Path) -> Result<PdfAnnotCounts, String> {
+    let qpdf = find_qpdf().ok_or_else(|| "count gate: qpdf not found".to_string())?;
+    let out = Command::new(&qpdf)
+        // JSON v1 explicitly: v2 (qpdf 12's default) has no
+        // objects table at all, and v1's objects are the bare
+        // dictionaries the loop below reads (the "value"
+        // unwrap tolerates the wrapped shape too).
+        .arg("--json=1")
+        .arg(pdf)
+        .output()
+        .map_err(|e| format!("run qpdf --json: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "qpdf --json failed (exit {}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("parse qpdf --json: {e}"))?;
+    // The objects table: every page object's /Annots array.
+    // /Popup entries are NOT counted as user annotations: a
+    // popup is the subordinate viewer window of its parent
+    // annotation (it sits in /Annots with /Type /Annot,
+    // /Subtype /Popup, /Parent set) and the editor's annots
+    // list — the gate's other side — never counts it.
+    // Diagnosed cycle 5 (diag1): one Text note merged to
+    // Text + Popup and the naive count read 2 against the
+    // editor's 1. /Widget entries (form fields) split out
+    // for the same reason (PF1): the editor's annots list
+    // excludes them, but a merge that DROPS fields is just
+    // as broken as one that drops notes, so the gate
+    // compares widgets against the ORIGIN's widget count.
+    let mut counts = PdfAnnotCounts { user: 0, widgets: 0 };
+    let mut saw_page = false;
+    if let Some(objects) = v.get("objects").and_then(|o| o.as_object()) {
+        for (_id, obj) in objects {
+            let val = obj.get("value").unwrap_or(obj);
+            if val.get("/Type").and_then(|t| t.as_str()) == Some("/Page") {
+                saw_page = true;
+                if let Some(annots) = val.get("/Annots").and_then(|a| a.as_array()) {
+                    for entry in annots {
+                        let subtype = entry
+                            .as_str()
+                            .and_then(|r| objects.get(r))
+                            .map(|o| {
+                                let ov = o.get("value").unwrap_or(o);
+                                ov.get("/Subtype")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("")
+                                    .to_string()
+                            })
+                            .unwrap_or_default();
+                        match subtype.as_str() {
+                            "/Popup" => {}
+                            "/Widget" => counts.widgets += 1,
+                            _ => counts.user += 1,
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !saw_page {
+        return Err("qpdf --json: no page objects found".to_string());
+    }
+    Ok(counts)
+}
+
+/// The wall sentence, enforced: x2t exiting 0 proves nothing.
+/// A merged PDF is believed only when independent readers
+/// accept it — qpdf --check clean AND a poppler render of
+/// page 1. Returns the readers' verdicts for the ledger.
+fn pdf_check_readers(pdf: &Path) -> Result<(), String> {
+    let qpdf = find_qpdf().ok_or_else(|| "reader check: qpdf not found".to_string())?;
+    let out = Command::new(&qpdf)
+        .arg("--check")
+        .arg(pdf)
+        .output()
+        .map_err(|e| format!("run qpdf --check: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "qpdf --check failed (exit {}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout).trim()
+        ));
+    }
+    if let Some(pdftoppm) = find_tool("pdftoppm") {
+        let stem = std::env::temp_dir().join(temp_stem("pdfcheck"));
+        let res = Command::new(&pdftoppm)
+            .arg("-f")
+            .arg("1")
+            .arg("-l")
+            .arg("1")
+            .arg("-r")
+            .arg("36")
+            .arg("-png")
+            .arg(pdf)
+            .arg(&stem)
+            .output();
+        let _ = std::fs::remove_file(stem.with_extension("png"));
+        let _ = std::fs::remove_file(format!("{}-1.png", stem.display()));
+        let _ = std::fs::remove_file(format!("{}-01.png", stem.display()));
+        match res {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                return Err(format!(
+                    "pdftoppm render failed (exit {}): {}",
+                    o.status,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ))
+            }
+            Err(e) => return Err(format!("run pdftoppm: {e}")),
+        }
+    }
+    Ok(())
+}
+
+/// Route A1 (cycle 5 step 5/6): run x2t with input format
+/// 513 + m_bFromChanges over a staged session layout —
+///   <work>/in/origin.pdf      (immutable copy of the bound file)
+///   <work>/in/changes/0.bin   (the compiled changes, "%PDF"…)
+///   <work>/in/media/          (stamp images, when any)
+///   <work>/out/merged.pdf     (the merge result)
+/// m_bDontSaveAdditional=true keeps changes.zip out of the
+/// output folder. Synchronous: call only from a worker
+/// thread. The output is NOT trusted on x2t's exit code —
+/// callers gate it through pdf_check_readers + the count.
+fn x2t_merge_pdf_sync(
+    x2t: &Path,
+    font_dir: Option<&Path>,
+    allfonts_path: Option<&Path>,
+    work: &Path,
+) -> Result<PathBuf, String> {
+    let in_pdf = work.join("in").join("origin.pdf");
+    let out_pdf = work.join("out").join("merged.pdf");
+    let tmp_dir = work.join("tmp");
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("create merge tmp: {e}"))?;
+    std::fs::create_dir_all(work.join("out")).map_err(|e| format!("create merge out: {e}"))?;
+    let mut extra = String::new();
+    extra.push_str("  <m_nFormatFrom>513</m_nFormatFrom>\n");
+    extra.push_str("  <m_bFromChanges>true</m_bFromChanges>\n");
+    extra.push_str("  <m_bDontSaveAdditional>true</m_bDontSaveAdditional>\n");
+    if let Some(d) = font_dir {
+        extra.push_str(&format!(
+            "  <m_sFontDir>{}</m_sFontDir>\n",
+            xml_escape(&d.display().to_string())
+        ));
+    } else {
+        extra.push_str("  <m_sFontDir />\n");
+    }
+    if let Some(p) = allfonts_path {
+        extra.push_str(&format!(
+            "  <m_sAllFontsPath>{}</m_sAllFontsPath>\n",
+            xml_escape(&p.display().to_string())
+        ));
+    }
+    let params = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<TaskQueueDataConvert xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <m_sFileFrom>{}</m_sFileFrom>
+  <m_sFileTo>{}</m_sFileTo>
+  <m_nFormatTo>513</m_nFormatTo>
+  <m_sTempDir>{}</m_sTempDir>
+  <m_sTitle>jOffice</m_sTitle>
+  <m_bIsNoBase64>true</m_bIsNoBase64>
+{}</TaskQueueDataConvert>"#,
+        xml_escape(&in_pdf.display().to_string()),
+        xml_escape(&out_pdf.display().to_string()),
+        xml_escape(&tmp_dir.display().to_string()),
+        extra
+    );
+    let params_path = work.join("params.xml");
+    std::fs::write(&params_path, params).map_err(|e| format!("write merge params: {e}"))?;
+    let extra_env = vec![("TMPDIR".to_string(), tmp_dir.display().to_string())];
+    let out = run_x2t(x2t, &params_path, &extra_env)?;
+    if !out.status.success() {
+        return Err(format!(
+            "x2t merge failed (exit {}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    if !out_pdf.exists() {
+        return Err("x2t merge exited 0 but produced no output file".to_string());
+    }
+    Ok(out_pdf)
+}
+
+/// Stage + run the A1 merge on a worker thread, verify with
+/// independent readers, enforce the count gate, and land the
+/// result through write_save_checked (external-change check +
+/// atomic replace + session bookkeeping). `after` mirrors
+/// convert_and_write's completion semantics.
+fn pdf_merge_and_write(
+    shell: &Rc<Shell>,
+    reply: ScriptMessageReply,
+    ctx: Context,
+    origin_pdf: PathBuf,
+    dest: PathBuf,
+    changes: Vec<u8>,
+    annot_count: Option<i64>,
+    seq: u64,
+    origin: String,
+    after: AfterWrite,
+) {
+    let x2t = match shell.x2t.clone() {
+        Some(x) => x,
+        None => {
+            save_fail(
+                shell,
+                &reply,
+                "x2t converter not found; PDF annotation save unavailable".to_string(),
+                &origin,
+            );
+            return;
+        }
+    };
+    let font_dir = shell.fonts_src_dir.clone();
+    let allfonts = shell.x2t_allfonts.clone();
+    let dest_log = dest.display().to_string();
+    // The channel carries (merged bytes, annotations_deleted):
+    // a count DROP means the merge was an incremental update
+    // over a deletion — the deleted content stays readable in
+    // the file's earlier revisions, and the user is told so
+    // (cycle-5 round 1 privacy disclosure).
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<u8>, bool), String>>();
+    std::thread::spawn(move || {
+        let work = std::env::temp_dir().join(temp_stem("pdfsave"));
+        let result = (|| -> Result<(Vec<u8>, bool), String> {
+            let in_dir = work.join("in");
+            std::fs::create_dir_all(in_dir.join("changes"))
+                .map_err(|e| format!("stage merge dirs: {e}"))?;
+            std::fs::create_dir_all(in_dir.join("media"))
+                .map_err(|e| format!("stage merge media: {e}"))?;
+            std::fs::copy(&origin_pdf, in_dir.join("origin.pdf"))
+                .map_err(|e| format!("stage origin pdf: {e}"))?;
+            if changes.len() < 4 || &changes[..4] != b"%PDF" {
+                return Err(format!(
+                    "compiled changes refused: bad prefix (first bytes {:?}); \
+                     the merge would fall back to a silent doctrenderer replay",
+                    String::from_utf8_lossy(&changes[..changes.len().min(4)])
+                ));
+            }
+            std::fs::write(in_dir.join("changes").join("0.bin"), &changes)
+                .map_err(|e| format!("stage changes: {e}"))?;
+            let out_pdf = x2t_merge_pdf_sync(
+                &x2t,
+                font_dir.as_deref(),
+                allfonts.as_deref(),
+                &work,
+            )?;
+            pdf_check_readers(&out_pdf)?;
+            // Diagnostic keep (cycle 5): with
+            // JOFFICE_PDF_KEEP_WORK set, preserve the staged
+            // merge (origin, changes, output) for inspection
+            // BEFORE the gate decides — a refused merge is
+            // exactly the case that needs its artifacts.
+            if std::env::var_os("JOFFICE_PDF_KEEP_WORK").is_some() {
+                let keep = std::env::temp_dir().join(format!("pdfkeep-{seq}"));
+                let _ = std::fs::create_dir_all(&keep);
+                let _ = std::fs::copy(&origin_pdf, keep.join("origin.pdf"));
+                let _ = std::fs::copy(
+                    work.join("in").join("changes").join("0.bin"),
+                    keep.join("0.bin"),
+                );
+                let _ = std::fs::copy(&out_pdf, keep.join("merged.pdf"));
+                eprintln!("joffice: PDF-KEEP work preserved at {}", keep.display());
+            }
+            // The count gate (step 7): a separate reader must
+            // find exactly the user annotations the editor
+            // reports, and the merge must preserve the
+            // origin's form-field widgets.
+            let found = pdf_annot_count_qpdf(&out_pdf)?;
+            let origin_counts = pdf_annot_count_qpdf(&origin_pdf)
+                .unwrap_or(PdfAnnotCounts { user: usize::MAX, widgets: usize::MAX });
+            let expected = annot_count.ok_or_else(|| {
+                "count gate: the editor reported no annotation count; save refused".to_string()
+            })?;
+            eprintln!(
+                "joffice: PDF-COUNT-GATE dest={} expected={} found={} origin={} \
+                 widgets_found={} widgets_origin={}",
+                dest_log, expected, found.user, origin_counts.user,
+                found.widgets, origin_counts.widgets
+            );
+            if found.user as i64 != expected {
+                return Err(format!(
+                    "count gate: the merged PDF holds {} annotations but the editor \
+                     reports {expected}; the save was refused and your original file \
+                     was not touched",
+                    found.user
+                ));
+            }
+            if found.widgets != origin_counts.widgets {
+                return Err(format!(
+                    "count gate: the merge changed the form-field count ({} -> {}); \
+                     the save was refused and your original file was not touched",
+                    origin_counts.widgets, found.widgets
+                ));
+            }
+            let deleted = origin_counts.user != usize::MAX
+                && (expected as usize) < origin_counts.user;
+            std::fs::read(&out_pdf)
+                .map(|bytes| (bytes, deleted))
+                .map_err(|e| format!("read merged pdf: {e}"))
+        })();
+        let _ = std::fs::remove_dir_all(&work);
+        let _ = tx.send(result);
+    });
+    // Poll the channel from the main thread; land there
+    // (WebKit calls must stay on main) — the x2t_convert_async
+    // pattern.
+    let shell_t = shell.clone();
+    let dest_m = dest;
+    let mut after_opt = Some(after);
+    gtk4::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+        match rx.try_recv() {
+            Ok(result) => {
+                let after = after_opt.take().unwrap_or(AfterWrite::Export);
+                match result {
+                    Ok((bytes, annots_deleted)) => {
+                        match write_save_checked(&shell_t, &dest_m, &bytes, seq) {
+                            Ok(_) => {
+                                note_save_success(&shell_t);
+                                if annots_deleted {
+                                    // Privacy disclosure (cycle
+                                    // 5, round 1): an
+                                    // incremental update keeps
+                                    // earlier revisions readable.
+                                    show_save_banner(
+                                        &shell_t,
+                                        "Saved. Note: deleted comments stay recoverable in this file's earlier revisions (incremental update).",
+                                    );
+                                    eprintln!(
+                                        "joffice: PDF-DISCLOSURE shown (annotation count dropped; incremental update)"
+                                    );
+                                }
+                                match after {
+                                    AfterWrite::Bound => {
+                                        reply_save(
+                                            &shell_t,
+                                            &reply,
+                                            &ctx,
+                                            &serde_json::json!({ "ok": true }),
+                                        );
+                                    }
+                                    AfterWrite::Adopt => {
+                                        *shell_t.current_path.borrow_mut() =
+                                            Some(dest_m.clone());
+                                        shell_t.note_document_opened(&dest_m);
+                                        set_doc_state(
+                                            &shell_t,
+                                            Some(dest_m.clone()),
+                                            fmt::PDF,
+                                            false,
+                                        );
+                                        reply_save(
+                                            &shell_t,
+                                            &reply,
+                                            &ctx,
+                                            &serde_json::json!({ "ok": true, "adopted": true }),
+                                        );
+                                    }
+                                    AfterWrite::Export => {
+                                        reply_save(
+                                            &shell_t,
+                                            &reply,
+                                            &ctx,
+                                            &serde_json::json!({ "ok": true, "export": true }),
+                                        );
+                                    }
+                                }
+                                save_done(&shell_t, true);
+                            }
+                            Err(e) => save_fail(&shell_t, &reply, e, &origin),
+                        }
+                    }
+                    Err(e) => save_fail(&shell_t, &reply, e, &origin),
+                }
+                gtk4::glib::ControlFlow::Break
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => gtk4::glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                save_fail(
+                    &shell_t,
+                    &reply,
+                    "pdf merge worker died".to_string(),
+                    &origin,
+                );
+                gtk4::glib::ControlFlow::Break
+            }
+        }
+    });
+}
+
 /// Find a helper tool on PATH or in the usual Nix profile
 /// locations (the shell's own PATH under the launcher carries
 /// the build shell's, not necessarily the user's tools).
@@ -5041,7 +5555,21 @@ fn begin_save_copy(shell: &Rc<Shell>) {
             doc.as_ref().and_then(|d| d.path.clone()),
         )
     };
-    if policy != Some(Policy::ViewOnly) {
+    // PdfAnnotate (cycle 5): a DIRTY document's copy must be
+    // MERGED, which needs a fresh compiled-changes capture —
+    // a host action cannot take one, so the copy goes through
+    // the editor's own Download-As (the saveFile merge dialog
+    // with export semantics). A CLEAN document byte-copies
+    // through the dialog below, exactly like ViewOnly.
+    if policy == Some(Policy::PdfAnnotate) {
+        let dirty = shell.modified.borrow().unwrap_or(false) || journal_pending(shell);
+        if dirty {
+            eprintln!("joffice: COPY_DIRTY pdf: routing through Download-As merge");
+            eval_in_view(shell, "window.__joExportPdf && window.__joExportPdf()");
+            return;
+        }
+    }
+    if policy != Some(Policy::ViewOnly) && policy != Some(Policy::PdfAnnotate) {
         return;
     }
     let Some(src) = src else { return };
@@ -5765,7 +6293,8 @@ fn handle_bridge(
                 // Local contract has no host URL-open path —
                 // binary_content:// + GetOpenedFile is the only
                 // channel, and it is synchronous.)
-                if msg.cmd == "openFile" {
+                let annotate = pdf_annotate_enabled();
+                if msg.cmd == "openFile" || annotate {
                     *shell.current_path.borrow_mut() = Some(path.clone());
                     shell.note_document_opened(&path);
                     set_doc_state(shell, Some(path.clone()), fmt::PDF, false);
@@ -5773,8 +6302,9 @@ fn handle_bridge(
                     // this window (cycle 4): retire its session.
                     shell.session_rotate_out();
                     eprintln!(
-                        "joffice: DOC-DETECT path={} code=513 policy=ViewOnly",
-                        path.display()
+                        "joffice: DOC-DETECT path={} code=513 policy={:?}",
+                        path.display(),
+                        policy_of_code(fmt::PDF)
                     );
                 }
                 let name = path
@@ -5790,14 +6320,40 @@ fn handle_bridge(
                             bytes.len(),
                             path.display()
                         );
-                        reply_json(
-                            reply,
-                            ctx,
-                            &serde_json::json!({
+                        if annotate {
+                            // Cycle 5: an annotate-mode PDF gets
+                            // a journal session like any other
+                            // document (seed = the PDF bytes);
+                            // the shim journals append-only and
+                            // never checkpoints (round 2). The
+                            // reply rides the dual channel
+                            // (reply_open) — a large PDF's
+                            // base64 must survive the trip.
+                            let sid = shell.session_create(
+                                Some(path.clone()),
+                                &name,
+                                fmt::PDF,
+                                &bytes,
+                            );
+                            let journal_on = journal_mode(&shell.flush_mode);
+                            let payload = serde_json::json!({
                                 "data": b64, "images": {}, "name": name,
-                                "boundSaved": false, "rawPdf": true
-                            }),
-                        );
+                                "boundSaved": false, "rawPdf": true,
+                                "sid": sid, "journal": journal_on,
+                                "pdfMode": "edit", "pdfAnnotate": true
+                            });
+                            reply_open(shell, reply, ctx, &payload, open_seq);
+                        } else {
+                            reply_json(
+                                reply,
+                                ctx,
+                                &serde_json::json!({
+                                    "data": b64, "images": {}, "name": name,
+                                    "boundSaved": false, "rawPdf": true,
+                                    "pdfMode": "view"
+                                }),
+                            );
+                        }
                     }
                     Err(e) => reply_err(reply, format!("read pdf: {e}")),
                 };
@@ -6429,6 +6985,136 @@ fn handle_bridge(
                 // Dialog route with copy_source set.
             }
 
+            // PdfAnnotate (cycle 5): the payload is the
+            // COMPILED annotation changes, not an Editor.bin.
+            // Print uses the saved file or refuses ("Save
+            // first"); Save As / Download-As park a merge
+            // dialog; a bound save merges behind the count
+            // gate (route A1, pdf_merge_and_write).
+            if policy == Policy::PdfAnnotate {
+                let src = doc_path.clone().expect("pdf annotate doc has a path");
+                let pdf_changes = msg
+                    .args
+                    .get("pdfChanges")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !pdf_changes {
+                    let _ = std::fs::remove_file(&tmp_bin);
+                    save_fail(
+                        shell,
+                        reply,
+                        "saveFile: annotate-mode PDF save carried no compiled changes"
+                            .to_string(),
+                        &origin,
+                    );
+                    return;
+                }
+                let annot_count = msg.args.get("annotCount").and_then(|v| v.as_i64());
+                if print_intent {
+                    let _ = std::fs::remove_file(&tmp_bin);
+                    if unmodified {
+                        begin_print(
+                            shell,
+                            Some((reply.clone(), ctx.clone())),
+                            src,
+                            false,
+                            print_pages,
+                            Some(origin),
+                        );
+                    } else {
+                        show_save_banner(
+                            shell,
+                            "Save the PDF before printing — print uses the saved annotations.",
+                        );
+                        eprintln!(
+                            "joffice: PDF-PRINT refused: unsaved annotations (save first)"
+                        );
+                        reply_save(
+                            shell,
+                            reply,
+                            ctx,
+                            &serde_json::json!({ "ok": false, "failed": true }),
+                        );
+                        save_done(shell, false);
+                    }
+                    return;
+                }
+                if save_as || file_type != 0 {
+                    if shell.pending_save.borrow().is_some()
+                        || shell.active_dialog.borrow().is_some()
+                    {
+                        let _ = std::fs::remove_file(&tmp_bin);
+                        save_fail(
+                            shell,
+                            reply,
+                            "saveFile: another save dialog is already open".to_string(),
+                            &origin,
+                        );
+                        return;
+                    }
+                    let preset_dir = src
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| gtk4::glib::home_dir());
+                    let preset_name = src
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "document.pdf".to_string());
+                    *shell.pending_save.borrow_mut() = Some(PendingSave {
+                        reply: reply.clone(),
+                        ctx: ctx.clone(),
+                        tmp_bin,
+                        seq,
+                        origin,
+                        kind,
+                        preset_dir,
+                        preset_name,
+                        filter_code: fmt::PDF,
+                        filters: Vec::new(),
+                        doc_path: doc_path.clone(),
+                        origin_code,
+                        pdfa: false,
+                        unmodified,
+                        copy_source: None,
+                        pdf_merge: true,
+                        pdf_annot_count: annot_count,
+                        pdf_adopt: save_as && file_type == 0,
+                    });
+                    show_save_dialog(shell);
+                    return;
+                }
+                // Bound save. §6a: an unedited PDF is a no-op
+                // success, never a merge.
+                if unmodified
+                    && !*shell.save_failed_outstanding.borrow()
+                    && !journal_pending(shell)
+                {
+                    let _ = std::fs::remove_file(&tmp_bin);
+                    eprintln!("joffice: SAVE-UNEDITED no-op (pdf, origin={origin})");
+                    reply_save(
+                        shell,
+                        reply,
+                        ctx,
+                        &serde_json::json!({ "ok": true, "unedited": true }),
+                    );
+                    save_done(shell, true);
+                    return;
+                }
+                pdf_merge_and_write(
+                    shell,
+                    reply.clone(),
+                    ctx.clone(),
+                    src.clone(),
+                    src,
+                    bin,
+                    annot_count,
+                    seq,
+                    origin,
+                    AfterWrite::Bound,
+                );
+                return;
+            }
+
             // Print intent (cycle 3, step 4): export the bin to
             // a temp PDF, self-slice the requested range, then
             // the native print dialog. The bridge reply resolves
@@ -6509,7 +7195,9 @@ fn handle_bridge(
             } else {
                 match policy {
                     Policy::InPlace | Policy::InPlaceMacro => Route::Bound(origin_code),
-                    Policy::SaveAsOnly | Policy::ViewOnly => Route::Dialog,
+                    Policy::SaveAsOnly | Policy::ViewOnly | Policy::PdfAnnotate => {
+                        Route::Dialog
+                    }
                     Policy::AskOnce => {
                         // The persistent preference applies only
                         // to the formats round 2 §D allows to
@@ -6651,6 +7339,9 @@ fn handle_bridge(
                         } else {
                             None
                         },
+                        pdf_merge: false,
+                        pdf_annot_count: None,
+                        pdf_adopt: false,
                     });
                     if is_askonce {
                         show_askonce(shell);
@@ -6678,7 +7369,25 @@ fn handle_bridge(
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
             let policy = shell.doc.borrow().as_ref().map(|d| d.policy);
-            if policy == Some(Policy::ViewOnly) {
+            if policy == Some(Policy::ViewOnly) || policy == Some(Policy::PdfAnnotate) {
+                // PdfAnnotate (cycle 5): print uses the SAVED
+                // file — a dirty document refuses ("Save
+                // first") rather than printing stale bytes.
+                if policy == Some(Policy::PdfAnnotate)
+                    && shell.modified.borrow().unwrap_or(false)
+                {
+                    show_save_banner(
+                        shell,
+                        "Save the PDF before printing — print uses the saved annotations.",
+                    );
+                    eprintln!("joffice: PDF-PRINT refused: unsaved annotations (save first)");
+                    reply_json(
+                        reply,
+                        ctx,
+                        &serde_json::json!({ "ok": false, "error": "unsaved annotations" }),
+                    );
+                    return;
+                }
                 let src = shell.doc.borrow().as_ref().and_then(|d| d.path.clone());
                 match src {
                     Some(src) => {
@@ -7159,9 +7868,16 @@ fn show_save_dialog(shell: &Rc<Shell>) {
             p.and_then(|p| p.copy_source.clone()),
         )
     };
+    let pdf_merge_pending = shell
+        .pending_save
+        .borrow()
+        .as_ref()
+        .map(|p| p.pdf_merge)
+        .unwrap_or(false);
     // A ViewOnly Save As offers ONLY the PDF copy (cycle 3);
+    // a PdfAnnotate merge Save As likewise offers only PDF;
     // everything else offers the family's full choice list.
-    let choices: Vec<(i32, &str)> = if copy_source.is_some() {
+    let choices: Vec<(i32, &str)> = if copy_source.is_some() || pdf_merge_pending {
         vec![(fmt::PDF, "PDF")]
     } else {
         save_as_choices(kind)
@@ -7263,6 +7979,102 @@ fn show_save_dialog(shell: &Rc<Shell>) {
         let Some(p) = take_pending_save(&shell_c) else {
             return;
         };
+        // PdfAnnotate merge completions (cycle 5): tmp_bin
+        // holds the compiled changes. A CLEAN document saved
+        // as its own format byte-copies instead (§6a — never
+        // merged), and adopts the path like a converted
+        // Save As. A dirty one runs the A1 merge into the
+        // chosen path behind the count gate; adoption follows
+        // pdf_adopt (plain Save As rebinds, Download-As is an
+        // export). Saving onto the bound path itself is a
+        // bound merge.
+        if p.pdf_merge {
+            let origin_pdf = p
+                .doc_path
+                .clone()
+                .expect("pdf merge pending has a doc path");
+            let clean_copy = p.unmodified
+                && format == p.origin_code
+                && !journal_pending(&shell_c)
+                && !*shell_c.save_failed_outstanding.borrow();
+            if clean_copy {
+                let _ = std::fs::remove_file(&p.tmp_bin);
+                let same = origin_pdf.canonicalize().ok() == path.canonicalize().ok();
+                let result = if same {
+                    Ok(())
+                } else {
+                    std::fs::read(&origin_pdf)
+                        .map_err(|e| format!("read copy source: {e}"))
+                        .and_then(|bytes| {
+                            write_save_checked(&shell_c, &path, &bytes, p.seq).map(|_| ())
+                        })
+                };
+                match result {
+                    Ok(()) => {
+                        eprintln!(
+                            "joffice: PDF-SAVE-COPY {} -> {} (clean, same={})",
+                            origin_pdf.display(),
+                            path.display(),
+                            same
+                        );
+                        if p.pdf_adopt {
+                            set_doc_state(&shell_c, Some(path.clone()), fmt::PDF, false);
+                            *shell_c.current_path.borrow_mut() = Some(path.clone());
+                            shell_c.note_document_opened(&path);
+                            refresh_chrome(&shell_c);
+                        }
+                        reply_save(
+                            &shell_c,
+                            &p.reply,
+                            &p.ctx,
+                            &serde_json::json!({ "ok": true, "unedited": true }),
+                        );
+                        save_done(&shell_c, true);
+                    }
+                    Err(e) => save_fail(&shell_c, &p.reply, e, &p.origin),
+                }
+                return;
+            }
+            let changes = match std::fs::read(&p.tmp_bin) {
+                Ok(c) => c,
+                Err(e) => {
+                    save_fail(
+                        &shell_c,
+                        &p.reply,
+                        format!("read compiled changes: {e}"),
+                        &p.origin,
+                    );
+                    return;
+                }
+            };
+            let _ = std::fs::remove_file(&p.tmp_bin);
+            let same = origin_pdf.canonicalize().ok() == path.canonicalize().ok();
+            let after = if same {
+                AfterWrite::Bound
+            } else if p.pdf_adopt {
+                AfterWrite::Adopt
+            } else {
+                AfterWrite::Export
+            };
+            eprintln!(
+                "joffice: PDF-SAVE-MERGE {} -> {}",
+                origin_pdf.display(),
+                path.display()
+            );
+            pdf_merge_and_write(
+                &shell_c,
+                p.reply.clone(),
+                p.ctx.clone(),
+                origin_pdf,
+                path,
+                changes,
+                p.pdf_annot_count,
+                p.seq,
+                p.origin.clone(),
+                after,
+            );
+            return;
+        }
         // Byte-copy completions (cycle 3): a ViewOnly Save As
         // copies the PDF; an UNEDITED document saved as its own
         // format copies the original bytes (§6a — never
