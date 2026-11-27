@@ -148,8 +148,78 @@
     // recovery. PDF recovery is state-based (compiled
     // snapshots), recovery_degraded = true.
     // -----------------------------------------------------------
-    var joPdf = { active: false, mode: null, degradedLogged: false };
+    var joPdf = {
+        active: false, mode: null, degradedLogged: false,
+        protected: false, perms: null
+    };
     window.__joPdf = joPdf;
+
+    // -----------------------------------------------------------
+    // Protected cycle: the PDF password hand-off + the
+    // clipboard gate. Rust probed the password itself (x2t)
+    // and read the permission bits itself (qpdf); the engine
+    // is the decryptor, so the password crosses ONCE through
+    // the open reply into joPdfPw, the createFile wrap feeds
+    // it to the engine, and the reference is dropped. The
+    // password is never logged, never stored, never sent
+    // anywhere else.
+    // -----------------------------------------------------------
+    var joPdfPw = null;
+
+    function joInstallPdfPasswordWrap(retries) {
+        if (window.AscViewer && window.AscViewer.__joPwWrapped) return;
+        if (!window.AscViewer || !window.AscViewer.createFile
+            || !window.AscViewer.setFilePassword) {
+            // The viewer namespace loads with the PDF editor;
+            // the open reply can land first. Poll briefly —
+            // the api cannot call createFile before the
+            // namespace exists either.
+            if (retries < 50) {
+                setTimeout(function () { joInstallPdfPasswordWrap(retries + 1); }, 100);
+            } else {
+                console.error('[jOffice] PDF_PW_WRAP viewer namespace never appeared');
+            }
+            return;
+        }
+        var orig = window.AscViewer.createFile;
+        window.AscViewer.createFile = function (data) {
+            var f = orig.call(this, data);
+            try {
+                if (f && f.isNeedPassword && f.isNeedPassword() && joPdfPw != null) {
+                    var pw = joPdfPw;
+                    joPdfPw = null; // drop our reference first
+                    window.AscViewer.setFilePassword(f, pw);
+                    pw = null;
+                    var still = !!(f.isNeedPassword && f.isNeedPassword());
+                    joLedger('PDF_PW_ENGINE', null, { accepted: still ? 'no' : 'yes' });
+                    if (still) bridge('pdfPasswordRejected', {});
+                }
+            } catch (e) {
+                console.error('[jOffice] PDF password wrap error: '
+                    + (e && e.message ? e.message : e));
+            }
+            return f;
+        };
+        window.AscViewer.__joPwWrapped = true;
+    }
+
+    // The copy bit is enforced by OUR code (Rust read the
+    // bit; the editor is not trusted to): with copy off,
+    // copy/cut events in this window are swallowed.
+    var joClipboardGateInstalled = false;
+    function joInstallClipboardGate() {
+        if (joClipboardGateInstalled) return;
+        if (!joPdf.perms || joPdf.perms.copy) return;
+        joClipboardGateInstalled = true;
+        var block = function (e) {
+            e.preventDefault();
+            joLedger('CLIPBOARD_BLOCKED', null, { kind: e.type });
+            bridge('clipboardBlocked', { kind: e.type });
+        };
+        document.addEventListener('copy', block, true);
+        document.addEventListener('cut', block, true);
+        joLedger('CLIPBOARD_GATE', null, { armed: 'yes' });
+    }
 
     // PE0 (cycle 5 step 3): trap the two api calls whose
     // arguments decide whether a PDF window may annotate and
@@ -782,6 +852,18 @@
                 mode: joPdf.mode || '?', annotate: !!res.pdfAnnotate
             });
         }
+        // Protected cycle: Rust hands a protected PDF's
+        // password through the open reply (a data channel —
+        // never a constructed script string). The createFile
+        // wrap consumes it ONCE and drops the reference; it
+        // is never logged. Permission bits (read by Rust from
+        // /Encrypt) arm the clipboard gate when copy is off.
+        joPdf.protected = !!res.protected;
+        joPdf.perms = res.pdfPerms || null;
+        if (joPdf.perms) joInstallClipboardGate();
+        joPdfPw = (typeof res.pdfPassword === 'string' && res.pdfPassword.length > 0)
+            ? res.pdfPassword : null;
+        if (joPdfPw != null) joInstallPdfPasswordWrap(0);
     }
 
     function joEndLoadWith(name, data, len) {
@@ -1843,7 +1925,13 @@
         ResaveFile: function () { console.log('[jOffice] stub ResaveFile'); },
         SaveQuestion: function () { console.log('[jOffice] stub SaveQuestion'); },
         SelectCertificate: function () { console.log('[jOffice] stub SelectCertificate'); return ''; },
-        SetAdvancedOptions: function () { console.log('[jOffice] stub SetAdvancedOptions'); },
+        // Ledger the call's LENGTH only (protected cycle):
+        // the argument of a DRM open carries the document
+        // password in its XML — it must never reach a log.
+        // Rust owns the password; this stays a no-op stub.
+        SetAdvancedOptions: function (xml) {
+            joLedger('SETADVANCEDOPTIONS', null, { len: (xml && xml.length) || 0 });
+        },
         SetLocalRestrictions: function () { console.log('[jOffice] stub SetLocalRestrictions'); },
         Sign: function () { console.log('[jOffice] stub Sign'); },
         SpellCheck: function () { console.log('[jOffice] stub SpellCheck'); },

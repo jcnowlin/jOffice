@@ -436,6 +436,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "gtk4",
+ "libc",
  "serde",
  "serde_json",
  "webkit6",

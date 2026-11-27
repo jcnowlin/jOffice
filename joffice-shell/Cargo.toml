@@ -10,6 +10,9 @@ webkit6 = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
+# Protected-documents cycle: setrlimit(RLIMIT_CORE) at startup.
+# Already in Cargo.lock as a transitive dependency (0.2.190).
+libc = "0.2"
 
 [profile.release]
 lto = true

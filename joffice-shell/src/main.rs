@@ -31,6 +31,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use webkit6::javascriptcore::{Context, Value};
@@ -380,7 +381,14 @@ fn refresh_chrome(shell: &Rc<Shell>) {
                     ),
                     Policy::ViewOnly => "PDF — opens read-only".to_string(),
                     Policy::PdfAnnotate => {
-                        "PDF — annotation save (experimental)".to_string()
+                        if d.protected.is_some() {
+                            "PDF — password-protected; annotation save (experimental)".to_string()
+                        } else {
+                            "PDF — annotation save (experimental)".to_string()
+                        }
+                    }
+                    Policy::Protected => {
+                        "Password-protected — recovery is off for this document".to_string()
                     }
                 };
                 badge.set_text(&text);
@@ -417,6 +425,15 @@ fn refresh_chrome(shell: &Rc<Shell>) {
     if let Some(l) = shell.readonly_label.borrow().as_ref() {
         l.set_visible(viewonly);
     }
+    // Password… (protected cycle, Tier 4): visible on any
+    // protected window — documents and PDFs alike.
+    let is_protected = doc
+        .as_ref()
+        .map(|d| d.protected.is_some())
+        .unwrap_or(false);
+    if let Some(b) = shell.pw_btn.borrow().as_ref() {
+        b.set_visible(is_protected);
+    }
 }
 
 /// Adopt a document state after an open (detection ran already).
@@ -438,6 +455,7 @@ fn set_doc_state(shell: &Rc<Shell>, path: Option<PathBuf>, code: i32, is_new: bo
         is_new,
         display_name,
         csv_delimiter,
+        protected: None,
     });
     *shell.modified.borrow_mut() = None;
     *shell.handshake_done.borrow_mut() = false;
@@ -1378,6 +1396,145 @@ fn save_config(cfg: &JofficeConfig) {
 }
 
 /// The open document's save-relevant state (marathon 2 cycle 2).
+/// A document password, held in Rust only (protected cycle,
+/// KAO round 2 §3). The buffer is zeroed on drop and on
+/// explicit clear; it is never cloned, never logged, never
+/// placed in a session manifest, a command line, an
+/// environment variable, or a constructed script string. The
+/// one sanctioned crossings: the 0600 x2t params file on
+/// tmpfs, and — for PDFs only, where the engine itself is the
+/// decryptor — the bridge open reply (a data channel, not a
+/// script string), where the shim drops its reference
+/// immediately after the engine call.
+struct PwBuf {
+    buf: Vec<u8>,
+}
+
+impl PwBuf {
+    fn new(s: &str) -> PwBuf {
+        PwBuf {
+            buf: s.as_bytes().to_vec(),
+        }
+    }
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.buf).unwrap_or("")
+    }
+    fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+    /// The wrong-password probe needs a password that is
+    /// guaranteed to differ from this one.
+    fn wrong_variant(&self) -> PwBuf {
+        let mut b = self.buf.clone();
+        b.push(1u8);
+        b.extend_from_slice(b"joffice-wrong-probe");
+        PwBuf { buf: b }
+    }
+    fn zeroize(&mut self) {
+        for b in &mut self.buf {
+            unsafe { std::ptr::write_volatile(b, 0) };
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Drop for PwBuf {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+/// The encryption scheme of a protected document, read at
+/// open from the file itself (never from the password).
+#[derive(Clone, Debug)]
+enum EncScheme {
+    /// Agile encryption whose parameters match what x2t
+    /// writes (AES-256 / SHA-512 / 100k spins — the pinned
+    /// ECMACryptFile hardcodes exactly this set), so a save
+    /// preserves the scheme by construction.
+    OoxmlAgile {
+        cipher: String,
+        hash: String,
+        key_bits: u32,
+        spin: u32,
+    },
+    /// Any other OOXML scheme (Standard RC4/AES-128, or
+    /// Agile with different parameters). x2t CANNOT preserve
+    /// it — it always writes Agile AES-256 — so saving
+    /// changes the scheme. Disclosed to the user at open,
+    /// never silent (round 1: never silently upgrade or
+    /// downgrade).
+    OoxmlOther { desc: String },
+    /// ODF manifest encryption (per-part; scheme detail in
+    /// the manifest's checksum/start-key attributes).
+    Odf { desc: String },
+    /// PDF /Encrypt dictionary facts.
+    Pdf {
+        r: i64,
+        v: i64,
+        /// The raw /P permission integer.
+        perms: i64,
+    },
+}
+
+impl EncScheme {
+    fn describe(&self) -> String {
+        match self {
+            EncScheme::OoxmlAgile {
+                cipher,
+                hash,
+                key_bits,
+                spin,
+            } => format!("agile {cipher} {hash} keybits={key_bits} spin={spin}"),
+            EncScheme::OoxmlOther { desc } => format!("ooxml-other {desc}"),
+            EncScheme::Odf { desc } => format!("odf {desc}"),
+            EncScheme::Pdf { r, v, perms } => format!("pdf R={r} V={v} P={perms}"),
+        }
+    }
+    /// True when an x2t save preserves the scheme as-is.
+    fn preserved_by_x2t(&self) -> bool {
+        matches!(self, EncScheme::OoxmlAgile { .. } | EncScheme::Pdf { .. })
+    }
+}
+
+/// What Rust knows about a protected window's encryption.
+/// (PDF permission bits are decoded from /P for R>=3:
+/// print 0x4, modify 0x8, copy 0x10, annotate 0x20.)
+#[derive(Clone, Debug)]
+struct ProtectedInfo {
+    scheme: EncScheme,
+    pdf_can_print: bool,
+    pdf_can_copy: bool,
+    pdf_can_modify: bool,
+    pdf_can_annotate: bool,
+    /// The supplied password satisfied the owner password
+    /// (or no user password is set): permissions are moot.
+    pdf_owner_unlocked: bool,
+}
+
+impl ProtectedInfo {
+    fn for_pdf(r: i64, v: i64, perms: i64, owner_unlocked: bool) -> ProtectedInfo {
+        ProtectedInfo {
+            scheme: EncScheme::Pdf { r, v, perms },
+            pdf_can_print: perms & 0x4 != 0,
+            pdf_can_copy: perms & 0x10 != 0,
+            pdf_can_modify: perms & 0x8 != 0,
+            pdf_can_annotate: perms & 0x20 != 0,
+            pdf_owner_unlocked: owner_unlocked,
+        }
+    }
+    fn for_document(scheme: EncScheme) -> ProtectedInfo {
+        ProtectedInfo {
+            scheme,
+            pdf_can_print: true,
+            pdf_can_copy: true,
+            pdf_can_modify: true,
+            pdf_can_annotate: true,
+            pdf_owner_unlocked: true,
+        }
+    }
+}
+
 struct DocState {
     /// The file the document is bound to (None = brand-new).
     path: Option<PathBuf>,
@@ -1391,6 +1548,12 @@ struct DocState {
     /// CSV delimiter detected at open (TCsvDelimiter code); a
     /// save back to CSV reuses it (round 1 §6).
     csv_delimiter: i32,
+    /// Protected-documents cycle: Some when this window's
+    /// document is password-protected. The password itself is
+    /// NOT here — it lives in Shell::protected_pw (Rust-only,
+    /// zeroing). This carries only the encryption scheme and,
+    /// for PDFs, the permission bits Rust enforces itself.
+    protected: Option<ProtectedInfo>,
 }
 
 /// Sniff a delimited-text file's delimiter from its first line:
@@ -1470,6 +1633,11 @@ struct PendingSave {
     /// (cycle 5 continuation, X5) — carried to the merge's
     /// target gate for its ledger.
     pdf_stream_kind: Option<String>,
+    /// Protected cycle: the document was protected when the
+    /// dialog opened — completion routes through the Tier
+    /// 2/3 handling (password prompt / downgrade warning),
+    /// never the plain copy/convert paths.
+    protected: bool,
 }
 
 /// A print-intent export parked on the native print dialog
@@ -1688,8 +1856,29 @@ struct Shell {
     /// merging save 2 into save 1's output appended the
     /// compiled stream onto annotations it already carried).
     pdf_origin: RefCell<Option<PathBuf>>,
+    /// Protected cycle: the session password of the protected
+    /// document in this window (Rust-only, zeroing). None for
+    /// unprotected windows. Cleared (and zeroed) whenever the
+    /// window's document changes or the window dies.
+    protected_pw: RefCell<Option<Arc<PwBuf>>>,
+    /// Protected cycle: the window's private tmpfs directory
+    /// (decrypted intermediates live here and nowhere else).
+    /// Removed on rotate/destroy.
+    protected_tmp: RefCell<Option<PathBuf>>,
+    /// Protected cycle: the one-shot URL transport for a
+    /// large decrypted Editor.bin (no session exists to serve
+    /// it): (token, tmpfs path). Served once by the scheme
+    /// handler, then unregistered.
+    protected_bin: RefCell<Option<(String, PathBuf)>>,
+    /// Protected cycle: the print disclosure ("printing
+    /// produces an unprotected printout") has been shown and
+    /// accepted once this session.
+    print_disclosed: RefCell<bool>,
     /// The ViewOnly "Save a Copy…" button (cycle 4 step 4).
     copy_btn: RefCell<Option<gtk4::Button>>,
+    /// Protected cycle: the "Password…" button (Tier 4
+    /// change/removal), visible on protected windows only.
+    pw_btn: RefCell<Option<gtk4::Button>>,
     /// The "Read-only" badge shown on ViewOnly windows.
     readonly_label: RefCell<Option<gtk4::Label>>,
 }
@@ -1834,10 +2023,15 @@ impl Shell {
             sdk_hash,
             session: RefCell::new(None),
             pdf_origin: RefCell::new(None),
+            protected_pw: RefCell::new(None),
+            protected_tmp: RefCell::new(None),
+            protected_bin: RefCell::new(None),
+            print_disclosed: RefCell::new(false),
             recovery_arm: RefCell::new(None),
             session_discard: RefCell::new(false),
             pending_hist_index: RefCell::new(None),
             copy_btn: RefCell::new(None),
+            pw_btn: RefCell::new(None),
             readonly_label: RefCell::new(None),
         });
         shell.log_manifest();
@@ -2024,6 +2218,9 @@ impl Shell {
         // merge origin (often a path INSIDE the retired
         // session's dir) must not leak into the next one.
         *self.pdf_origin.borrow_mut() = None;
+        // Protected cycle: the old document's password and
+        // tmpfs intermediates die with it (zeroed + removed).
+        clear_protected_state(self);
         let old = self.session.borrow_mut().take();
         if let Some(st) = old {
             let keep = st.unsaved() > 0 || st.recovered_unsaved;
@@ -2066,6 +2263,9 @@ impl Shell {
     /// paths marked it discardable (saved / Don't Save) or the
     /// document is clean; otherwise keep it for recovery.
     fn session_finalize_destroy(&self) {
+        // Protected cycle: the password and tmpfs dir die
+        // with the window, whatever the session does.
+        clear_protected_state(self);
         let old = self.session.borrow_mut().take();
         if let Some(st) = old {
             let discard = *self.session_discard.borrow()
@@ -2337,6 +2537,13 @@ enum Policy {
     /// gate; the bound file is replaced atomically, never
     /// written in place.
     PdfAnnotate,
+    /// A password-protected OOXML/ODF document (protected
+    /// cycle): in-memory only — no journal, no session, no
+    /// recovery. Every exit from this window routes through
+    /// the deny-by-default exit registry; saves re-encrypt
+    /// with the session password and are verified on tmpfs
+    /// before anything touches disk (the wall rule).
+    Protected,
 }
 
 /// Cycle 5 dev flag: PDF annotation save is experimental
@@ -2865,10 +3072,13 @@ fn zip_part_bytes(data: &[u8], entries: &[ZipEntry], name: &str) -> Option<Vec<u
 enum Detected {
     /// A known document format code (AVS_OFFICESTUDIO_FILE_*).
     Format(i32),
-    /// An OLE container carrying OOXML encryption: opening is
-    /// refused (the save side could silently strip the password
-    /// — round 1 §6's trap; refusal is the cycle-2 minimum).
-    Encrypted,
+    /// A password-protected document. The payload is the base
+    /// format code of the document inside the encryption (0 =
+    /// family unknown). Cycle 2 refused these at open; the
+    /// protected-documents cycle opens them through the
+    /// password flow (detection BEFORE x2t or the editor sees
+    /// the file — KAO protected round 1).
+    Encrypted(i32),
     /// Nothing conclusive; callers fall back to the extension.
     Unknown,
 }
@@ -2896,12 +3106,25 @@ fn detect_format(path: &Path) -> Detected {
         // ODF: the mimetype entry names the format directly.
         if let Some(mt) = zip_part_text(&data, &entries, "mimetype") {
             let mt = mt.trim();
-            return match mt {
-                "application/vnd.oasis.opendocument.text" => Detected::Format(fmt::ODT),
-                "application/vnd.oasis.opendocument.spreadsheet" => Detected::Format(fmt::ODS),
-                "application/vnd.oasis.opendocument.presentation" => Detected::Format(fmt::ODP),
-                _ => Detected::Unknown,
+            let code = match mt {
+                "application/vnd.oasis.opendocument.text" => fmt::ODT,
+                "application/vnd.oasis.opendocument.spreadsheet" => fmt::ODS,
+                "application/vnd.oasis.opendocument.presentation" => fmt::ODP,
+                _ => return Detected::Unknown,
             };
+            // Protected ODF (protected-documents cycle): the
+            // manifest marks every encrypted part with an
+            // encryption-data element. Before this check an
+            // encrypted ODF detected as a plain ODF and the
+            // editor failed on garbage bytes.
+            if let Some(manifest) =
+                zip_part_text(&data, &entries, "META-INF/manifest.xml")
+            {
+                if manifest.contains("encryption-data") {
+                    return Detected::Encrypted(code);
+                }
+            }
+            return Detected::Format(code);
         }
         if let Some(ct) = zip_part_text(&data, &entries, "[Content_Types].xml") {
             // The main part's content type decides the format.
@@ -2969,7 +3192,36 @@ fn detect_format(path: &Path) -> Detected {
             .windows(needle.len())
             .any(|w| w == needle.as_slice())
         {
-            return Detected::Encrypted;
+            // The base format rides on the extension — an
+            // encrypted OOXML package's own parts are ciphertext,
+            // so the zip sniffing above cannot run. (The CFB
+            // reader in the protected module reads the real
+            // EncryptionInfo stream at open time.)
+            let base = match path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase()
+                .as_str()
+            {
+                "docx" => fmt::DOCX,
+                "docm" => fmt::DOCM,
+                "dotx" => fmt::DOTX,
+                "dotm" => fmt::DOTM,
+                "xlsx" => fmt::XLSX,
+                "xlsm" => fmt::XLSM,
+                "xltx" => fmt::XLTX,
+                "xltm" => fmt::XLTM,
+                "pptx" => fmt::PPTX,
+                "pptm" => fmt::PPTM,
+                "potx" => fmt::POTX,
+                "potm" => fmt::POTM,
+                "doc" => fmt::DOC,
+                "xls" => fmt::XLS,
+                "ppt" => fmt::PPT,
+                _ => 0,
+            };
+            return Detected::Encrypted(base);
         }
         return match path
             .extension()
@@ -2987,7 +3239,27 @@ fn detect_format(path: &Path) -> Detected {
         return Detected::Format(fmt::RTF);
     }
     if head.starts_with(b"%PDF-") {
-        return Detected::Format(fmt::PDF);
+        // Protected PDF (protected-documents cycle): the
+        // /Encrypt dictionary lives in the trailer (end of
+        // file) or an xref stream. Scan the head and tail; the
+        // engine probe at open is the backstop for exotic
+        // layouts (a miss here surfaces as the editor asking
+        // for a password we never supplied — ledgered as
+        // PDF_NEED_PASSWORD_UNEXPECTED in the shim).
+        let encrypted = std::fs::read(path)
+            .map(|data| {
+                let n = data.len();
+                let head_end = n.min(256 * 1024);
+                let tail_start = n.saturating_sub(256 * 1024);
+                data[..head_end].windows(8).any(|w| w == b"/Encrypt")
+                    || data[tail_start..].windows(8).any(|w| w == b"/Encrypt")
+            })
+            .unwrap_or(false);
+        return if encrypted {
+            Detected::Encrypted(fmt::PDF)
+        } else {
+            Detected::Format(fmt::PDF)
+        };
     }
     Detected::Unknown
 }
@@ -3361,6 +3633,33 @@ fn generate_doctrenderer_config(x2t: &Path, sdkjs: &Path, webapps: &Path) {
 /// Spawn x2t on a params file through the single disciplined
 /// path. `extra_env` rides on top of the allowlist (the caller
 /// pins TMPDIR to the conversion's private temp root).
+/// Ledger scrubbing (protected cycle, KAO round 2 §2): the
+/// params XML of a protected conversion carries the document
+/// password. Anything printed from it must have the password
+/// elements' contents redacted — the ledger records that a
+/// password was supplied, never its value.
+fn scrub_params_for_log(xml: &str) -> String {
+    let mut out = xml.to_string();
+    for tag in ["m_sPassword", "m_sSavePassword"] {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        let mut cursor = 0;
+        while let Some(rel) = out[cursor..].find(&open) {
+            let s = cursor + rel;
+            let Some(erel) = out[s..].find(&close) else { break };
+            let inner_start = s + open.len();
+            let inner_end = s + erel;
+            if inner_end > inner_start {
+                out.replace_range(inner_start..inner_end, "***");
+                cursor = inner_start + 3 + close.len();
+            } else {
+                cursor = inner_end + close.len();
+            }
+        }
+    }
+    out
+}
+
 fn run_x2t(
     x2t: &Path,
     params_path: &Path,
@@ -3400,7 +3699,7 @@ fn run_x2t(
         .unwrap_or_else(|_| "<unavailable>".to_string());
     eprintln!(
         "joffice: X2T_RUN pid={pid} cwd={proc_cwd} proc_env={proc_env} params={}",
-        params_xml.replace('\n', " ")
+        scrub_params_for_log(&params_xml).replace('\n', " ")
     );
     let out = child
         .wait_with_output()
@@ -3424,6 +3723,19 @@ fn run_x2t(
 /// (8192) — x2t cannot auto-detect the internal format.
 /// Returns the output file bytes.
 #[allow(clippy::too_many_arguments)]
+/// Conversion options for protected documents (protected
+/// cycle). Passwords travel ONLY inside the 0600 params file
+/// written under `root` (a private tmpfs dir) — never on a
+/// command line, never in an environment variable (KAO
+/// round 2 §3). The params file is deleted with the rest of
+/// the conversion temp immediately after the run.
+#[derive(Default, Clone)]
+struct X2tOpts {
+    pw_open: Option<Arc<PwBuf>>,
+    pw_save: Option<Arc<PwBuf>>,
+    root: Option<PathBuf>,
+}
+
 fn x2t_convert_sync(
     x2t: &Path,
     from: &Path,
@@ -3436,9 +3748,44 @@ fn x2t_convert_sync(
     pdfa: bool,
     media: &[(String, PathBuf)],
 ) -> Result<Vec<u8>, String> {
+    x2t_convert_sync_opts(
+        x2t,
+        from,
+        format_to,
+        format_from,
+        font_dir,
+        allfonts_path,
+        theme_dir,
+        csv_delim,
+        pdfa,
+        media,
+        &X2tOpts::default(),
+    )
+    .0
+}
+
+/// The workhorse, additionally reporting x2t's numeric exit
+/// code on failure (the protected open classifies 90 = DRM /
+/// no password and 91 = wrong password — getReturnErrorCode
+/// in the pinned core subtracts the HRESULT bases, so these
+/// are the small integers the process actually exits with).
+#[allow(clippy::too_many_arguments)]
+fn x2t_convert_sync_opts(
+    x2t: &Path,
+    from: &Path,
+    format_to: i32,
+    format_from: Option<i32>,
+    font_dir: Option<&Path>,
+    allfonts_path: Option<&Path>,
+    theme_dir: Option<&Path>,
+    csv_delim: Option<i32>,
+    pdfa: bool,
+    media: &[(String, PathBuf)],
+    opts: &X2tOpts,
+) -> (Result<Vec<u8>, String>, Option<i32>) {
     let t_start = std::time::Instant::now();
     let stem = temp_stem("x2t");
-    let tmpdir = std::env::temp_dir();
+    let tmpdir = opts.root.clone().unwrap_or_else(std::env::temp_dir);
     let out_path = tmpdir.join(format!("{stem}.out"));
     let params_path = tmpdir.join(format!("{stem}.xml"));
     // PRIVATE per-conversion temp dir (marathon 2 cycle 2 drive
@@ -3450,7 +3797,9 @@ fn x2t_convert_sync(
     // footnotes plus a vbaProject stub left by an earlier
     // conversion. One private dir per conversion, removed after.
     let work_temp = tmpdir.join(format!("{stem}-tmp"));
-    std::fs::create_dir_all(&work_temp).map_err(|e| format!("create x2t temp dir: {e}"))?;
+    if let Err(e) = std::fs::create_dir_all(&work_temp) {
+        return (Err(format!("create x2t temp dir: {e}")), None);
+    }
 
     // x2t infers from extensions: the input extension must be right.
     // Copy the input to a temp file with its real extension if needed.
@@ -3463,9 +3812,13 @@ fn x2t_convert_sync(
     // the dangling references.
     let from_ext = from.extension().and_then(|e| e.to_str()).unwrap_or("docx");
     let conv_dir = tmpdir.join(format!("{stem}-conv"));
-    std::fs::create_dir_all(&conv_dir).map_err(|e| format!("create x2t conv dir: {e}"))?;
+    if let Err(e) = std::fs::create_dir_all(&conv_dir) {
+        return (Err(format!("create x2t conv dir: {e}")), None);
+    }
     let from_tmp = conv_dir.join(format!("in.{from_ext}"));
-    std::fs::copy(from, &from_tmp).map_err(|e| format!("stage input: {e}"))?;
+    if let Err(e) = std::fs::copy(from, &from_tmp) {
+        return (Err(format!("stage input: {e}")), None);
+    }
     if !media.is_empty() {
         let mdir = conv_dir.join("media");
         if std::fs::create_dir_all(&mdir).is_ok() {
@@ -3537,6 +3890,25 @@ fn x2t_convert_sync(
     if format_to == fmt::PDF {
         extra.push_str(&format!("  <m_bIsPDFA>{pdfa}</m_bIsPDFA>\n"));
     }
+    // Protected documents: the password elements (the pinned
+    // cextracttools.h names — m_sPassword opens, m_sSavePassword
+    // seals the output; the same pair serves OOXML, ODF and
+    // PDF). Values are XML-escaped; the params file carrying
+    // them is 0600 under the conversion root and deleted below.
+    // The ledger line for this run logs only "password
+    // supplied: yes/no" (run_x2t scrubs the XML it prints).
+    if let Some(pw) = &opts.pw_open {
+        extra.push_str(&format!(
+            "  <m_sPassword>{}</m_sPassword>\n",
+            xml_escape(pw.as_str())
+        ));
+    }
+    if let Some(pw) = &opts.pw_save {
+        extra.push_str(&format!(
+            "  <m_sSavePassword>{}</m_sSavePassword>\n",
+            xml_escape(pw.as_str())
+        ));
+    }
 
     let params = format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
@@ -3554,7 +3926,17 @@ fn x2t_convert_sync(
         xml_escape(&work_temp.display().to_string()),
         extra
     );
-    std::fs::write(&params_path, params).map_err(|e| format!("write x2t params: {e}"))?;
+    if let Err(e) = std::fs::write(&params_path, params) {
+        return (Err(format!("write x2t params: {e}")), None);
+    }
+    if opts.pw_open.is_some() || opts.pw_save.is_some() {
+        // The params file now carries a password: owner-only.
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            &params_path,
+            std::fs::Permissions::from_mode(0o600),
+        );
+    }
 
     // TMPDIR pinned to the private temp root: x2t's own scratch
     // (beyond m_sTempDir) must not land in the shared system temp
@@ -3563,20 +3945,34 @@ fn x2t_convert_sync(
         "TMPDIR".to_string(),
         work_temp.display().to_string(),
     )];
-    let out = run_x2t(x2t, &params_path, &extra_env)?;
+    let out = match run_x2t(x2t, &params_path, &extra_env) {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = std::fs::remove_file(&params_path);
+            let _ = std::fs::remove_dir_all(&conv_dir);
+            let _ = std::fs::remove_dir_all(&work_temp);
+            return (Err(e), None);
+        }
+    };
 
     let _ = std::fs::remove_file(&params_path);
     let _ = std::fs::remove_dir_all(&conv_dir);
     let _ = std::fs::remove_dir_all(&work_temp);
 
     if !out.status.success() {
-        return Err(format!(
-            "x2t failed (exit {}): {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        return (
+            Err(format!(
+                "x2t failed (exit {}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+            out.status.code(),
+        );
     }
-    let bytes = std::fs::read(&out_path).map_err(|e| format!("read x2t output: {e}"))?;
+    let bytes = match std::fs::read(&out_path) {
+        Ok(b) => b,
+        Err(e) => return (Err(format!("read x2t output: {e}")), None),
+    };
     let _ = std::fs::remove_file(&out_path);
     eprintln!(
         "joffice: MEASURE conv to={} ms={} out_bytes={}",
@@ -3584,7 +3980,7 @@ fn x2t_convert_sync(
         t_start.elapsed().as_millis(),
         bytes.len()
     );
-    Ok(bytes)
+    (Ok(bytes), None)
 }
 
 /// Run x2t on a worker thread; `done` runs on the GTK main thread with
@@ -3595,6 +3991,28 @@ fn x2t_convert_async(
     format_to: i32,
     format_from: Option<i32>,
     pdfa: bool,
+    done: impl FnOnce(Result<Vec<u8>, String>) + 'static,
+) {
+    x2t_convert_async_opts(
+        shell,
+        from,
+        format_to,
+        format_from,
+        pdfa,
+        X2tOpts::default(),
+        done,
+    )
+}
+
+/// x2t_convert_async with protected-conversion options
+/// (passwords + tmpfs root) for the protected save paths.
+fn x2t_convert_async_opts(
+    shell: &Rc<Shell>,
+    from: PathBuf,
+    format_to: i32,
+    format_from: Option<i32>,
+    pdfa: bool,
+    opts: X2tOpts,
     done: impl FnOnce(Result<Vec<u8>, String>) + 'static,
 ) {
     let x2t = match shell.x2t.clone() {
@@ -3644,7 +4062,7 @@ fn x2t_convert_async(
         .collect();
     let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
     std::thread::spawn(move || {
-        let result = x2t_convert_sync(
+        let result = x2t_convert_sync_opts(
             &x2t,
             &from,
             format_to,
@@ -3655,7 +4073,9 @@ fn x2t_convert_async(
             csv_delim,
             pdfa,
             &media,
-        );
+            &opts,
+        )
+        .0;
         let _ = tx.send(result);
     });
     // Poll the channel from the main thread; reply there (WebKit calls
@@ -3931,6 +4351,46 @@ fn handle_uri_scheme(shell: &Rc<Shell>, req: &URISchemeRequest) {
     // upload endpoint and nothing else.
     if let Some(rest) = rel.strip_prefix("session/") {
         handle_session_route(shell, req, rest, &uri);
+        return;
+    }
+
+    // Route /protected-bin/<token> (protected cycle): the
+    // one-shot transport for a large decrypted Editor.bin.
+    // A protected window has NO session (mode (a)), so the
+    // bin rides its own token; the file lives on tmpfs and
+    // the registration is consumed by the first serve.
+    if let Some(token) = rel.strip_prefix("protected-bin/") {
+        let registered = shell.protected_bin.borrow().clone();
+        match registered {
+            Some((t, p)) if t == token => {
+                *shell.protected_bin.borrow_mut() = None;
+                match std::fs::read(&p) {
+                    Ok(data) => {
+                        eprintln!(
+                            "joffice: PROTECTED_BIN served bytes={}",
+                            data.len()
+                        );
+                        finish_ok(req, &data, "application/octet-stream");
+                    }
+                    Err(e) => {
+                        eprintln!("joffice: PROTECTED_BIN read failed: {e}");
+                        let mut err = gtk4::glib::Error::new(
+                            gtk4::gio::IOErrorEnum::NotFound,
+                            &format!("joffice: protected bin unreadable: {e}"),
+                        );
+                        req.finish_error(&mut err);
+                    }
+                }
+            }
+            _ => {
+                eprintln!("joffice: PROTECTED_BIN 404 (unknown or consumed token)");
+                let mut err = gtk4::glib::Error::new(
+                    gtk4::gio::IOErrorEnum::NotFound,
+                    "joffice: protected bin not found",
+                );
+                req.finish_error(&mut err);
+            }
+        }
         return;
     }
 
@@ -4729,6 +5189,1816 @@ fn show_close_prompt(shell: &Rc<Shell>, unknown: bool) {
 /// The encrypted-document refusal (round 1 §6's minimum): a
 /// clear native message, and the file is never opened (so it
 /// can never be saved back unencrypted by accident).
+// ---------------------------------------------------------------------------
+// Protected documents (marathon 2, protected-documents cycle;
+// KAO protected rounds 1+2 govern — round 2's build order and
+// corrections supersede round 1 where they conflict).
+//
+// A protected document is a different MODE, not a format flag:
+//   * detection before x2t or the editor sees the file;
+//   * the password lives in Rust only, in a zeroing buffer;
+//   * mode (a): NO journal, NO session, NO recovery — the
+//     window is in-memory only and says so in its banner;
+//   * every decrypted intermediate lives on tmpfs;
+//   * saves re-encrypt with the SESSION password and are
+//     verified on tmpfs BEFORE anything touches disk (the
+//     wall rule: a protected save counts only if the output
+//     opened with the user's password and refused a wrong
+//     one, before the rename);
+//   * every content-writing exit routes through the
+//     deny-by-default registry below.
+// ---------------------------------------------------------------------------
+
+/// Root for protected intermediates: /dev/shm when it is a
+/// real tmpfs (checked against /proc/mounts, not assumed),
+/// else a private dir under the state home — with a ledger
+/// warning, never silent (round 2 §5: don't shred tmpfs; the
+/// control is never putting decrypted bytes on persistent
+/// disk, and when that is impossible, say so in the log).
+fn protected_tmp_root() -> PathBuf {
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+        let shm_is_tmpfs = mounts
+            .lines()
+            .any(|l| l.starts_with("tmpfs /dev/shm ") || l.contains(" /dev/shm tmpfs "));
+        if shm_is_tmpfs && Path::new("/dev/shm").is_dir() {
+            let probe = Path::new("/dev/shm").join(format!(".joffice-probe-{}", std::process::id()));
+            if std::fs::create_dir(&probe).is_ok() {
+                let _ = std::fs::remove_dir(&probe);
+                return PathBuf::from("/dev/shm");
+            }
+        }
+        let fallback = gtk4::glib::home_dir()
+            .join(".local")
+            .join("state")
+            .join("joffice")
+            .join("prot-tmp");
+        let _ = std::fs::create_dir_all(&fallback);
+        eprintln!(
+            "joffice: PROT_TMP_FALLBACK root={} (no usable tmpfs at /dev/shm; \
+             decrypted intermediates live on disk here, deleted immediately \
+             after each use)",
+            fallback.display()
+        );
+        fallback
+    })
+    .clone()
+}
+
+/// Create this window's private protected dir (0700) under
+/// the tmpfs root and register it for cleanup. Any previous
+/// dir is removed first.
+fn protected_tmp_new(shell: &Rc<Shell>) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(old) = shell.protected_tmp.borrow_mut().take() {
+        let _ = std::fs::remove_dir_all(&old);
+    }
+    let root = protected_tmp_root();
+    let _ = std::fs::create_dir_all(&root);
+    let dir = root.join(format!("joffice-prot-{}", new_sid()));
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    eprintln!("joffice: PROT_TMP dir={}", dir.display());
+    *shell.protected_tmp.borrow_mut() = Some(dir.clone());
+    dir
+}
+
+/// Zero and drop the window's password, remove its tmpfs
+/// dir and its one-shot bin registration. Called whenever
+/// the window's document changes and when it dies. (Takes
+/// &Shell: it is called from inside impl Shell methods.)
+fn clear_protected_state(shell: &Shell) {
+    if let Some(mut pw) = shell.protected_pw.borrow_mut().take() {
+        // The Arc may outlive this in an in-flight conversion;
+        // zero the buffer now when we hold the last reference
+        // — otherwise PwBuf::drop zeroes it when the count
+        // reaches zero.
+        if let Some(m) = Arc::get_mut(&mut pw) {
+            m.zeroize();
+        }
+        drop(pw);
+    }
+    if let Some(dir) = shell.protected_tmp.borrow_mut().take() {
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("joffice: PROT_TMP removed dir={}", dir.display());
+    }
+    *shell.protected_bin.borrow_mut() = None;
+    *shell.print_disclosed.borrow_mut() = false;
+}
+
+// --- OLE/CFB reader ---------------------------------------------------------
+// Just enough of the compound-file format to enumerate the
+// directory and read the (small) EncryptionInfo stream
+// exactly — detection by directory-entry substring (the old
+// cycle-2 sniff) cannot read the scheme parameters. Every
+// offset is bounds-checked; any inconsistency returns None
+// and the caller falls back to "scheme unknown".
+
+struct CfbDirEntry {
+    name: String,
+    obj_type: u8,
+    start: u32,
+    size: u64,
+}
+
+fn cfb_u16(d: &[u8], off: usize) -> Option<u16> {
+    d.get(off..off + 2)
+        .map(|s| u16::from_le_bytes([s[0], s[1]]))
+}
+fn cfb_u32(d: &[u8], off: usize) -> Option<u32> {
+    d.get(off..off + 4)
+        .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+fn cfb_u64(d: &[u8], off: usize) -> Option<u64> {
+    d.get(off..off + 8)
+        .map(|s| u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
+}
+
+const CFB_FREE: u32 = 0xFFFF_FFFF;
+const CFB_END: u32 = 0xFFFF_FFFE;
+
+fn cfb_sector<'a>(d: &'a [u8], sec_size: usize, sid: u32) -> Option<&'a [u8]> {
+    let off = (sid as usize).checked_add(1)?.checked_mul(sec_size)?;
+    d.get(off..off + sec_size)
+}
+
+fn cfb_chain(fat: &[u32], start: u32, limit: usize) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut cur = start;
+    while cur != CFB_END && cur != CFB_FREE && (cur as usize) < fat.len() && out.len() < limit {
+        out.push(cur);
+        cur = fat[cur as usize];
+    }
+    out
+}
+
+fn cfb_parse(d: &[u8]) -> Option<(Vec<CfbDirEntry>, Vec<u8>)> {
+    // Returns (directory entries, mini-stream bytes).
+    if d.len() < 512 || !d.starts_with(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]) {
+        return None;
+    }
+    let sec_size = 1usize << cfb_u16(d, 30)?;
+    let mini_size = 1usize << cfb_u16(d, 32)?;
+    if sec_size < 128 || mini_size == 0 {
+        return None;
+    }
+    let num_fat = cfb_u32(d, 44)? as usize;
+    let first_dir = cfb_u32(d, 48)?;
+    let mini_cutoff = cfb_u32(d, 56)? as usize;
+    let first_minifat = cfb_u32(d, 60)?;
+    let num_minifat = cfb_u32(d, 64)? as usize;
+    let first_difat = cfb_u32(d, 68)?;
+    let num_difat = cfb_u32(d, 72)? as usize;
+    let _ = mini_cutoff;
+    // DIFAT: 109 entries in the header, then a chain.
+    let mut difat: Vec<u32> = Vec::new();
+    for i in 0..109 {
+        let v = cfb_u32(d, 76 + i * 4)?;
+        if v != CFB_FREE {
+            difat.push(v);
+        }
+    }
+    let mut next_difat = first_difat;
+    let mut guard = 0;
+    while next_difat != CFB_END && next_difat != CFB_FREE && guard < num_difat + 1 {
+        guard += 1;
+        let sec = cfb_sector(d, sec_size, next_difat)?;
+        let per = sec_size / 4 - 1;
+        for i in 0..per {
+            let v = cfb_u32(sec, i * 4)?;
+            if v != CFB_FREE {
+                difat.push(v);
+            }
+        }
+        next_difat = cfb_u32(sec, per * 4)?;
+    }
+    // FAT.
+    let mut fat: Vec<u32> = Vec::new();
+    for sid in difat.iter().take(num_fat.max(1)) {
+        let sec = cfb_sector(d, sec_size, *sid)?;
+        for i in 0..sec_size / 4 {
+            fat.push(cfb_u32(sec, i * 4)?);
+        }
+    }
+    if fat.is_empty() {
+        return None;
+    }
+    // Directory.
+    let mut entries: Vec<CfbDirEntry> = Vec::new();
+    for sid in cfb_chain(&fat, first_dir, 1024) {
+        let sec = cfb_sector(d, sec_size, sid)?;
+        for chunk in sec.chunks_exact(128) {
+            let name_len = cfb_u16(chunk, 64)? as usize;
+            if name_len < 2 || name_len > 64 {
+                continue;
+            }
+            let units: Vec<u16> = (0..(name_len - 2) / 2)
+                .filter_map(|i| cfb_u16(chunk, i * 2))
+                .collect();
+            let name = String::from_utf16_lossy(&units);
+            entries.push(CfbDirEntry {
+                name,
+                obj_type: chunk[66],
+                start: cfb_u32(chunk, 116)?,
+                size: cfb_u64(chunk, 120)?,
+            });
+        }
+    }
+    // Mini stream = the root entry's own stream.
+    let root = entries.iter().find(|e| e.obj_type == 5)?;
+    let mut mini_stream: Vec<u8> = Vec::new();
+    for sid in cfb_chain(&fat, root.start, 1 << 20) {
+        let sec = cfb_sector(d, sec_size, sid)?;
+        mini_stream.extend_from_slice(sec);
+    }
+    mini_stream.truncate(root.size as usize);
+    // MiniFAT.
+    let mut minifat: Vec<u32> = Vec::new();
+    for sid in cfb_chain(&fat, first_minifat, num_minifat + 1) {
+        let sec = cfb_sector(d, sec_size, sid)?;
+        for i in 0..sec_size / 4 {
+            minifat.push(cfb_u32(sec, i * 4)?);
+        }
+    }
+    let _ = minifat;
+    Some((entries, mini_stream))
+}
+
+/// Read one stream's bytes from a CFB image. Streams at or
+/// above the mini cutoff ride the FAT; smaller ones ride the
+/// mini stream. (EncryptionInfo is small; EncryptedPackage
+/// is never read — its size alone is not needed.)
+fn cfb_read_stream(d: &[u8], want: &str) -> Option<Vec<u8>> {
+    let (entries, mini_stream) = cfb_parse(d)?;
+    let entry = entries.iter().find(|e| e.obj_type == 2 && e.name == want)?;
+    let sec_size = 1usize << cfb_u16(d, 30)?;
+    let mini_size = 1usize << cfb_u16(d, 32)?;
+    let mini_cutoff = cfb_u32(d, 56)? as usize;
+    let size = entry.size as usize;
+    if size >= mini_cutoff {
+        // Rebuild the FAT (cfb_parse consumed it privately;
+        // recompute cheaply from the DIFAT).
+        let num_fat = cfb_u32(d, 44)? as usize;
+        let mut fat: Vec<u32> = Vec::new();
+        for i in 0..109 {
+            let v = cfb_u32(d, 76 + i * 4)?;
+            if v != CFB_FREE && fat.len() / (sec_size / 4) < num_fat.max(1) {
+                if let Some(sec) = cfb_sector(d, sec_size, v) {
+                    for j in 0..sec_size / 4 {
+                        fat.push(cfb_u32(sec, j * 4)?);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for sid in cfb_chain(&fat, entry.start, 1 << 22) {
+            let sec = cfb_sector(d, sec_size, sid)?;
+            out.extend_from_slice(sec);
+            if out.len() >= size {
+                break;
+            }
+        }
+        out.truncate(size);
+        Some(out)
+    } else {
+        // Mini stream path: rebuild the MiniFAT chain.
+        let first_minifat = cfb_u32(d, 60)?;
+        let num_fat = cfb_u32(d, 44)? as usize;
+        let mut fat: Vec<u32> = Vec::new();
+        for i in 0..109 {
+            let v = cfb_u32(d, 76 + i * 4)?;
+            if v != CFB_FREE && fat.len() / (sec_size / 4) < num_fat.max(1) {
+                if let Some(sec) = cfb_sector(d, sec_size, v) {
+                    for j in 0..sec_size / 4 {
+                        fat.push(cfb_u32(sec, j * 4)?);
+                    }
+                }
+            }
+        }
+        let mut minifat: Vec<u32> = Vec::new();
+        for sid in cfb_chain(&fat, first_minifat, 1 << 20) {
+            let sec = cfb_sector(d, sec_size, sid)?;
+            for j in 0..sec_size / 4 {
+                minifat.push(cfb_u32(sec, j * 4)?);
+            }
+        }
+        let mut out = Vec::new();
+        let mut cur = entry.start;
+        let mut guard = 0;
+        while cur != CFB_END && cur != CFB_FREE && (cur as usize) < minifat.len() && guard < 1 << 22 {
+            guard += 1;
+            let off = (cur as usize) * mini_size;
+            let chunk = mini_stream.get(off..off + mini_size)?;
+            out.extend_from_slice(chunk);
+            if out.len() >= size {
+                break;
+            }
+            cur = minifat[cur as usize];
+        }
+        out.truncate(size);
+        Some(out)
+    }
+}
+
+fn cfb_stream_names(d: &[u8]) -> Vec<String> {
+    cfb_parse(d)
+        .map(|(entries, _)| entries.iter().map(|e| e.name.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// Parse an agile EncryptionInfo XML attribute (string
+/// search — the file is a fixed-shape XML descriptor).
+fn agile_attr(xml: &str, name: &str) -> Option<String> {
+    let pat = format!("{name}=\"");
+    let s = xml.find(&pat)? + pat.len();
+    let e = xml[s..].find('"')? + s;
+    Some(xml[s..e].to_string())
+}
+
+/// The OOXML encryption scheme from the EncryptionInfo
+/// stream: (4,4) = Agile (XML descriptor at offset 8);
+/// anything else is a legacy scheme x2t cannot preserve.
+fn ooxml_scheme(data: &[u8]) -> EncScheme {
+    let Some(info) = cfb_read_stream(data, "EncryptionInfo") else {
+        return EncScheme::OoxmlOther {
+            desc: "EncryptionInfo stream unreadable".to_string(),
+        };
+    };
+    if info.len() < 8 {
+        return EncScheme::OoxmlOther {
+            desc: "EncryptionInfo stream truncated".to_string(),
+        };
+    }
+    let major = u16::from_le_bytes([info[0], info[1]]);
+    let minor = u16::from_le_bytes([info[2], info[3]]);
+    if (major, minor) == (4, 4) {
+        let xml = String::from_utf8_lossy(&info[8..]).into_owned();
+        let cipher = agile_attr(&xml, "cipherAlgorithm").unwrap_or_else(|| "?".to_string());
+        let hash = agile_attr(&xml, "hashAlgorithm").unwrap_or_else(|| "?".to_string());
+        let key_bits: u32 = agile_attr(&xml, "keyBits")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let spin: u32 = agile_attr(&xml, "spinCount")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if cipher == "AES" && hash == "SHA512" && key_bits == 256 {
+            return EncScheme::OoxmlAgile {
+                cipher,
+                hash,
+                key_bits,
+                spin,
+            };
+        }
+        return EncScheme::OoxmlOther {
+            desc: format!("agile {cipher}/{hash} keyBits={key_bits} spin={spin}"),
+        };
+    }
+    EncScheme::OoxmlOther {
+        desc: format!("version {major}.{minor} (standard/extensible, pre-Agile)"),
+    }
+}
+
+/// The ODF encryption scheme from META-INF/manifest.xml.
+fn odf_scheme(path: &Path) -> EncScheme {
+    let desc = std::fs::read(path)
+        .ok()
+        .and_then(|data| {
+            let entries = zip_central_dir(&data)?;
+            zip_part_text(&data, &entries, "META-INF/manifest.xml")
+        })
+        .map(|manifest| {
+            let mut parts = Vec::new();
+            if let Some(pos) = manifest.find("encryption-data") {
+                let block = &manifest[pos..manifest.len().min(pos + 600)];
+                if let Some(ck) = agile_attr(block, "checksum-type") {
+                    parts.push(format!("checksum {ck}"));
+                }
+                if let Some(sk) = agile_attr(block, "start-key-generation-name") {
+                    parts.push(format!("start-key {sk}"));
+                }
+            }
+            if parts.is_empty() {
+                "manifest encryption (details unread)".to_string()
+            } else {
+                parts.join(", ")
+            }
+        })
+        .unwrap_or_else(|| "manifest unreadable".to_string());
+    EncScheme::Odf { desc }
+}
+
+/// PDF encryption facts (R, V, /P) via qpdf --show-encryption
+/// (no password is needed — or accepted — for this listing;
+/// nothing here goes near a command line but the file path).
+fn pdf_encryption_info(path: &Path) -> Option<(i64, i64, i64)> {
+    let qpdf = find_qpdf()?;
+    let out = Command::new(&qpdf)
+        .arg("--show-encryption")
+        .arg(path)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned()
+        + &String::from_utf8_lossy(&out.stderr);
+    let grab = |key: &str| -> Option<i64> {
+        for line in text.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix(key) {
+                let rest = rest.trim().trim_start_matches('=').trim();
+                if let Ok(v) = rest.parse::<i64>() {
+                    return Some(v);
+                }
+            }
+        }
+        None
+    };
+    let r = grab("R")?;
+    let v = grab("V").unwrap_or(0);
+    let p = grab("P")?;
+    Some((r, v, p))
+}
+
+// --- Exit registry ----------------------------------------------------------
+
+/// Every shell path that can write document content, for the
+/// deny-by-default registry (KAO round 2 §8). A protected
+/// window's exit is classified BEFORE it runs; an
+/// unclassified path refuses.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExitPath {
+    InPlaceSave,
+    SaveAsSameFormat,
+    SaveAsOtherFormat,
+    SaveCopy,
+    PdfExport,
+    OtherExport,
+    Print,
+    PrintToFile,
+    PdfMerge,
+    JournalFlush,
+    TempWrite,
+    Clipboard,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExitClass {
+    /// The output must be re-encrypted (and verified) with
+    /// the session password.
+    ReEncrypt,
+    /// Refused outright for protected windows.
+    Refuse,
+    /// Allowed only after the explicit downgrade warning
+    /// ("will not be password-protected") is accepted.
+    WarnDowngrade,
+    /// Allowed as-is (the bytes stay encrypted, or the path
+    /// is tmpfs-only by construction).
+    Allow,
+}
+
+/// Classify an exit for the window's current document.
+/// Non-protected windows always Allow. Every consultation
+/// on a protected window — and every refusal anywhere — is
+/// ledgered.
+fn exit_registry(shell: &Rc<Shell>, path: ExitPath) -> ExitClass {
+    let doc = shell.doc.borrow();
+    let info = doc.as_ref().and_then(|d| d.protected.clone());
+    let Some(info) = info else {
+        return ExitClass::Allow;
+    };
+    let class = match path {
+        ExitPath::InPlaceSave => ExitClass::ReEncrypt,
+        ExitPath::SaveAsSameFormat => ExitClass::ReEncrypt,
+        ExitPath::SaveAsOtherFormat => ExitClass::WarnDowngrade,
+        // A byte copy of the file is still the encrypted
+        // file — nothing is decrypted by copying it.
+        ExitPath::SaveCopy => ExitClass::Allow,
+        ExitPath::PdfExport => ExitClass::WarnDowngrade,
+        ExitPath::OtherExport => ExitClass::WarnDowngrade,
+        ExitPath::Print => ExitClass::WarnDowngrade,
+        ExitPath::PrintToFile => ExitClass::WarnDowngrade,
+        // The annotation merge preserves the /Encrypt dict
+        // (pinned pdf_image.h: EditPdf is constructed with
+        // the reader's encrypt dict + password) and is
+        // verified still-encrypted before it lands.
+        ExitPath::PdfMerge => ExitClass::ReEncrypt,
+        // Mode (a): a protected window has no journal. A
+        // flush claiming to write one is a bug — refuse it.
+        ExitPath::JournalFlush => ExitClass::Refuse,
+        ExitPath::TempWrite => ExitClass::Allow,
+        ExitPath::Clipboard => {
+            if !info.pdf_can_copy && !info.pdf_owner_unlocked {
+                ExitClass::Refuse
+            } else {
+                ExitClass::Allow
+            }
+        }
+    };
+    eprintln!("joffice: EXIT_REGISTRY path={path:?} class={class:?}");
+    if class == ExitClass::Refuse {
+        eprintln!("joffice: EXIT_REFUSED path={path:?}");
+    }
+    class
+}
+
+// --- Native dialogs (synchronous, nested main loop) -------------------------
+// The password prompt and the downgrade confirmations are
+// NATIVE GTK, in Rust (round 1: prompt natively, never in
+// JS). They run a nested main loop from inside the bridge
+// handler — the bridge reply is deferred by design, and the
+// nested loop keeps the editor's own event flow alive while
+// the dialog is up.
+
+fn modal_parent(shell: &Rc<Shell>) -> Option<gtk4::Window> {
+    shell
+        .window
+        .borrow()
+        .clone()
+        .map(|w| w.upcast::<gtk4::Window>())
+}
+
+fn run_nested_modal(win: &gtk4::Window) {
+    let loop_ = gtk4::glib::MainLoop::new(None, false);
+    let quit = loop_.clone();
+    win.connect_destroy(move |_| quit.quit());
+    win.present();
+    loop_.run();
+}
+
+/// One-field password prompt. `prefill` seeds the entry
+/// (Save As: the new file's password defaults to the
+/// current one). Returns None on Cancel / window close.
+fn prompt_password_sync(
+    shell: &Rc<Shell>,
+    title: &str,
+    message: &str,
+    error: Option<&str>,
+    prefill: Option<&str>,
+    ok_label: &str,
+) -> Option<String> {
+    let win = gtk4::Window::new();
+    win.set_title(Some(title));
+    win.set_modal(true);
+    if let Some(parent) = modal_parent(shell) {
+        win.set_transient_for(Some(&parent));
+    }
+    win.set_default_size(420, -1);
+    let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
+    vbox.set_margin_start(18);
+    vbox.set_margin_end(18);
+    vbox.set_margin_top(16);
+    vbox.set_margin_bottom(16);
+    let msg = gtk4::Label::new(Some(message));
+    msg.set_wrap(true);
+    msg.set_xalign(0.0);
+    vbox.append(&msg);
+    if let Some(e) = error {
+        let err = gtk4::Label::new(Some(e));
+        err.set_wrap(true);
+        err.set_xalign(0.0);
+        err.add_css_class("error");
+        vbox.append(&err);
+    }
+    let entry = gtk4::PasswordEntry::new();
+    entry.set_placeholder_text(Some("Password"));
+    entry.set_show_peek_icon(true);
+    if let Some(p) = prefill {
+        entry.set_text(p);
+    }
+    vbox.append(&entry);
+    let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    hbox.set_halign(gtk4::Align::End);
+    let cancel = gtk4::Button::with_label("Cancel");
+    let ok = gtk4::Button::with_label(ok_label);
+    ok.add_css_class("suggested-action");
+    hbox.append(&cancel);
+    hbox.append(&ok);
+    vbox.append(&hbox);
+    win.set_child(Some(&vbox));
+
+    let result: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let decided: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+    {
+        let result = result.clone();
+        let decided = decided.clone();
+        let entry_c = entry.clone();
+        let win_c = win.clone();
+        ok.connect_clicked(move |_| {
+            if !*decided.borrow() {
+                *decided.borrow_mut() = true;
+                *result.borrow_mut() = Some(entry_c.text().to_string());
+            }
+            win_c.close();
+        });
+    }
+    {
+        let entry_c = entry.clone();
+        let ok_c = ok.clone();
+        entry.connect_activate(move |_| ok_c.emit_clicked());
+        let _ = entry_c;
+    }
+    {
+        let win_c = win.clone();
+        cancel.connect_clicked(move |_| win_c.close());
+    }
+    run_nested_modal(&win);
+    let out = result.borrow().clone();
+    out
+}
+
+/// Two-field new-password prompt (Tier 4): the new password
+/// typed twice; a mismatch re-labels inside the dialog
+/// rather than failing the flow. An EMPTY new password is
+/// a removal request — the caller routes it to Tier 3.
+fn prompt_new_password_sync(
+    shell: &Rc<Shell>,
+    title: &str,
+    message: &str,
+) -> Option<String> {
+    let win = gtk4::Window::new();
+    win.set_title(Some(title));
+    win.set_modal(true);
+    if let Some(parent) = modal_parent(shell) {
+        win.set_transient_for(Some(&parent));
+    }
+    win.set_default_size(420, -1);
+    let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
+    vbox.set_margin_start(18);
+    vbox.set_margin_end(18);
+    vbox.set_margin_top(16);
+    vbox.set_margin_bottom(16);
+    let msg = gtk4::Label::new(Some(message));
+    msg.set_wrap(true);
+    msg.set_xalign(0.0);
+    vbox.append(&msg);
+    let err = gtk4::Label::new(Some(""));
+    err.set_wrap(true);
+    err.set_xalign(0.0);
+    err.add_css_class("error");
+    let e1 = gtk4::PasswordEntry::new();
+    e1.set_placeholder_text(Some("New password"));
+    e1.set_show_peek_icon(true);
+    let e2 = gtk4::PasswordEntry::new();
+    e2.set_placeholder_text(Some("New password again"));
+    e2.set_show_peek_icon(true);
+    vbox.append(&e1);
+    vbox.append(&e2);
+    vbox.append(&err);
+    let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    hbox.set_halign(gtk4::Align::End);
+    let cancel = gtk4::Button::with_label("Cancel");
+    let ok = gtk4::Button::with_label("Set password");
+    ok.add_css_class("suggested-action");
+    hbox.append(&cancel);
+    hbox.append(&ok);
+    vbox.append(&hbox);
+    win.set_child(Some(&vbox));
+
+    let result: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let decided: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+    {
+        let result = result.clone();
+        let decided = decided.clone();
+        let e1c = e1.clone();
+        let e2c = e2.clone();
+        let errc = err.clone();
+        let win_c = win.clone();
+        ok.connect_clicked(move |_| {
+            let a = e1c.text().to_string();
+            let b = e2c.text().to_string();
+            if a != b {
+                errc.set_text("The two passwords do not match. Try again.");
+                return;
+            }
+            if !*decided.borrow() {
+                *decided.borrow_mut() = true;
+                *result.borrow_mut() = Some(a);
+            }
+            win_c.close();
+        });
+    }
+    {
+        let win_c = win.clone();
+        cancel.connect_clicked(move |_| win_c.close());
+    }
+    run_nested_modal(&win);
+    let out = result.borrow().clone();
+    out
+}
+
+/// The print disclosure for protected windows (registry:
+/// Print = WarnDowngrade): the first print of a session
+/// warns that the printout is unprotected and asks; later
+/// prints in the same session proceed.
+fn protected_print_disclose(shell: &Rc<Shell>) -> bool {
+    if *shell.print_disclosed.borrow() {
+        return true;
+    }
+    let ok = confirm_sync(
+        shell,
+        "Print an unprotected copy?",
+        "Printing will produce an unprotected printout of this \
+         password-protected document.",
+        "Print anyway",
+    );
+    if ok {
+        *shell.print_disclosed.borrow_mut() = true;
+    }
+    ok
+}
+
+/// A two-button confirmation. Used for the Tier 3 downgrade
+/// warning and the print disclosure; the body text carries
+/// the registry's required words ("will not be
+/// password-protected") verbatim at the call sites.
+fn confirm_sync(shell: &Rc<Shell>, title: &str, body: &str, ok_label: &str) -> bool {
+    let win = gtk4::Window::new();
+    win.set_title(Some(title));
+    win.set_modal(true);
+    if let Some(parent) = modal_parent(shell) {
+        win.set_transient_for(Some(&parent));
+    }
+    win.set_default_size(440, -1);
+    let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
+    vbox.set_margin_start(18);
+    vbox.set_margin_end(18);
+    vbox.set_margin_top(16);
+    vbox.set_margin_bottom(16);
+    let msg = gtk4::Label::new(Some(body));
+    msg.set_wrap(true);
+    msg.set_xalign(0.0);
+    vbox.append(&msg);
+    let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    hbox.set_halign(gtk4::Align::End);
+    let cancel = gtk4::Button::with_label("Cancel");
+    let ok = gtk4::Button::with_label(ok_label);
+    ok.add_css_class("destructive-action");
+    hbox.append(&cancel);
+    hbox.append(&ok);
+    vbox.append(&hbox);
+    win.set_child(Some(&vbox));
+    let result: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+    {
+        let result = result.clone();
+        let win_c = win.clone();
+        ok.connect_clicked(move |_| {
+            *result.borrow_mut() = true;
+            win_c.close();
+        });
+    }
+    {
+        let win_c = win.clone();
+        cancel.connect_clicked(move |_| win_c.close());
+    }
+    run_nested_modal(&win);
+    let out = *result.borrow();
+    out
+}
+
+/// The x2t argument set x2t_convert_async assembles from
+/// the shell (binary, font root, AllFonts, theme dir).
+fn shell_conv_args(
+    shell: &Rc<Shell>,
+) -> Option<(PathBuf, Option<PathBuf>, Option<PathBuf>, Option<PathBuf>)> {
+    let x2t = shell.x2t.clone()?;
+    let theme_dir = shell
+        .sdkjs_dir
+        .as_ref()
+        .map(|d| d.join("slide/themes"))
+        .filter(|p| p.is_dir());
+    Some((
+        x2t,
+        shell.fonts_src_dir.clone(),
+        shell.x2t_allfonts.clone(),
+        theme_dir,
+    ))
+}
+
+/// One synchronous protected conversion on tmpfs, with the
+/// exit code preserved for password classification (90 =
+/// DRM / no password supplied, 91 = wrong password — the
+/// pinned core's getReturnErrorCode arithmetic).
+fn prot_probe(
+    shell: &Rc<Shell>,
+    from: &Path,
+    to_code: i32,
+    pdfa: bool,
+    opts: &X2tOpts,
+) -> (Result<Vec<u8>, String>, Option<i32>) {
+    let Some((x2t, font_dir, allfonts, theme_dir)) = shell_conv_args(shell) else {
+        return (Err("x2t converter not found".to_string()), None);
+    };
+    x2t_convert_sync_opts(
+        &x2t,
+        from,
+        to_code,
+        None,
+        font_dir.as_deref(),
+        allfonts.as_deref(),
+        theme_dir.as_deref(),
+        None,
+        pdfa,
+        &[],
+        opts,
+    )
+}
+
+fn pw_opts(pw: &Arc<PwBuf>) -> X2tOpts {
+    X2tOpts {
+        pw_open: Some(pw.clone()),
+        pw_save: Some(pw.clone()),
+        root: Some(protected_tmp_root()),
+    }
+}
+
+/// THE WALL RULE (KAO protected round 1): verify a sealed
+/// output on tmpfs BEFORE anything touches disk —
+///   1. it still detects as the same encrypted family;
+///   2. it OPENS with the sealing password (a full probe
+///      conversion, not a header sniff);
+///   3. it REFUSES a wrong password;
+///   4. for OOXML, its EncryptionInfo carries exactly the
+///      parameter set x2t writes (Agile AES-256 / SHA-512 /
+///      100k) — anything else means the writer did something
+///      we did not sanction.
+/// `out_path` must already live under the tmpfs root.
+fn verify_protected_output(
+    shell: &Rc<Shell>,
+    out_path: &Path,
+    base_code: i32,
+    seal_pw: &Arc<PwBuf>,
+) -> Result<(), String> {
+    match detect_format(out_path) {
+        Detected::Encrypted(c) if c == base_code => {}
+        other => {
+            return Err(format!(
+                "protected verify: the converted output is not the same encrypted \
+                 format (detected {other:?}); the save was refused and your \
+                 original file was not touched"
+            ));
+        }
+    }
+    let root = Some(protected_tmp_root());
+    // (2) opens with the sealing password.
+    let probe_to = if base_code == fmt::PDF { fmt::PDF } else { fmt::BIN };
+    let probe_pdfa = base_code == fmt::PDF;
+    let (res, _code) = prot_probe(
+        shell,
+        out_path,
+        probe_to,
+        probe_pdfa,
+        &X2tOpts {
+            pw_open: Some(seal_pw.clone()),
+            pw_save: Some(seal_pw.clone()),
+            root: root.clone(),
+        },
+    );
+    if let Err(e) = res {
+        return Err(format!(
+            "protected verify: the output does not open with the password it was \
+             sealed with ({e}); the save was refused and your original file was \
+             not touched"
+        ));
+    }
+    // (3) refuses a wrong password.
+    let wrong = Arc::new(seal_pw.wrong_variant());
+    let (res, _code) = prot_probe(
+        shell,
+        out_path,
+        probe_to,
+        probe_pdfa,
+        &X2tOpts {
+            pw_open: Some(wrong),
+            pw_save: None,
+            root,
+        },
+    );
+    if res.is_ok() {
+        return Err(
+            "protected verify: the output opened with a WRONG password; the save \
+             was refused and your original file was not touched"
+                .to_string(),
+        );
+    }
+    // (4) OOXML scheme parameters.
+    if base_code != fmt::PDF && !matches!(base_code, fmt::ODT | fmt::ODS | fmt::ODP) {
+        if let Ok(data) = std::fs::read(out_path) {
+            match ooxml_scheme(&data) {
+                EncScheme::OoxmlAgile {
+                    cipher,
+                    hash,
+                    key_bits,
+                    spin,
+                } => {
+                    eprintln!(
+                        "joffice: ENC_OUT_SCHEME agile {cipher} {hash} \
+                         keybits={key_bits} spin={spin}"
+                    );
+                    if spin != 100_000 {
+                        return Err(format!(
+                            "protected verify: the output's spin count is {spin}, \
+                             not x2t's 100000; the save was refused and your \
+                             original file was not touched"
+                        ));
+                    }
+                }
+                other => {
+                    return Err(format!(
+                        "protected verify: the output's encryption scheme is \
+                         '{}', not the Agile AES-256 set x2t writes; the save \
+                         was refused and your original file was not touched",
+                        other.describe()
+                    ));
+                }
+            }
+        }
+    }
+    eprintln!("joffice: ENC_VERIFY ok base={base_code}");
+    Ok(())
+}
+
+/// write_save_checked's protected sibling: the tmpfs
+/// verification replaces the zip sanity check (an encrypted
+/// package is an OLE file; the sanity check would refuse it
+/// for not starting with PK). The external-change check,
+/// the write sequencing, and the atomic rename are the
+/// same discipline.
+fn write_protected_checked(
+    shell: &Rc<Shell>,
+    dest: &Path,
+    bytes: &[u8],
+    seq: u64,
+) -> Result<bool, String> {
+    shell.check_unchanged(dest)?;
+    if seq <= *shell.save_written_seq.borrow() {
+        eprintln!(
+            "joffice: protected save seq={seq} superseded by seq={} — skipped",
+            shell.save_written_seq.borrow()
+        );
+        return Ok(false);
+    }
+    write_atomic(dest, bytes).map_err(|e| format!("save write: {e}"))?;
+    *shell.save_written_seq.borrow_mut() = seq;
+    shell.note_save_completed(dest);
+    Ok(true)
+}
+
+/// convert_and_write's protected sibling: the conversion
+/// seals with `seal_pw` on tmpfs, the output is verified by
+/// the wall rule, and only then does it land. On an Adopt,
+/// the session password becomes the sealing password (the
+/// document's password is now that one).
+#[allow(clippy::too_many_arguments)]
+fn convert_and_write_protected(
+    shell: &Rc<Shell>,
+    reply: ScriptMessageReply,
+    ctx: Context,
+    tmp_bin: PathBuf,
+    dest: PathBuf,
+    code: i32,
+    seq: u64,
+    origin: String,
+    after: AfterWrite,
+    seal_pw: Arc<PwBuf>,
+) {
+    let shell_c = shell.clone();
+    let opts = X2tOpts {
+        pw_open: None,
+        pw_save: Some(seal_pw.clone()),
+        root: Some(protected_tmp_root()),
+    };
+    x2t_convert_async_opts(
+        shell,
+        tmp_bin,
+        code,
+        Some(kind_of_code(code).unwrap_or(EditorKind::Word).canvas_code()),
+        false,
+        opts,
+        move |result| match result {
+            Ok(bytes) => {
+                // Stage the sealed output on tmpfs and run
+                // the wall-rule verification there.
+                let dir = match shell_c.protected_tmp.borrow().clone() {
+                    Some(d) => d,
+                    None => protected_tmp_new(&shell_c),
+                };
+                let out_path = dir.join("verify-output.bin");
+                if let Err(e) = std::fs::write(&out_path, &bytes) {
+                    save_fail(
+                        &shell_c,
+                        &reply,
+                        format!("protected verify stage: {e}"),
+                        &origin,
+                    );
+                    return;
+                }
+                let verdict = verify_protected_output(&shell_c, &out_path, code, &seal_pw);
+                let _ = std::fs::remove_file(&out_path);
+                if let Err(e) = verdict {
+                    eprintln!("joffice: ENC_VERIFY_FAIL dest={} err={e}", dest.display());
+                    save_fail(&shell_c, &reply, e, &origin);
+                    return;
+                }
+                match write_protected_checked(&shell_c, &dest, &bytes, seq) {
+                    Ok(_) => {
+                        note_save_success(&shell_c);
+                        match after {
+                            AfterWrite::Bound => {
+                                reply_save(
+                                    &shell_c,
+                                    &reply,
+                                    &ctx,
+                                    &serde_json::json!({ "ok": true }),
+                                );
+                            }
+                            AfterWrite::Adopt => {
+                                *shell_c.current_path.borrow_mut() = Some(dest.clone());
+                                shell_c.note_document_opened(&dest);
+                                let info = shell_c
+                                    .doc
+                                    .borrow()
+                                    .as_ref()
+                                    .and_then(|d| d.protected.clone());
+                                set_doc_state(&shell_c, Some(dest.clone()), code, false);
+                                if let Some(info) = info {
+                                    let mut doc = shell_c.doc.borrow_mut();
+                                    if let Some(d) = doc.as_mut() {
+                                        d.policy = Policy::Protected;
+                                        d.protected = Some(info);
+                                    }
+                                }
+                                *shell_c.protected_pw.borrow_mut() = Some(seal_pw.clone());
+                                refresh_chrome(&shell_c);
+                                eprintln!(
+                                    "joffice: ENC_ADOPT dest={} (password updated to the sealing password)",
+                                    dest.display()
+                                );
+                                reply_save(
+                                    &shell_c,
+                                    &reply,
+                                    &ctx,
+                                    &serde_json::json!({ "ok": true, "adopted": true }),
+                                );
+                            }
+                            AfterWrite::Export => {
+                                reply_save(
+                                    &shell_c,
+                                    &reply,
+                                    &ctx,
+                                    &serde_json::json!({ "ok": true, "export": true }),
+                                );
+                            }
+                        }
+                        save_done(&shell_c, true);
+                    }
+                    Err(e) => save_fail(&shell_c, &reply, e, &origin),
+                }
+            }
+            Err(e) => save_fail(&shell_c, &reply, e, &origin),
+        },
+    );
+}
+
+/// The protected open (bridge openFile/convertFile arm):
+/// detection already ran — this prompts natively, probes
+/// with x2t on tmpfs (the probe IS the open conversion for
+/// documents), and replies with NO session (mode (a)).
+#[allow(clippy::too_many_arguments)]
+fn protected_open_document(
+    shell: &Rc<Shell>,
+    reply: &ScriptMessageReply,
+    ctx: &Context,
+    path: &Path,
+    base_code: i32,
+    cmd: &str,
+    open_seq: Option<u64>,
+) {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // A recovery arm never applies to a protected file
+    // (mode (a) has no recovery); drop any stale arm so it
+    // cannot fire on a later open.
+    let _ = shell.recovery_arm.borrow_mut().take();
+    if shell.x2t.is_none() {
+        reply_err(
+            reply,
+            "x2t converter not found; protected documents cannot be opened".to_string(),
+        );
+        return;
+    }
+    if base_code == fmt::PDF {
+        protected_open_pdf(shell, reply, ctx, path, &name, cmd, open_seq);
+        return;
+    }
+    if base_code == 0 {
+        // Family unknown: we cannot even name the editor.
+        refuse_encrypted(shell, path);
+        reply_err(
+            reply,
+            "this password-protected file's format could not be determined".to_string(),
+        );
+        return;
+    }
+    // --- OOXML / ODF ---
+    let scheme = if matches!(base_code, fmt::ODT | fmt::ODS | fmt::ODP) {
+        odf_scheme(path)
+    } else {
+        match std::fs::read(path) {
+            Ok(data) => {
+                let names = cfb_stream_names(&data);
+                eprintln!(
+                    "joffice: ENC_STREAMS path={} streams={names:?}",
+                    path.display()
+                );
+                ooxml_scheme(&data)
+            }
+            Err(e) => {
+                reply_err(reply, format!("read protected file: {e}"));
+                return;
+            }
+        }
+    };
+    eprintln!(
+        "joffice: ENC_INFO path={} base={} scheme={}",
+        path.display(),
+        base_code,
+        scheme.describe()
+    );
+    let mut error: Option<String> = None;
+    let (pw, bin) = loop {
+        let Some(entered) = prompt_password_sync(
+            shell,
+            "Password required",
+            &format!("“{name}” is password-protected. Enter its password to open it."),
+            error.as_deref(),
+            None,
+            "Open",
+        ) else {
+            eprintln!("joffice: ENC_OPEN_CANCELLED path={}", path.display());
+            reply_err(reply, "open cancelled".to_string());
+            return;
+        };
+        let pw = Arc::new(PwBuf::new(&entered));
+        let (res, code) = prot_probe(shell, path, fmt::BIN, false, &pw_opts(&pw));
+        match res {
+            Ok(bin) => break (pw, bin),
+            Err(e) => {
+                if code == Some(90) || code == Some(91) {
+                    eprintln!(
+                        "joffice: ENC_PW_REJECTED path={} x2t_code={code:?}",
+                        path.display()
+                    );
+                    error = Some("Wrong password. Try again.".to_string());
+                    continue;
+                }
+                eprintln!(
+                    "joffice: ENC_OPEN_FAIL path={} x2t_code={code:?} err={e}",
+                    path.display()
+                );
+                reply_err(reply, format!("could not open the protected document: {e}"));
+                return;
+            }
+        }
+    };
+    // Mode (a): retire any previous document's session and
+    // protected state; create NO session for this one.
+    shell.session_rotate_out();
+    if cmd == "openFile" {
+        *shell.current_path.borrow_mut() = Some(path.to_path_buf());
+        shell.note_document_opened(path);
+        set_doc_state(shell, Some(path.to_path_buf()), base_code, false);
+    }
+    {
+        let mut doc = shell.doc.borrow_mut();
+        if let Some(d) = doc.as_mut() {
+            d.policy = Policy::Protected;
+            d.protected = Some(ProtectedInfo::for_document(scheme.clone()));
+        }
+    }
+    refresh_chrome(shell);
+    *shell.protected_pw.borrow_mut() = Some(pw);
+    let tmp_dir = protected_tmp_new(shell);
+    let mut banner =
+        "Recovery is off for password-protected documents.".to_string();
+    if !scheme.preserved_by_x2t() {
+        banner.push_str(
+            " This file uses an older encryption scheme; saving will \
+             re-encrypt it with modern AES-256 encryption.",
+        );
+        eprintln!(
+            "joffice: ENC_SCHEME_LEGACY path={} scheme={}",
+            path.display(),
+            scheme.describe()
+        );
+    }
+    show_save_banner(shell, &banner);
+    eprintln!(
+        "joffice: ENC_OPEN mode=memory path={} base={} bin_bytes={}",
+        path.display(),
+        base_code,
+        bin.len()
+    );
+    if bin.len() > 64 * 1024 * 1024 {
+        // No session exists to serve the bin — the one-shot
+        // protected-bin token route does it (tmpfs file).
+        let bin_path = tmp_dir.join("editor.bin");
+        if std::fs::write(&bin_path, &bin).is_err() {
+            reply_err(reply, "could not stage the decrypted document".to_string());
+            return;
+        }
+        let token = new_sid();
+        *shell.protected_bin.borrow_mut() = Some((token.clone(), bin_path));
+        reply_open(
+            shell,
+            reply,
+            ctx,
+            &serde_json::json!({
+                "binUrl": format!("joffice:///protected-bin/{token}"),
+                "binBytes": bin.len(),
+                "images": {}, "name": name,
+                "boundSaved": true, "protected": true,
+            }),
+            open_seq,
+        );
+    } else {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bin);
+        reply_open(
+            shell,
+            reply,
+            ctx,
+            &serde_json::json!({
+                "data": b64, "images": {}, "name": name,
+                "boundSaved": true, "protected": true,
+            }),
+            open_seq,
+        );
+    }
+}
+
+/// The protected PDF open: probe with the PDF/A conversion
+/// (it loads through PdfDjvuXpsToRenderer, which returns
+/// 90/91 on password failure), read the permission bits in
+/// Rust, and hand the password to the engine through the
+/// open reply (the one sanctioned JS crossing — the engine
+/// is the decryptor; the shim drops its reference at once).
+#[allow(clippy::too_many_arguments)]
+fn protected_open_pdf(
+    shell: &Rc<Shell>,
+    reply: &ScriptMessageReply,
+    ctx: &Context,
+    path: &Path,
+    name: &str,
+    cmd: &str,
+    open_seq: Option<u64>,
+) {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            reply_err(reply, format!("read pdf: {e}"));
+            return;
+        }
+    };
+    // Permission bits first (qpdf needs no password to list
+    // them). Unknown bits are ledgered, not guessed.
+    let (r, v, p) = match pdf_encryption_info(path) {
+        Some(t) => t,
+        None => {
+            eprintln!(
+                "joffice: PDF_PERMS_UNKNOWN path={} (qpdf --show-encryption unread; \
+                 the engine's own enforcement is the residual control)",
+                path.display()
+            );
+            (0, 0, -4)
+        }
+    };
+    // An empty user password means the file opens with no
+    // prompt at all (owner-password-only protection).
+    let empty_pw = Arc::new(PwBuf::new(""));
+    let (res, _c) = prot_probe(shell, path, fmt::PDF, true, &pw_opts(&empty_pw));
+    let pw = if res.is_ok() {
+        eprintln!(
+            "joffice: ENC_PDF_USERPW_EMPTY path={} (opens without a password; \
+             permission bits bind)",
+            path.display()
+        );
+        empty_pw
+    } else {
+        let mut error: Option<String> = None;
+        loop {
+            let Some(entered) = prompt_password_sync(
+                shell,
+                "Password required",
+                &format!("“{name}” is password-protected. Enter its password to open it."),
+                error.as_deref(),
+                None,
+                "Open",
+            ) else {
+                eprintln!("joffice: ENC_OPEN_CANCELLED path={}", path.display());
+                reply_err(reply, "open cancelled".to_string());
+                return;
+            };
+            let candidate = Arc::new(PwBuf::new(&entered));
+            let (res, code) = prot_probe(shell, path, fmt::PDF, true, &pw_opts(&candidate));
+            match res {
+                Ok(_) => break candidate,
+                Err(e) => {
+                    if code == Some(90) || code == Some(91) {
+                        eprintln!(
+                            "joffice: ENC_PW_REJECTED path={} x2t_code={code:?}",
+                            path.display()
+                        );
+                        error = Some("Wrong password. Try again.".to_string());
+                        continue;
+                    }
+                    eprintln!(
+                        "joffice: ENC_OPEN_FAIL path={} x2t_code={code:?} err={e}",
+                        path.display()
+                    );
+                    reply_err(reply, format!("could not open the protected PDF: {e}"));
+                    return;
+                }
+            }
+        }
+    };
+    // Owner state: with an empty user password, a NON-empty
+    // supplied password would be the owner password — but we
+    // never prompted (the file opened). When we did prompt,
+    // user vs owner cannot be distinguished by any probe
+    // available to us (recorded limitation): permissions
+    // bind either way.
+    let info = ProtectedInfo::for_pdf(r, v, p, false);
+    eprintln!(
+        "joffice: ENC_INFO path={} base=513 scheme={} print={} copy={} modify={} annotate={}",
+        path.display(),
+        info.scheme.describe(),
+        info.pdf_can_print,
+        info.pdf_can_copy,
+        info.pdf_can_modify,
+        info.pdf_can_annotate
+    );
+    shell.session_rotate_out();
+    let annotate_flag = pdf_annotate_enabled();
+    let annotate = annotate_flag && info.pdf_can_annotate;
+    if cmd == "openFile" || annotate_flag {
+        *shell.current_path.borrow_mut() = Some(path.to_path_buf());
+        shell.note_document_opened(path);
+        set_doc_state(shell, Some(path.to_path_buf()), fmt::PDF, false);
+    }
+    {
+        let mut doc = shell.doc.borrow_mut();
+        if let Some(d) = doc.as_mut() {
+            d.policy = if annotate {
+                Policy::PdfAnnotate
+            } else {
+                Policy::ViewOnly
+            };
+            d.protected = Some(info.clone());
+        }
+    }
+    refresh_chrome(shell);
+    *shell.protected_pw.borrow_mut() = Some(pw.clone());
+    // X1 for protected PDFs: the immutable merge origin is a
+    // tmpfs copy (still encrypted bytes), never the bound
+    // file.
+    let tmp_dir = protected_tmp_new(shell);
+    let origin_copy = tmp_dir.join("origin.pdf");
+    if std::fs::write(&origin_copy, &bytes).is_ok() {
+        *shell.pdf_origin.borrow_mut() = Some(origin_copy);
+    }
+    let mut banner = "Recovery is off for password-protected documents.".to_string();
+    if annotate_flag && !annotate {
+        banner.push_str(" This PDF's permissions do not allow changes.");
+    }
+    show_save_banner(shell, &banner);
+    eprintln!(
+        "joffice: ENC_OPEN mode=memory path={} base=513 annotate={} bytes={}",
+        path.display(),
+        annotate,
+        bytes.len()
+    );
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    reply_open(
+        shell,
+        reply,
+        ctx,
+        &serde_json::json!({
+            "data": b64, "images": {}, "name": name,
+            "boundSaved": false, "rawPdf": true,
+            "pdfMode": if annotate { "edit" } else { "view" },
+            "pdfAnnotate": annotate,
+            "protected": true,
+            "pdfPassword": pw.as_str(),
+            "pdfPerms": {
+                "print": info.pdf_can_print,
+                "copy": info.pdf_can_copy,
+                "modify": info.pdf_can_modify,
+                "annotate": info.pdf_can_annotate,
+            },
+        }),
+        open_seq,
+    );
+}
+
+/// Save As completion for a protected document (Tier 2/3).
+/// Runs BEFORE the byte-copy shortcut: a protected Save As
+/// always prompts (same format) or warns (any other format).
+fn handle_protected_dialog_completion(
+    shell: &Rc<Shell>,
+    p: PendingSave,
+    dest: PathBuf,
+    format: i32,
+) {
+    let session_pw = shell.protected_pw.borrow().clone();
+    let Some(session_pw) = session_pw else {
+        save_fail(
+            shell,
+            &p.reply,
+            "protected save: the session password is gone; reopen the document"
+                .to_string(),
+            &p.origin,
+        );
+        return;
+    };
+    if format == p.origin_code {
+        // Tier 2: prompt for the NEW file's password,
+        // defaulting to the current one. A different entry
+        // is a password change for the new file (Tier 4
+        // mechanics, verified before it lands).
+        let _ = exit_registry(shell, ExitPath::SaveAsSameFormat);
+        let Some(entered) = prompt_password_sync(
+            shell,
+            "Password for the new file",
+            "The new file stays password-protected. Keep the current password, \
+             or enter a different one for the new file.",
+            None,
+            Some(session_pw.as_str()),
+            "Save",
+        ) else {
+            reply_save(
+                shell,
+                &p.reply,
+                &p.ctx,
+                &serde_json::json!({ "ok": false, "cancelled": true }),
+            );
+            save_done(shell, false);
+            return;
+        };
+        let seal = Arc::new(PwBuf::new(&entered));
+        if entered == session_pw.as_str()
+            && p.unmodified
+            && !journal_pending(shell)
+            && !*shell.save_failed_outstanding.borrow()
+        {
+            // Unedited + same password: the encrypted bytes
+            // ARE the new file (the §6a rule, encrypted).
+            let src = p.doc_path.clone().expect("protected save has a doc path");
+            let _ = std::fs::remove_file(&p.tmp_bin);
+            let result = std::fs::read(&src)
+                .map_err(|e| format!("read copy source: {e}"))
+                .and_then(|bytes| {
+                    write_protected_checked(shell, &dest, &bytes, p.seq).map(|_| ())
+                });
+            match result {
+                Ok(()) => {
+                    eprintln!(
+                        "joffice: ENC_SAVEAS_COPY {} -> {} (unedited, same password)",
+                        src.display(),
+                        dest.display()
+                    );
+                    *shell.current_path.borrow_mut() = Some(dest.clone());
+                    shell.note_document_opened(&dest);
+                    let info = shell
+                        .doc
+                        .borrow()
+                        .as_ref()
+                        .and_then(|d| d.protected.clone());
+                    set_doc_state(shell, Some(dest.clone()), format, false);
+                    if let Some(info) = info {
+                        let mut doc = shell.doc.borrow_mut();
+                        if let Some(d) = doc.as_mut() {
+                            d.policy = Policy::Protected;
+                            d.protected = Some(info);
+                        }
+                    }
+                    refresh_chrome(shell);
+                    reply_save(
+                        shell,
+                        &p.reply,
+                        &p.ctx,
+                        &serde_json::json!({ "ok": true, "unedited": true }),
+                    );
+                    save_done(shell, true);
+                }
+                Err(e) => save_fail(shell, &p.reply, e, &p.origin),
+            }
+            return;
+        }
+        convert_and_write_protected(
+            shell,
+            p.reply.clone(),
+            p.ctx.clone(),
+            p.tmp_bin.clone(),
+            dest,
+            format,
+            p.seq,
+            p.origin.clone(),
+            AfterWrite::Adopt,
+            seal,
+        );
+        return;
+    }
+    // Tier 3: any other format is unprotected output.
+    let class_path = if format == fmt::PDF {
+        ExitPath::PdfExport
+    } else {
+        ExitPath::OtherExport
+    };
+    let _ = exit_registry(shell, class_path);
+    let ok = confirm_sync(
+        shell,
+        "Save without password protection?",
+        "The new file will not be password-protected. Anyone who can open \
+         the file will be able to read it. The original file stays protected.",
+        "Save unprotected",
+    );
+    if !ok {
+        let _ = std::fs::remove_file(&p.tmp_bin);
+        reply_save(
+            shell,
+            &p.reply,
+            &p.ctx,
+            &serde_json::json!({ "ok": false, "cancelled": true }),
+        );
+        save_done(shell, false);
+        return;
+    }
+    eprintln!(
+        "joffice: ENC_DOWNGRADE_CONFIRMED dest={} format={format}",
+        dest.display()
+    );
+    let after = if code_is_native(format) {
+        // Adopting an unprotected file ends the protected
+        // window: the password state goes with it.
+        clear_protected_state(shell);
+        AfterWrite::Adopt
+    } else {
+        AfterWrite::Export
+    };
+    convert_and_write(
+        shell,
+        p.reply.clone(),
+        p.ctx.clone(),
+        p.tmp_bin.clone(),
+        dest,
+        format,
+        p.seq,
+        p.origin.clone(),
+        after,
+        p.pdfa,
+    );
+}
+
+/// The protected-PDF print source: permission gate (Rust,
+/// step 6) + one-time disclosure + a decrypted tmpfs copy
+/// for the print dialog. Shared by the printRequest bridge
+/// arm and the action-bar Print button — the gate must not
+/// depend on which door the print came through. Err carries
+/// the user-facing reason (already bannered/ledgered here).
+fn protected_pdf_print_source(shell: &Rc<Shell>) -> Result<PathBuf, String> {
+    let (info, src) = {
+        let doc = shell.doc.borrow();
+        let d = doc.as_ref().ok_or("no document open")?;
+        (
+            d.protected.clone().ok_or("document is not protected")?,
+            d.path.clone().ok_or("no PDF open")?,
+        )
+    };
+    let _ = exit_registry(shell, ExitPath::Print);
+    if !info.pdf_can_print && !info.pdf_owner_unlocked {
+        show_save_banner(shell, "This PDF's permissions do not allow printing.");
+        eprintln!("joffice: PDF_PERM_PRINT_REFUSED (print bit off)");
+        return Err("printing not permitted".to_string());
+    }
+    if !protected_print_disclose(shell) {
+        return Err("print cancelled".to_string());
+    }
+    let pw = shell
+        .protected_pw
+        .borrow()
+        .clone()
+        .ok_or("no session password")?;
+    // Decrypt via the converter's own password-change path
+    // (m_sSavePassword empty); the result must come back
+    // UNencrypted or the print refuses.
+    let (res, _c) = prot_probe(
+        shell,
+        &src,
+        fmt::PDF,
+        false,
+        &X2tOpts {
+            pw_open: Some(pw),
+            pw_save: Some(Arc::new(PwBuf::new(""))),
+            root: Some(protected_tmp_root()),
+        },
+    );
+    match res {
+        Ok(bytes) => {
+            let dir = match shell.protected_tmp.borrow().clone() {
+                Some(d) => d,
+                None => protected_tmp_new(shell),
+            };
+            let print_path = dir.join("print.pdf");
+            if std::fs::write(&print_path, &bytes).is_err()
+                || matches!(detect_format(&print_path), Detected::Encrypted(_))
+            {
+                show_save_banner(
+                    shell,
+                    "Printing failed: could not produce an unprotected print copy.",
+                );
+                eprintln!(
+                    "joffice: PDF_PRINT_DECRYPT failed (output still encrypted or unwritable)"
+                );
+                return Err("print decrypt failed".to_string());
+            }
+            eprintln!("joffice: PDF_PRINT_DECRYPT ok (tmpfs copy)");
+            Ok(print_path)
+        }
+        Err(e) => {
+            eprintln!("joffice: PDF_PRINT_DECRYPT failed: {e}");
+            Err("print decrypt failed".to_string())
+        }
+    }
+}
+
+/// Tier 4 (the header "Password…" button): change or remove
+/// the bound protected file's password. The current
+/// password is verified by probe first; the re-sealed file
+/// is verified with the NEW password (wall rule) before it
+/// replaces the old one. A dirty document must save first —
+/// the re-seal converts the file on disk, not the editor's
+/// unsaved state.
+fn change_password_flow(shell: &Rc<Shell>) {
+    let (bound, base_code) = {
+        let doc = shell.doc.borrow();
+        match doc.as_ref() {
+            Some(d) if d.protected.is_some() => match d.path.clone() {
+                Some(p) => (p, d.origin_code),
+                None => return,
+            },
+            _ => return,
+        }
+    };
+    if shell.modified.borrow().unwrap_or(false) {
+        show_save_banner(shell, "Save the document before changing its password.");
+        eprintln!("joffice: ENC_PWCHANGE refused: document has unsaved changes");
+        return;
+    }
+    let name = bound
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let Some(current) = prompt_password_sync(
+        shell,
+        "Current password",
+        &format!("Enter the current password for “{name}”."),
+        None,
+        None,
+        "Continue",
+    ) else {
+        return;
+    };
+    let current = Arc::new(PwBuf::new(&current));
+    let probe_to = if base_code == fmt::PDF { fmt::PDF } else { fmt::BIN };
+    let (res, _c) = prot_probe(
+        shell,
+        &bound,
+        probe_to,
+        base_code == fmt::PDF,
+        &pw_opts(&current),
+    );
+    if res.is_err() {
+        show_save_banner(shell, "That is not the current password.");
+        eprintln!("joffice: ENC_PWCHANGE refused: current password probe failed");
+        return;
+    }
+    let Some(new_pw) = prompt_new_password_sync(
+        shell,
+        "New password",
+        "Enter the new password twice. Leave both fields empty to REMOVE \
+         password protection from the file.",
+    ) else {
+        return;
+    };
+    let seq = {
+        let mut s = shell.save_seq.borrow_mut();
+        *s += 1;
+        *s
+    };
+    if new_pw.is_empty() {
+        // Removal = Tier 3 downgrade.
+        let _ = exit_registry(shell, ExitPath::SaveAsOtherFormat);
+        let ok = confirm_sync(
+            shell,
+            "Remove password protection?",
+            "The file will not be password-protected. Anyone who can open \
+             the file will be able to read it.",
+            "Remove password",
+        );
+        if !ok {
+            return;
+        }
+        let (res, _c) = prot_probe(
+            shell,
+            &bound,
+            base_code,
+            false,
+            &X2tOpts {
+                pw_open: Some(current.clone()),
+                pw_save: Some(Arc::new(PwBuf::new(""))),
+                root: Some(protected_tmp_root()),
+            },
+        );
+        match res {
+            Ok(bytes) => {
+                if matches!(detect_format(&bound), Detected::Encrypted(_)) {
+                    // The output goes to a tmpfs staging file
+                    // first — detect_format reads paths.
+                    let dir = protected_tmp_new(shell);
+                    let staged = dir.join("removed.bin");
+                    let _ = std::fs::write(&staged, &bytes);
+                    if matches!(detect_format(&staged), Detected::Encrypted(_)) {
+                        show_save_banner(
+                            shell,
+                            "Password removal failed: the output is still encrypted.",
+                        );
+                        eprintln!("joffice: ENC_PWREMOVE failed: output still encrypted");
+                        return;
+                    }
+                }
+                match write_protected_checked(shell, &bound, &bytes, seq) {
+                    Ok(_) => {
+                        eprintln!("joffice: ENC_PWREMOVED path={}", bound.display());
+                        clear_protected_state(shell);
+                        set_doc_state(shell, Some(bound.clone()), base_code, false);
+                        refresh_chrome(shell);
+                        show_save_banner(shell, "Password removed.");
+                    }
+                    Err(e) => show_save_banner(shell, &format!("Password removal failed: {e}")),
+                }
+            }
+            Err(e) => {
+                show_save_banner(shell, &format!("Password removal failed: {e}"));
+            }
+        }
+        return;
+    }
+    let new_pw = Arc::new(PwBuf::new(&new_pw));
+    let (res, _c) = prot_probe(
+        shell,
+        &bound,
+        base_code,
+        false,
+        &X2tOpts {
+            pw_open: Some(current.clone()),
+            pw_save: Some(new_pw.clone()),
+            root: Some(protected_tmp_root()),
+        },
+    );
+    match res {
+        Ok(bytes) => {
+            let dir = match shell.protected_tmp.borrow().clone() {
+                Some(d) => d,
+                None => protected_tmp_new(shell),
+            };
+            let staged = dir.join("resealed.bin");
+            if let Err(e) = std::fs::write(&staged, &bytes) {
+                show_save_banner(shell, &format!("Password change failed: {e}"));
+                return;
+            }
+            if let Err(e) = verify_protected_output(shell, &staged, base_code, &new_pw) {
+                eprintln!("joffice: ENC_PWCHANGE verify failed: {e}");
+                show_save_banner(shell, &format!("Password change failed: {e}"));
+                return;
+            }
+            let _ = std::fs::remove_file(&staged);
+            match write_protected_checked(shell, &bound, &bytes, seq) {
+                Ok(_) => {
+                    *shell.protected_pw.borrow_mut() = Some(new_pw);
+                    eprintln!("joffice: ENC_PWCHANGED path={}", bound.display());
+                    show_save_banner(shell, "Password changed.");
+                }
+                Err(e) => show_save_banner(shell, &format!("Password change failed: {e}")),
+            }
+        }
+        Err(e) => {
+            show_save_banner(shell, &format!("Password change failed: {e}"));
+        }
+    }
+}
+
 fn refuse_encrypted(shell: &Rc<Shell>, path: &Path) {
     let msg = format!(
         "“{}” is password-protected. jOffice cannot open encrypted documents yet — the file was not opened and has not been modified.",
@@ -5137,6 +7407,7 @@ fn x2t_merge_pdf_sync(
     font_dir: Option<&Path>,
     allfonts_path: Option<&Path>,
     work: &Path,
+    pw: Option<&PwBuf>,
 ) -> Result<PathBuf, String> {
     let in_pdf = work.join("in").join("origin.pdf");
     let out_pdf = work.join("out").join("merged.pdf");
@@ -5147,6 +7418,19 @@ fn x2t_merge_pdf_sync(
     extra.push_str("  <m_nFormatFrom>513</m_nFormatFrom>\n");
     extra.push_str("  <m_bFromChanges>true</m_bFromChanges>\n");
     extra.push_str("  <m_bDontSaveAdditional>true</m_bDontSaveAdditional>\n");
+    // Protected cycle: an encrypted origin loads with the
+    // session password (pinned pdf_image.h: applyChangesPdf
+    // passes params.getPassword() to LoadFromFile, and
+    // EditPdf is constructed with the reader's own encrypt
+    // dict — the merge preserves /Encrypt). The params file
+    // is 0600 inside the (tmpfs, for protected work) work dir
+    // and deleted with it.
+    if let Some(pw) = pw {
+        extra.push_str(&format!(
+            "  <m_sPassword>{}</m_sPassword>\n",
+            xml_escape(pw.as_str())
+        ));
+    }
     if let Some(d) = font_dir {
         extra.push_str(&format!(
             "  <m_sFontDir>{}</m_sFontDir>\n",
@@ -5178,6 +7462,13 @@ fn x2t_merge_pdf_sync(
     );
     let params_path = work.join("params.xml");
     std::fs::write(&params_path, params).map_err(|e| format!("write merge params: {e}"))?;
+    if pw.is_some() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            &params_path,
+            std::fs::Permissions::from_mode(0o600),
+        );
+    }
     let extra_env = vec![("TMPDIR".to_string(), tmp_dir.display().to_string())];
     let out = run_x2t(x2t, &params_path, &extra_env)?;
     if !out.status.success() {
@@ -5379,6 +7670,25 @@ fn pdf_merge_and_write(
         v.push(shell.media_dir.clone());
         v
     };
+    // Protected cycle: an encrypted origin merges with the
+    // session password, on tmpfs, and the output must come
+    // back still encrypted + wall-rule verified. The
+    // registry class for the merge is ReEncrypt.
+    let prot_pw: Option<Arc<PwBuf>> = {
+        let doc = shell.doc.borrow();
+        match doc.as_ref() {
+            Some(d) if d.protected.is_some() => {
+                let _ = exit_registry(shell, ExitPath::PdfMerge);
+                shell.protected_pw.borrow().clone()
+            }
+            _ => None,
+        }
+    };
+    let work_root = if prot_pw.is_some() {
+        protected_tmp_root()
+    } else {
+        std::env::temp_dir()
+    };
     // The channel carries (merged bytes, annotations_deleted):
     // a count DROP vs the opened file means this save deleted
     // annotations. (Cycle-5 continuation forensics: the merge
@@ -5387,7 +7697,7 @@ fn pdf_merge_and_write(
     // arm.)
     let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<u8>, bool), String>>();
     std::thread::spawn(move || {
-        let work = std::env::temp_dir().join(temp_stem("pdfsave"));
+        let work = work_root.join(temp_stem("pdfsave"));
         let result = (|| -> Result<(Vec<u8>, bool), String> {
             let in_dir = work.join("in");
             std::fs::create_dir_all(in_dir.join("changes"))
@@ -5453,14 +7763,80 @@ fn pdf_merge_and_write(
                 font_dir.as_deref(),
                 allfonts.as_deref(),
                 &work,
+                prot_pw.as_deref(),
             )?;
-            pdf_check_readers(&out_pdf)?;
+            if let Some(pw) = &prot_pw {
+                // Protected merge verification (the wall
+                // rule, PDF form): the output must still be
+                // an encrypted PDF, it must open with the
+                // session password, and it must refuse a
+                // wrong one. The poppler leg of
+                // pdf_check_readers cannot run — it takes no
+                // password — so qpdf --check (structure only)
+                // plus these probes replace it.
+                match detect_format(&out_pdf) {
+                    Detected::Encrypted(c) if c == fmt::PDF => {}
+                    other => {
+                        return Err(format!(
+                            "protected merge: the output is not an encrypted PDF                              (detected {other:?}); the save was refused and your                              original file was not touched"
+                        ));
+                    }
+                }
+                if let Some(qpdf) = find_qpdf() {
+                    let out = Command::new(&qpdf)
+                        .arg("--check")
+                        .arg(&out_pdf)
+                        .output()
+                        .map_err(|e| format!("run qpdf --check: {e}"))?;
+                    if !out.status.success() {
+                        return Err(format!(
+                            "protected merge: qpdf --check failed (exit {})",
+                            out.status
+                        ));
+                    }
+                }
+                let probe = |candidate: &PwBuf| {
+                    x2t_convert_sync_opts(
+                        &x2t,
+                        &out_pdf,
+                        fmt::PDF,
+                        None,
+                        font_dir.as_deref(),
+                        allfonts.as_deref(),
+                        None,
+                        None,
+                        true,
+                        &[],
+                        &X2tOpts {
+                            pw_open: Some(Arc::new(PwBuf::new(candidate.as_str()))),
+                            pw_save: Some(Arc::new(PwBuf::new(candidate.as_str()))),
+                            root: Some(protected_tmp_root()),
+                        },
+                    )
+                    .0
+                };
+                if probe(pw).is_err() {
+                    return Err(
+                        "protected merge: the output does not open with the                          session password; the save was refused and your                          original file was not touched"
+                            .to_string(),
+                    );
+                }
+                if probe(&pw.wrong_variant()).is_ok() {
+                    return Err(
+                        "protected merge: the output opened with a WRONG                          password; the save was refused and your original                          file was not touched"
+                            .to_string(),
+                    );
+                }
+                eprintln!("joffice: ENC_VERIFY ok base=513 (merge)");
+            } else {
+                pdf_check_readers(&out_pdf)?;
+            }
             // Diagnostic keep (cycle 5): with
             // JOFFICE_PDF_KEEP_WORK set, preserve the staged
             // merge (origin, changes, output) for inspection
             // BEFORE the gate decides — a refused merge is
             // exactly the case that needs its artifacts.
-            if std::env::var_os("JOFFICE_PDF_KEEP_WORK").is_some() {
+            if prot_pw.is_none() && std::env::var_os("JOFFICE_PDF_KEEP_WORK").is_some() {
                 let keep = std::env::temp_dir().join(format!("pdfkeep-{seq}"));
                 let _ = std::fs::create_dir_all(&keep);
                 let _ = std::fs::copy(&origin_pdf, keep.join("origin.pdf"));
@@ -5713,8 +8089,21 @@ fn begin_print_export(
         false,
         move |result| match result {
             Ok(bytes) => {
-                let pdf_path =
-                    std::env::temp_dir().join(format!("{}.pdf", temp_stem("print")));
+                // Protected windows: the print PDF is a
+                // decrypted copy — tmpfs only (registry:
+                // TempWrite), deleted by finish_print as an
+                // owned temp.
+                let pdf_path = if shell_c
+                    .doc
+                    .borrow()
+                    .as_ref()
+                    .map(|d| d.protected.is_some())
+                    .unwrap_or(false)
+                {
+                    protected_tmp_root().join(format!("{}.pdf", temp_stem("print")))
+                } else {
+                    std::env::temp_dir().join(format!("{}.pdf", temp_stem("print")))
+                };
                 match std::fs::write(&pdf_path, &bytes) {
                     Ok(()) => begin_print(
                         &shell_c,
@@ -6235,17 +8624,19 @@ fn handle_bridge(
                     // the first save would silently land in /tmp.
                     // open_as_new marks it: no current_path (first
                     // save prompts), no stamp, no recents entry.
-                    // Encrypted: refuse here too (the activate
-                    // path checks earlier; this is the backstop
-                    // for a file swapped in between).
-                    if detect_format(&p) == Detected::Encrypted {
-                        refuse_encrypted(shell, &p);
-                        reply_json(
-                            reply,
-                            ctx,
-                            &serde_json::json!({ "handle": null, "name": null, "encrypted": true }),
+                    // Protected documents (protected cycle):
+                    // no refusal here — the password gate is
+                    // the openFile/convertFile arm below, which
+                    // prompts natively and probes before the
+                    // editor sees a single decrypted byte. The
+                    // doc state takes the base format; the open
+                    // arm refines it to Policy::Protected.
+                    if let Detected::Encrypted(base) = detect_format(&p) {
+                        eprintln!(
+                            "joffice: ENC_DETECTED path={} base={} (pendingFile)",
+                            p.display(),
+                            base
                         );
-                        return;
                     }
                     // Cycle 2: detection by content sets the doc
                     // state (kind, origin format, policy) that
@@ -6253,6 +8644,7 @@ fn handle_bridge(
                     let is_new = shell.open_as_new.borrow().is_some();
                     let code = match detect_format(&p) {
                         Detected::Format(c) => c,
+                        Detected::Encrypted(c) if c != 0 => c,
                         _ => format_for_path(&p),
                     };
                     if is_new {
@@ -6393,7 +8785,9 @@ fn handle_bridge(
             // journal replays over the seed either way, and the
             // F0 fingerprint in doc_stamp makes the first save
             // run the external-change check — K4/K7).
-            if shell.recovery_arm.borrow().is_some() {
+            if shell.recovery_arm.borrow().is_some()
+                && !matches!(detect_format(&path), Detected::Encrypted(_))
+            {
                 let arm_sid = shell.recovery_arm.borrow_mut().take().unwrap();
                 match load_recovery_session(shell, &arm_sid) {
                     Some((st, folded, gap)) if st.bound_path.as_deref() == Some(path.as_path()) => {
@@ -6505,14 +8899,20 @@ fn handle_bridge(
                     }
                 }
             }
-            if detect_format(&path) == Detected::Encrypted {
-                refuse_encrypted(shell, &path);
-                reply_err(
+            if let Detected::Encrypted(base) = detect_format(&path) {
+                // Protected-documents cycle: prompt + probe +
+                // mode (a) open. Detection ran BEFORE x2t or
+                // the editor saw the file (this arm is the
+                // single choke point both open flows pass
+                // through).
+                protected_open_document(
+                    shell,
                     reply,
-                    format!(
-                        "{}: password-protected documents are not supported",
-                        msg.cmd
-                    ),
+                    ctx,
+                    &path,
+                    base,
+                    &msg.cmd,
+                    open_seq,
                 );
                 return;
             }
@@ -7185,13 +9585,43 @@ fn handle_bridge(
                 t_dec.elapsed().as_millis(),
                 bin.len()
             );
-            let tmp_bin =
-                std::env::temp_dir().join(format!("{}.bin", temp_stem("save")));
+            // Protected windows stage the snapshot bin on
+            // tmpfs (registry: TempWrite) — it is decrypted
+            // document content and never touches shared or
+            // persistent temp.
+            let doc_protected = shell
+                .doc
+                .borrow()
+                .as_ref()
+                .map(|d| d.protected.is_some())
+                .unwrap_or(false);
+            let tmp_bin = if doc_protected {
+                protected_tmp_root().join(format!("{}.bin", temp_stem("save")))
+            } else {
+                std::env::temp_dir().join(format!("{}.bin", temp_stem("save")))
+            };
             if let Err(e) = std::fs::write(&tmp_bin, &bin) {
                 save_fail(
                     shell,
                     reply,
                     format!("write temp Editor.bin: {e}"),
+                    &origin,
+                );
+                return;
+            }
+            // Registry, JournalFlush: a protected window has
+            // no journal (mode (a)); a flush claiming a full
+            // save cycle is refused, never written. (The shim
+            // is log-only for these windows — this is the
+            // deny-by-default backstop.)
+            if doc_protected && origin == "changes" {
+                let _ = exit_registry(shell, ExitPath::JournalFlush);
+                let _ = std::fs::remove_file(&tmp_bin);
+                save_fail(
+                    shell,
+                    reply,
+                    "protected document: change flushes are not saved (recovery is off)"
+                        .to_string(),
                     &origin,
                 );
                 return;
@@ -7351,6 +9781,7 @@ fn handle_bridge(
                             .get("streamKind")
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string()),
+                        protected: false,
                     });
                     show_save_dialog(shell);
                     return;
@@ -7413,6 +9844,22 @@ fn handle_bridge(
             // the native print dialog. The bridge reply resolves
             // when the job is sent or cancelled.
             if print_intent && policy != Policy::ViewOnly {
+                // Registry (protected): printing produces an
+                // unprotected printout — first-time-per-session
+                // disclosure before anything is exported.
+                if doc_protected {
+                    let _ = exit_registry(shell, ExitPath::Print);
+                    if !protected_print_disclose(shell) {
+                        let _ = std::fs::remove_file(&tmp_bin);
+                        save_fail(
+                            shell,
+                            reply,
+                            "print cancelled".to_string(),
+                            &origin,
+                        );
+                        return;
+                    }
+                }
                 begin_print_export(
                     shell,
                     reply.clone(),
@@ -7488,6 +9935,10 @@ fn handle_bridge(
             } else {
                 match policy {
                     Policy::InPlace | Policy::InPlaceMacro => Route::Bound(origin_code),
+                    // Protected: the bound route, but the write
+                    // seals with the session password and is
+                    // verified on tmpfs (the Bound arm branches).
+                    Policy::Protected => Route::Bound(origin_code),
                     Policy::SaveAsOnly | Policy::ViewOnly | Policy::PdfAnnotate => {
                         Route::Dialog
                     }
@@ -7547,6 +9998,39 @@ fn handle_bridge(
                             &serde_json::json!({ "ok": true, "unedited": true }),
                         );
                         save_done(shell, true);
+                        return;
+                    }
+                    if policy == Policy::Protected {
+                        // Registry: InPlaceSave = ReEncrypt.
+                        // Seal with the SESSION password (the
+                        // save that encrypts with a password
+                        // the user does not know is the worst
+                        // failure in this cycle — round 2 §1);
+                        // the output is verified on tmpfs
+                        // before it lands.
+                        let _ = exit_registry(shell, ExitPath::InPlaceSave);
+                        let Some(pw) = shell.protected_pw.borrow().clone() else {
+                            save_fail(
+                                shell,
+                                reply,
+                                "protected save: the session password is gone; reopen the document"
+                                    .to_string(),
+                                &origin,
+                            );
+                            return;
+                        };
+                        convert_and_write_protected(
+                            shell,
+                            reply.clone(),
+                            ctx.clone(),
+                            tmp_bin,
+                            dest,
+                            code,
+                            seq,
+                            origin,
+                            AfterWrite::Bound,
+                            pw,
+                        );
                         return;
                     }
                     convert_and_write(
@@ -7636,6 +10120,12 @@ fn handle_bridge(
                         pdf_annot_count: None,
                         pdf_adopt: false,
                         pdf_stream_kind: None,
+                        protected: shell
+                            .doc
+                            .borrow()
+                            .as_ref()
+                            .map(|d| d.protected.is_some())
+                            .unwrap_or(false),
                     });
                     if is_askonce {
                         show_askonce(shell);
@@ -7683,6 +10173,41 @@ fn handle_bridge(
                     return;
                 }
                 let src = shell.doc.borrow().as_ref().and_then(|d| d.path.clone());
+                // Protected PDF (protected cycle, step 6):
+                // the permission bits are enforced HERE, in
+                // Rust — never left to the editor. The print
+                // bit off (and no owner unlock) refuses; an
+                // allowed print runs from a DECRYPTED tmpfs
+                // copy (the encrypted file itself cannot go
+                // to the print dialog), after the one-time
+                // disclosure.
+                let prot_info = shell
+                    .doc
+                    .borrow()
+                    .as_ref()
+                    .and_then(|d| d.protected.clone());
+                if prot_info.is_some() {
+                    match protected_pdf_print_source(shell) {
+                        Ok(print_path) => {
+                            begin_print(
+                                shell,
+                                Some((reply.clone(), ctx.clone())),
+                                print_path,
+                                true,
+                                pages,
+                                None,
+                            );
+                        }
+                        Err(e) => {
+                            reply_json(
+                                reply,
+                                ctx,
+                                &serde_json::json!({ "ok": false, "error": e }),
+                            );
+                        }
+                    }
+                    return;
+                }
                 match src {
                     Some(src) => {
                         begin_print(
@@ -7723,6 +10248,44 @@ fn handle_bridge(
                 _ => fmt::DOCX,
             };
             set_doc_state(shell, None, code, true);
+            reply_json(reply, ctx, &serde_json::json!({ "ok": true }));
+        }
+
+        "pdfPasswordRejected" => {
+            // The engine refused a password x2t's probe had
+            // accepted (or the probe path and the engine
+            // disagree about the file). That is a goofy-PDF
+            // signal: ledger it loudly, banner it, and let
+            // the cycle's PDF rule take it from there.
+            if !shell.check_secret(msg) {
+                reply_err(reply, "pdfPasswordRejected: secret".to_string());
+                return;
+            }
+            eprintln!(
+                "joffice: PDF_PW_ENGINE_REJECTED (probe accepted, engine refused)"
+            );
+            show_save_banner(
+                shell,
+                "The editor could not open this PDF with the supplied password.",
+            );
+            reply_json(reply, ctx, &serde_json::json!({ "ok": true }));
+        }
+
+        "clipboardBlocked" => {
+            // The shim's clipboard gate swallowed a copy/cut
+            // (the PDF's copy permission bit is off — read by
+            // Rust at open, enforced by our own shim).
+            if !shell.check_secret(msg) {
+                reply_err(reply, "clipboardBlocked: secret".to_string());
+                return;
+            }
+            eprintln!(
+                "joffice: CLIPBOARD_BLOCKED kind={}",
+                msg.args
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+            );
             reply_json(reply, ctx, &serde_json::json!({ "ok": true }));
         }
 
@@ -8376,6 +10939,16 @@ fn show_save_dialog(shell: &Rc<Shell>) {
                 after,
                 p.pdf_stream_kind.clone(),
             );
+            return;
+        }
+        // Protected completions (protected cycle, Tier 2/3):
+        // same format prompts for the new file's password;
+        // any other format needs the downgrade confirmation.
+        // Runs BEFORE the byte-copy shortcut below — a
+        // protected Save As must never slip through as a
+        // silent copy or a plain conversion.
+        if p.protected {
+            handle_protected_dialog_completion(&shell_c, p, path, format);
             return;
         }
         // Byte-copy completions (cycle 3): a ViewOnly Save As
@@ -9099,6 +11672,24 @@ fn build_launcher(
 // ---------------------------------------------------------------------------
 
 fn main() {
+    // Protected-documents cycle, build order step 1 (KAO
+    // round 2 correction of round 1): a document password will
+    // live in this process's memory; a core dump would carry
+    // it to disk. PR_SET_DUMPABLE(0) alone does NOT stop
+    // systemd-coredump — RLIMIT_CORE=0, set before anything
+    // else runs (and long before any password is read), is
+    // the control. PW-D1 grades it.
+    unsafe {
+        let lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let rc = libc::setrlimit(libc::RLIMIT_CORE, &lim);
+        // Belt and braces: non-dumpable too (harmless if the
+        // rlimit already did the work).
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        eprintln!("joffice: CORE_LIMIT rlimit_core=0 rc={rc}");
+    }
     // GSettings schemas (marathon 2 cycle 2 drive finding): the
     // native file chooser is a hard GLib-GIO-ERROR ("No GSettings
     // schemas are installed on the system") on hosts without GTK
@@ -9921,6 +12512,19 @@ fn main() {
                 begin_save_copy(&shell_cp);
             });
         }
+        // Password… (protected cycle, Tier 4): change or
+        // remove the open document's password. Visible only
+        // on protected windows (refresh_chrome).
+        let pw_btn = gtk4::Button::with_label("Password…");
+        pw_btn.set_visible(false);
+        action_row.append(&pw_btn);
+        *shell.pw_btn.borrow_mut() = Some(pw_btn.clone());
+        {
+            let shell_pw = shell.clone();
+            pw_btn.connect_clicked(move |_| {
+                change_password_flow(&shell_pw);
+            });
+        }
         action_row.set_visible(false);
         *shell.action_row.borrow_mut() = Some(action_row.clone());
         vbox.append(&action_row);
@@ -9933,14 +12537,23 @@ fn main() {
         {
             let shell_p = shell.clone();
             print_btn.connect_clicked(move |_| {
-                let (policy, src) = {
+                let (policy, src, is_protected) = {
                     let doc = shell_p.doc.borrow();
                     (
                         doc.as_ref().map(|d| d.policy),
                         doc.as_ref().and_then(|d| d.path.clone()),
+                        doc.as_ref()
+                            .map(|d| d.protected.is_some())
+                            .unwrap_or(false),
                     )
                 };
-                if policy == Some(Policy::ViewOnly) {
+                if is_protected && policy == Some(Policy::ViewOnly) {
+                    // Protected PDF: the same Rust gate +
+                    // decrypted tmpfs source as printRequest.
+                    if let Ok(print_path) = protected_pdf_print_source(&shell_p) {
+                        begin_print(&shell_p, None, print_path, true, None, None);
+                    }
+                } else if policy == Some(Policy::ViewOnly) {
                     if let Some(src) = src {
                         begin_print(&shell_p, None, src, false, None, None);
                     }
@@ -9980,11 +12593,19 @@ fn main() {
             let vbox_od = vbox.clone();
             let launcher_od = launcher_holder.clone();
             Rc::new(move |path: PathBuf, as_new: Option<String>| {
-                // Encrypted documents are refused before any
-                // editor machinery sees them (cycle 2, E1).
-                if as_new.is_none() && detect_format(&path) == Detected::Encrypted {
-                    refuse_encrypted(&shell_od, &path);
-                    return;
+                // Protected documents (protected cycle) load
+                // the editor like any other file — the bridge
+                // open arm prompts for the password natively
+                // before any decrypted byte exists. Detection
+                // is ledgered here for the record.
+                if as_new.is_none() {
+                    if let Detected::Encrypted(base) = detect_format(&path) {
+                        eprintln!(
+                            "joffice: ENC_DETECTED path={} base={} (launcher)",
+                            path.display(),
+                            base
+                        );
+                    }
                 }
                 *shell_od.open_as_new.borrow_mut() = as_new;
                 *shell_od.pending_file.borrow_mut() = Some(path.clone());
@@ -10002,14 +12623,7 @@ fn main() {
             })
         };
 
-        if shell.pending_file.borrow().is_some()
-            && shell
-                .pending_file
-                .borrow()
-                .as_ref()
-                .map(|p| detect_format(p) != Detected::Encrypted)
-                .unwrap_or(false)
-        {
+        if shell.pending_file.borrow().is_some() {
             // --file launch: straight into the editor, as before.
             // Cycle 4: if a crashed session belongs to this
             // exact file, arm its recovery — the open below
@@ -10017,7 +12631,16 @@ fn main() {
             // on-disk bytes.
             if let Some(p) = shell.pending_file.borrow().as_ref() {
                 let canon = p.canonicalize().ok();
-                for cand in scan_recovery_candidates() {
+                // Protected files never arm recovery (mode
+                // (a) has none — and a journal written before
+                // the file was encrypted must not replay
+                // against ciphertext).
+                let candidates = if matches!(detect_format(p), Detected::Encrypted(_)) {
+                    Vec::new()
+                } else {
+                    scan_recovery_candidates()
+                };
+                for cand in candidates {
                     let cand_canon = cand
                         .bound_path
                         .as_ref()
@@ -10038,16 +12661,6 @@ fn main() {
                 &shell.config.borrow(),
             );
             view.load_uri(&entry);
-        } else if shell.pending_file.borrow().is_some() {
-            // --file on an encrypted document: refuse, and show
-            // the launcher instead of an editor that must not
-            // open it.
-            let p = shell.pending_file.borrow().clone().unwrap();
-            let launcher = build_launcher(&shell, &window, &open_document);
-            *launcher_holder.borrow_mut() = Some(launcher.clone());
-            vbox.append(&launcher);
-            let shell_r = shell.clone();
-            gtk4::glib::idle_add_local_once(move || refuse_encrypted(&shell_r, &p));
         } else {
             // No-args launch: the native launcher (Kagi round 2
             // §3/§8 — a start window is a feature, not chrome).
