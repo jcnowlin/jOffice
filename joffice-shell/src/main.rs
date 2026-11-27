@@ -5249,6 +5249,56 @@ fn protected_tmp_root() -> PathBuf {
 /// Create this window's private protected dir (0700) under
 /// the tmpfs root and register it for cleanup. Any previous
 /// dir is removed first.
+/// Startup sweep of the protected tmp root (PW-T2): a
+/// kill -9 mid-session leaves the window's prot dir and
+/// any in-flight staged bins behind on tmpfs. They are
+/// RAM and 0700, but they should not accumulate: at
+/// startup, remove joffice-prot-* dirs, joffice-x2t-*
+/// staging, and joffice-save-*.bin files older than an
+/// hour (an hour-old entry cannot belong to a live
+/// conversion; a concurrently running instance's active
+/// files are never that old while in use).
+fn sweep_protected_tmp() {
+    let root = protected_tmp_root();
+    let now = std::time::SystemTime::now();
+    let mut swept = 0usize;
+    if let Ok(rd) = std::fs::read_dir(&root) {
+        for ent in rd.flatten() {
+            let name = ent.file_name().to_string_lossy().into_owned();
+            if !(name.starts_with("joffice-prot-")
+                || name.starts_with("joffice-x2t-")
+                || (name.starts_with("joffice-save-") && name.ends_with(".bin")))
+            {
+                continue;
+            }
+            let stale = ent
+                .metadata()
+                .and_then(|m| m.modified())
+                .map(|t| {
+                    now.duration_since(t)
+                        .map(|d| d.as_secs() > 3600)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if !stale {
+                continue;
+            }
+            let p = ent.path();
+            let gone = if p.is_dir() {
+                std::fs::remove_dir_all(&p).is_ok()
+            } else {
+                std::fs::remove_file(&p).is_ok()
+            };
+            if gone {
+                swept += 1;
+            }
+        }
+    }
+    if swept > 0 {
+        eprintln!("joffice: PROT_SWEEP removed={swept} (stale protected-tmp leftovers)");
+    }
+}
+
 fn protected_tmp_new(shell: &Rc<Shell>) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     if let Some(old) = shell.protected_tmp.borrow_mut().take() {
@@ -6244,6 +6294,13 @@ fn convert_and_write_protected(
         pw_save: Some(seal_pw.clone()),
         root: Some(protected_tmp_root()),
     };
+    // The staged bin is decrypted content on tmpfs; the
+    // conversion copies it into its own private dir, and
+    // THIS path owns the original — remove it the moment
+    // the conversion completes, success or failure (the r3
+    // drive's PW-T1 catch: a completed protected save left
+    // joffice-save-<pid>-<seq>.bin behind on /dev/shm).
+    let tmp_bin_cleanup = tmp_bin.clone();
     x2t_convert_async_opts(
         shell,
         tmp_bin,
@@ -6251,7 +6308,9 @@ fn convert_and_write_protected(
         Some(kind_of_code(code).unwrap_or(EditorKind::Word).canvas_code()),
         false,
         opts,
-        move |result| match result {
+        move |result| {
+            let _ = std::fs::remove_file(&tmp_bin_cleanup);
+            match result {
             Ok(bytes) => {
                 // Stage the sealed output on tmpfs and run
                 // the wall-rule verification there.
@@ -6342,6 +6401,7 @@ fn convert_and_write_protected(
                 }
             }
             Err(e) => save_fail(&shell_c, &reply, e, &origin),
+        }
         },
     );
 }
@@ -11793,6 +11853,7 @@ fn main() {
         libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
         eprintln!("joffice: CORE_LIMIT rlimit_core=0 rc={rc}");
     }
+    sweep_protected_tmp();
     // GSettings schemas (marathon 2 cycle 2 drive finding): the
     // native file chooser is a hard GLib-GIO-ERROR ("No GSettings
     // schemas are installed on the system") on hosts without GTK
