@@ -379,7 +379,13 @@ fn refresh_chrome(shell: &Rc<Shell>) {
                         "{} — legacy format; saving means Save As",
                         ext_of_code(d.origin_code).unwrap_or("").to_uppercase()
                     ),
-                    Policy::ViewOnly => "PDF — opens read-only".to_string(),
+                    Policy::ViewOnly => {
+                        if d.protected.is_some() {
+                            "Password-protected — read-only in jOffice".to_string()
+                        } else {
+                            "PDF — opens read-only".to_string()
+                        }
+                    }
                     Policy::PdfAnnotate => {
                         if d.protected.is_some() {
                             "PDF — password-protected; annotation save (experimental)".to_string()
@@ -6522,7 +6528,24 @@ fn protected_open_document(
     {
         let mut doc = shell.doc.borrow_mut();
         if let Some(d) = doc.as_mut() {
-            d.policy = Policy::Protected;
+            if matches!(base_code, fmt::ODT | fmt::ODS | fmt::ODP) {
+                // CUT (the brief's cut order; PW-R3 evidence):
+                // x2t's ODF re-encryption produces packages
+                // LibreOffice refuses — meta.xml is
+                // undecryptable under the parameters its own
+                // manifest declares, and the manifest
+                // checksums do not verify. ODF protected
+                // documents are READ-ONLY here: they open
+                // and read correctly (the r7 drive), they
+                // never seal.
+                d.policy = Policy::ViewOnly;
+                eprintln!(
+                    "joffice: ENC_ODF_VIEWONLY path={} (x2t ODF seal is not reader-safe; PW-R3)",
+                    path.display()
+                );
+            } else {
+                d.policy = Policy::Protected;
+            }
             d.protected = Some(ProtectedInfo::for_document(scheme.clone()));
         }
     }
@@ -6531,7 +6554,12 @@ fn protected_open_document(
     let tmp_dir = protected_tmp_new(shell);
     let mut banner =
         "Recovery is off for password-protected documents.".to_string();
-    if !scheme.preserved_by_x2t() {
+    if matches!(base_code, fmt::ODT | fmt::ODS | fmt::ODP) {
+        banner.push_str(
+            " This ODF document is read-only in jOffice: the converter's \
+             ODF re-encryption produces files other readers reject.",
+        );
+    } else if !scheme.preserved_by_x2t() {
         banner.push_str(
             " This file uses an older encryption scheme; saving will \
              re-encrypt it with modern AES-256 encryption.",
@@ -7001,6 +7029,14 @@ fn change_password_flow(shell: &Rc<Shell>) {
             _ => return,
         }
     };
+    if matches!(base_code, fmt::ODT | fmt::ODS | fmt::ODP) {
+        show_save_banner(
+            shell,
+            "Password changes are unavailable for ODF documents (read-only in jOffice).",
+        );
+        eprintln!("joffice: ENC_PWCHANGE refused: ODF is view-only this cycle (PW-R3)");
+        return;
+    }
     if shell.modified.borrow().unwrap_or(false) {
         show_save_banner(shell, "Save the document before changing its password.");
         eprintln!("joffice: ENC_PWCHANGE refused: document has unsaved changes");
