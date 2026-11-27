@@ -5708,6 +5708,7 @@ fn exit_registry(shell: &Rc<Shell>, path: ExitPath) -> ExitClass {
 // nested loop keeps the editor's own event flow alive while
 // the dialog is up.
 
+#[allow(dead_code)]
 fn modal_parent(shell: &Rc<Shell>) -> Option<gtk4::Window> {
     shell
         .window
@@ -5742,10 +5743,15 @@ fn prompt_password_sync(
 ) -> Option<String> {
     let win = gtk4::Window::new();
     win.set_title(Some(title));
-    win.set_modal(true);
-    if let Some(parent) = modal_parent(shell) {
-        win.set_transient_for(Some(&parent));
-    }
+    // NOT transient, NOT modal-flagged (drive finding,
+    // protected cycle): on first open the shell swaps the
+    // launcher for the WebView, the main window restacks,
+    // and labwc withdrew the transient dialog from the
+    // compositor entirely — no destroy signal, the nested
+    // loop below never exited, and the open wedged with the
+    // main thread spinning. A standalone window survives
+    // the restack; the nested loop still enforces the
+    // synchronous contract for OUR code.
     win.set_default_size(420, -1);
     let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
     vbox.set_margin_start(18);
@@ -5805,6 +5811,7 @@ fn prompt_password_sync(
         let win_c = win.clone();
         cancel.connect_clicked(move |_| win_c.close());
     }
+    entry.grab_focus();
     run_nested_modal(&win);
     let out = result.borrow().clone();
     eprintln!("joffice: PW_PROMPT exit answered={}", out.is_some());
@@ -5822,10 +5829,15 @@ fn prompt_new_password_sync(
 ) -> Option<String> {
     let win = gtk4::Window::new();
     win.set_title(Some(title));
-    win.set_modal(true);
-    if let Some(parent) = modal_parent(shell) {
-        win.set_transient_for(Some(&parent));
-    }
+    // NOT transient, NOT modal-flagged (drive finding,
+    // protected cycle): on first open the shell swaps the
+    // launcher for the WebView, the main window restacks,
+    // and labwc withdrew the transient dialog from the
+    // compositor entirely — no destroy signal, the nested
+    // loop below never exited, and the open wedged with the
+    // main thread spinning. A standalone window survives
+    // the restack; the nested loop still enforces the
+    // synchronous contract for OUR code.
     win.set_default_size(420, -1);
     let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
     vbox.set_margin_start(18);
@@ -5886,6 +5898,7 @@ fn prompt_new_password_sync(
         let win_c = win.clone();
         cancel.connect_clicked(move |_| win_c.close());
     }
+    e1.grab_focus();
     run_nested_modal(&win);
     let out = result.borrow().clone();
     eprintln!("joffice: PW_PROMPT exit answered={}", out.is_some());
@@ -5920,10 +5933,15 @@ fn protected_print_disclose(shell: &Rc<Shell>) -> bool {
 fn confirm_sync(shell: &Rc<Shell>, title: &str, body: &str, ok_label: &str) -> bool {
     let win = gtk4::Window::new();
     win.set_title(Some(title));
-    win.set_modal(true);
-    if let Some(parent) = modal_parent(shell) {
-        win.set_transient_for(Some(&parent));
-    }
+    // NOT transient, NOT modal-flagged (drive finding,
+    // protected cycle): on first open the shell swaps the
+    // launcher for the WebView, the main window restacks,
+    // and labwc withdrew the transient dialog from the
+    // compositor entirely — no destroy signal, the nested
+    // loop below never exited, and the open wedged with the
+    // main thread spinning. A standalone window survives
+    // the restack; the nested loop still enforces the
+    // synchronous contract for OUR code.
     win.set_default_size(440, -1);
     let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
     vbox.set_margin_start(18);
