@@ -5717,11 +5717,16 @@ fn modal_parent(shell: &Rc<Shell>) -> Option<gtk4::Window> {
 }
 
 fn run_nested_modal(win: &gtk4::Window) {
+    eprintln!("joffice: MODAL enter");
     let loop_ = gtk4::glib::MainLoop::new(None, false);
     let quit = loop_.clone();
-    win.connect_destroy(move |_| quit.quit());
+    win.connect_destroy(move |_| {
+        eprintln!("joffice: MODAL destroy seen");
+        quit.quit()
+    });
     win.present();
     loop_.run();
+    eprintln!("joffice: MODAL exit");
 }
 
 /// One-field password prompt. `prefill` seeds the entry
@@ -5802,6 +5807,7 @@ fn prompt_password_sync(
     }
     run_nested_modal(&win);
     let out = result.borrow().clone();
+    eprintln!("joffice: PW_PROMPT exit answered={}", out.is_some());
     out
 }
 
@@ -5882,6 +5888,7 @@ fn prompt_new_password_sync(
     }
     run_nested_modal(&win);
     let out = result.borrow().clone();
+    eprintln!("joffice: PW_PROMPT exit answered={}", out.is_some());
     out
 }
 
@@ -6340,7 +6347,9 @@ fn protected_open_document(
             return;
         };
         let pw = Arc::new(PwBuf::new(&entered));
+        eprintln!("joffice: ENC_PROBE begin path={}", path.display());
         let (res, code) = prot_probe(shell, path, fmt::BIN, false, &pw_opts(&pw));
+        eprintln!("joffice: ENC_PROBE end path={} code={code:?}", path.display());
         match res {
             Ok(bin) => break (pw, bin),
             Err(e) => {
