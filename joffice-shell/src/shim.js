@@ -866,7 +866,12 @@
         joProtectedDoc = !!res.protected;
         joPdf.perms = res.pdfPerms || null;
         if (joPdf.perms) joInstallClipboardGate();
-        joPdfPw = (typeof res.pdfPassword === 'string' && res.pdfPassword.length > 0)
+        // An EMPTY string is a real credential (owner-restricted
+        // PDFs whose user password is empty); only an absent
+        // field means "no password to feed". Collapsing "" to
+        // null left the engine in isNeedPassword() forever and
+        // the page never rendered (PW-R2 leg 2 drive).
+        joPdfPw = (typeof res.pdfPassword === 'string')
             ? res.pdfPassword : null;
         if (joPdfPw != null) joInstallPdfPasswordWrap(0);
     }
