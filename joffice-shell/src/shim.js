@@ -97,6 +97,195 @@
     window.__joSave = joSave;
 
     // -----------------------------------------------------------
+    // Spellcheck (marathon 2 cycle 7; KAO round 2 §2/§4).
+    //
+    // sdkjs (desktop branch, armed by _coSpellCheckInit via
+    // the auth fake-call) calls AscDesktopEditor.SpellCheck(
+    // JSON.stringify(spellData)) and consumes exactly one
+    // reply per task through window.asc_nativeOnSpellCheck.
+    // One lost reply stalls the document's checking
+    // permanently, so every task is registered as a waiter
+    // here and settled exactly once: by Rust's JS-channel
+    // delivery (__joDeliverSpellReply), by the bridge-failure
+    // fallback, or by the watchdog — the last two with a
+    // locally built all-correct echo (silence, never a stall).
+    // -----------------------------------------------------------
+    var joSpell = {
+        seq: 0,
+        sent: 0,
+        answered: 0,
+        waiters: {} // seq -> {task, paraId, at}
+    };
+    window.__joSpell = joSpell;
+    var joSpellProbe = { disabled: null, capped: null, editedSentAt: 0 };
+
+    // The all-correct echo for a task (stock's unknown-LCID
+    // shape), built locally when Rust cannot answer.
+    function joSpellFallback(taskStr) {
+        var t = null;
+        try { t = JSON.parse(taskStr); } catch (e) { /* fall through */ }
+        if (!t || typeof t !== 'object') {
+            return { type: 'spell', usrCorrect: [], usrSuggest: [] };
+        }
+        if (t.type === 'spell') {
+            var n = Array.isArray(t.usrWords) ? t.usrWords.length : 0;
+            t.usrCorrect = [];
+            for (var i = 0; i < n; i++) t.usrCorrect.push(true);
+            t.usrSuggest = [];
+            return t;
+        }
+        if (t.type === 'suggest') {
+            var m = Array.isArray(t.usrWords) ? t.usrWords.length : 0;
+            t.usrCorrect = [];
+            t.usrSuggest = [];
+            for (var j = 0; j < m; j++) t.usrSuggest.push([]);
+            return t;
+        }
+        if (t.type === 'add') return { type: 'add' };
+        if (t.type === 'clear') return { type: 'clear' };
+        return t;
+    }
+
+    // Settle one waiter with a payload value (an object, or
+    // the string 'clear'). Returns false when the payload's
+    // ParagraphId belongs to a different task — the seq
+    // spaces of two frames can collide, and the deliver
+    // function's forwarding then tries the other frame.
+    function joSpellTake(seq, payload) {
+        var w = joSpell.waiters[seq];
+        if (!w) return false;
+        var val = payload;
+        var bad = false;
+        if (val !== 'clear' && (typeof val !== 'object' || val === null)) bad = true;
+        if (!bad && val !== 'clear' && w.paraId != null
+            && val.ParagraphId !== undefined
+            && String(val.ParagraphId) !== String(w.paraId)) {
+            return false;
+        }
+        delete joSpell.waiters[seq];
+        joSpell.answered++;
+        if (bad) {
+            joLedger('SPELL_REPLY_GARBLED', seq, {});
+            val = joSpellFallback(w.task);
+        }
+        if (typeof window.asc_nativeOnSpellCheck === 'function') {
+            try { window.asc_nativeOnSpellCheck(val); }
+            catch (e) { console.log('[jOffice] asc_nativeOnSpellCheck threw: ' + e); }
+        } else {
+            joLedger('SPELL_NO_CALLBACK', seq, {});
+        }
+        return true;
+    }
+
+    // Dual-channel spell-reply delivery: Rust evaluates this
+    // in the top frame; the top frame forwards to the editor
+    // frame, whose copy settles the seq's waiter (the save /
+    // open pattern).
+    window.__joDeliverSpellReply = function (seq, payload) {
+        if (joSpellTake(seq, payload)) return true;
+        var ref = getEditor();
+        if (ref.ew && ref.ew !== window && ref.ew.__joDeliverSpellReply) {
+            return ref.ew.__joDeliverSpellReply(seq, payload);
+        }
+        return false;
+    };
+
+    // The watchdog: a waiter older than 10 s is settled with
+    // the fallback echo and ledgered on BOTH channels (the
+    // CR1 grade counts SPELL_WATCHDOG in the shell's stderr).
+    setInterval(function () {
+        var now = Date.now();
+        for (var seq in joSpell.waiters) {
+            var w = joSpell.waiters[seq];
+            if (w && now - w.at > 10000) {
+                delete joSpell.waiters[seq];
+                joSpell.answered++;
+                joLedger('SPELL_WATCHDOG', Number(seq), { age_ms: now - w.at });
+                bridge('spellEvent', { kind: 'watchdog', seq: Number(seq) }).catch(function () {});
+                var val = joSpellFallback(w.task);
+                if (typeof window.asc_nativeOnSpellCheck === 'function') {
+                    try { window.asc_nativeOnSpellCheck(val); } catch (e) { /* frame going away */ }
+                }
+            }
+        }
+    }, 2000);
+
+    // Liveness probes (round 2 §2): the word editor's
+    // CDocumentSpellChecker lives at
+    // editor.WordControl.m_oLogicDocument.Spelling and
+    // carries ErrorsExceed + IsOn(). Transitions only —
+    // the shell's state machine does the rest. Cell/slide
+    // expose no equivalent object on this path; their
+    // Disabled/Capped states stay unprobed (recorded in
+    // CYCLES.md), their Live/NoDict states still prove out
+    // through tasks.
+    setInterval(function () {
+        var ref = getEditor();
+        var ed = ref.editor;
+        if (!ed) return;
+        var sp = null;
+        try {
+            sp = ed.WordControl && ed.WordControl.m_oLogicDocument
+                && ed.WordControl.m_oLogicDocument.Spelling;
+        } catch (e) { /* not a word editor */ }
+        if (!sp) return;
+        var capped = null, on = null;
+        try { capped = !!sp.ErrorsExceed; } catch (e) { /* ignore */ }
+        try { on = (typeof sp.IsOn === 'function') ? !!sp.IsOn() : null; } catch (e) { /* ignore */ }
+        if (capped !== null && capped !== joSpellProbe.capped) {
+            joSpellProbe.capped = capped;
+            if (capped) {
+                joLedger('SPELL_PROBE_CAPPED', null, {});
+                bridge('spellEvent', { kind: 'capped' }).catch(function () {});
+            }
+        }
+        if (on !== null) {
+            var dis = !on;
+            if (dis !== joSpellProbe.disabled) {
+                joSpellProbe.disabled = dis;
+                bridge('spellEvent', { kind: dis ? 'disabled' : 'enabled' }).catch(function () {});
+            }
+        }
+    }, 3000);
+
+    // Language-list filter (round 2 §2): stock's
+    // DesktopAfterOpen advertises every key of
+    // spellcheckGetLanguages() as spellcheck-capable whether
+    // or not a dictionary exists. Wrap the editor's sendEvent
+    // before that can happen (CreateEditorApi fires first)
+    // and advertise only the LCIDs Rust installed.
+    function joInstallSpellFilter(api) {
+        if (!api || api.__joSpellFilter || typeof api.sendEvent !== 'function') return;
+        api.__joSpellFilter = true;
+        var installed = {};
+        (window.__joSpellLcids || []).forEach(function (n) { installed[Number(n)] = true; });
+        var orig = api.sendEvent.bind(api);
+        api.sendEvent = function (name) {
+            var a = Array.prototype.slice.call(arguments, 1);
+            if (name === 'asc_onSpellCheckInit' && Array.isArray(a[0])) {
+                var before = a[0].length;
+                a[0] = a[0].filter(function (c) { return !!installed[Number(c)]; });
+                joLedger('SPELL_LANG_FILTER', null, { before: before, after: a[0].length });
+            }
+            return orig.apply(null, [name].concat(a));
+        };
+    }
+
+    // Spellcheck on/off toggles from the editor UI arrive as
+    // asc_setSpellCheck on the api object: mirror them to
+    // the shell's liveness machine.
+    function joWrapSpellToggle(api) {
+        if (!api || api.__joSpellToggle || typeof api.asc_setSpellCheck !== 'function') return;
+        api.__joSpellToggle = true;
+        var orig = api.asc_setSpellCheck.bind(api);
+        api.asc_setSpellCheck = function (isOn) {
+            joLedger('SPELL_TOGGLE', null, { on: isOn ? 'yes' : 'no' });
+            bridge('spellEvent', { kind: isOn ? 'enabled' : 'disabled' }).catch(function () {});
+            return orig(isOn);
+        };
+    }
+
+    // -----------------------------------------------------------
     // Cycle 4: flush mode + journal state. The mode is injected
     // by Rust (window.__joFlushMode, from JOFFICE_FLUSH_MODE):
     //   'journal' — mode J (production): saveChanges is journaled
@@ -1944,7 +2133,51 @@
         },
         SetLocalRestrictions: function () { console.log('[jOffice] stub SetLocalRestrictions'); },
         Sign: function () { console.log('[jOffice] stub Sign'); },
-        SpellCheck: function () { console.log('[jOffice] stub SpellCheck'); },
+        // The desktop spellcheck route (cycle 7): sdkjs hands
+        // us the task as a JSON string (or the bare string
+        // 'clear' for a restart) and waits for exactly one
+        // asc_nativeOnSpellCheck reply. Forward to Rust's
+        // spell service; the answer rides __joDeliverSpellReply.
+        // A bridge failure settles the waiter with the local
+        // fallback echo — a stalled document is the one
+        // outcome this function must never produce.
+        SpellCheck: function (arg) {
+            try {
+                var taskStr = (typeof arg === 'string') ? arg : JSON.stringify(arg);
+                var seq = ++joSpell.seq;
+                joSpell.sent++;
+                if (taskStr === 'clear') {
+                    // Restart semantics (stock): queued tasks
+                    // are dropped; the single "clear" reply
+                    // settles the editor's pending state.
+                    var dropped = Object.keys(joSpell.waiters).length;
+                    joSpell.waiters = {};
+                    joLedger('SPELL_CLEAR', seq, { dropped: dropped });
+                }
+                var paraId = null;
+                if (taskStr !== 'clear') {
+                    try { paraId = JSON.parse(taskStr).ParagraphId; } catch (e) { /* cell tasks may lack it */ }
+                }
+                joSpell.waiters[seq] = { task: taskStr, paraId: paraId, at: Date.now() };
+                if (joSpell.sent <= 5 || joSpell.sent % 100 === 0) {
+                    joLedger('SPELL_TASK_SENT', seq, { n: joSpell.sent });
+                }
+                bridge('spellTask', { task: taskStr, spellSeq: seq }).catch(function (e) {
+                    joLedger('SPELL_BRIDGE_FAIL', seq, { err: String(e) });
+                    var w = joSpell.waiters[seq];
+                    if (w) {
+                        delete joSpell.waiters[seq];
+                        joSpell.answered++;
+                        var val = joSpellFallback(w.task);
+                        if (typeof window.asc_nativeOnSpellCheck === 'function') {
+                            try { window.asc_nativeOnSpellCheck(val); } catch (e2) { /* ignore */ }
+                        }
+                    }
+                });
+            } catch (e) {
+                console.log('[jOffice] SpellCheck shim error: ' + e);
+            }
+        },
         ViewCertificate: function () { console.log('[jOffice] stub ViewCertificate'); },
         buildCryptedEnd: function () { console.log('[jOffice] stub buildCryptedEnd'); },
         buildCryptedStart: function () { console.log('[jOffice] stub buildCryptedStart'); },
@@ -1985,6 +2218,17 @@
             joSave.overlayForced = overlay;
             joLedger('modified', null, { pushed: v, overlay: overlay });
             bridge('modifiedChanged', { value: v }).catch(function () { /* log-only channel */ });
+            // Cycle 7 Dead probe feeder: edits while no spell
+            // task has ever arrived are the liveness machine's
+            // "typing produced no task" evidence. Throttled;
+            // Rust latches the first one and ignores the rest.
+            if (v && joSpell.sent === 0) {
+                var nowMs = Date.now();
+                if (nowMs - joSpellProbe.editedSentAt > 5000) {
+                    joSpellProbe.editedSentAt = nowMs;
+                    bridge('spellEvent', { kind: 'edited' }).catch(function () { /* log-only channel */ });
+                }
+            }
         },
         openExternalReference: function () { console.log('[jOffice] stub openExternalReference'); },
         sendSystemMessage: function () { console.log('[jOffice] stub sendSystemMessage'); },
@@ -2016,6 +2260,12 @@
         // it and scan iframes — the editor may run in the top document.
         CreateEditorApi: function (api) {
             editorApi = api || null;
+            // Cycle 7: the language-list filter and the
+            // spellcheck toggle mirror must be in place before
+            // DesktopAfterOpen can fire (the open path calls
+            // EndLoad, which calls DesktopAfterOpen).
+            joInstallSpellFilter(editorApi);
+            joWrapSpellToggle(editorApi);
         },
 
         // Called by DesktopOfflineUpdateLocalName during load.

@@ -20,6 +20,10 @@
 #                    (see the assembly note in the install
 #                    phase)
 #     dictionaries/  from the deb
+#     spell-dictionaries/  the pinned English hunspell tree
+#                    + manifest.json the shell's spell
+#                    service reads (cycle 7; nix/
+#                    dictionaries.nix)
 #     runtime-manifest.json
 #
 # DoctRenderer.config is NOT shipped: the shell generates it
@@ -37,6 +41,7 @@
 
 let
   fonts = pkgs.callPackage ./fonts.nix { };
+  spellDicts = pkgs.callPackage ./dictionaries.nix { };
   deb = pkgs.fetchurl {
     url = "https://github.com/Euro-Office/DesktopEditors/releases/download/v9.3.8/euro-office-euro-office_9.3.8-0_amd64.deb";
     # sha256 of the official release asset, verified three
@@ -164,6 +169,11 @@ pkgs.stdenv.mkDerivation {
        $RT/web-apps/apps/common/mobile/resources/less/_theme-mobile-overrides.less
     cp -r $APP/fonts $RT/fonts
     cp -r $APP/dictionaries $RT/dictionaries
+    # Cycle 7: the spell service's own pinned English tree
+    # (nix/dictionaries.nix) — separate from the deb's
+    # dictionaries/ above, which the generated
+    # DoctRenderer.config references for the renderer.
+    cp -r ${spellDicts} $RT/spell-dictionaries
     # Fetched sources land read-only; the copies below write
     # INTO these trees.
     chmod -R u+w $RT

@@ -36,6 +36,11 @@ pkgs.rustPlatform.buildRustPackage {
     pkgs.wayland
     pkgs.fontconfig
     pkgs.freetype
+    # Cycle 7: the spell service dlopens libhunspell-1.7 at
+    # runtime (hand-rolled FFI, no link-time dependency);
+    # the package is here so the wrapper can put its lib
+    # dir on LD_LIBRARY_PATH as a fallback for dlopen.
+    pkgs.hunspell
   ];
 
   # The wrapper: runtime discovery + the font path variables
@@ -61,6 +66,8 @@ pkgs.rustPlatform.buildRustPackage {
       --set-default JOFFICE_FONTSDIR "${rtDir}/fonts" \
       --set-default JOFFICE_ALLFONTS "${rtDir}/fonts/AllFonts.js" \
       --set-default JOFFICE_FONTSROOT "${rtDir}/fonts" \
+      --set-default JOFFICE_DICT_DIR "${rtDir}/spell-dictionaries" \
+      --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ pkgs.hunspell ]} \
       --prefix PATH : ${lib.makeBinPath [ pkgs.qpdf pkgs.poppler-utils ]} \
       --prefix XDG_DATA_DIRS : "$out/share''${GSETTINGS_SCHEMAS_PATH:+:$GSETTINGS_SCHEMAS_PATH}"
   '';

@@ -56,6 +56,8 @@ const FONT_SCHEME: &str = "ascdesktop";
 /// Defines window.AscDesktopEditor on top of the Rust bridge.
 const SHIM_JS: &str = include_str!("shim.js");
 
+mod spell;
+
 /// Minimal bootstrap: error collector + the Rust bridge entry point.
 /// The shim (SHIM_JS) does the real work on top of this.
 const BOOTSTRAP_JS: &str = r#"
@@ -348,6 +350,253 @@ fn eval_in_view(shell: &Rc<Shell>, script: &str) {
         return;
     };
     view.evaluate_javascript(script, None, None, None::<&gtk4::gio::Cancellable>, |_| {});
+}
+
+// ---------------------------------------------------------------------------
+// Spellcheck window state (marathon 2 cycle 7; KAO round 2 §2)
+// ---------------------------------------------------------------------------
+
+/// Per-window spellcheck liveness. The base states come from
+/// round 2's machine; NoDict/BrokenDict ride as LCID sets on
+/// top (a window can be Live for en_US and NoDict for sv_SE
+/// at once; the indicator shows the worst).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum SpellBase {
+    Pending,
+    Live,
+    Dead,
+    WrongRoute,
+    Disabled,
+    Capped,
+}
+
+struct SpellWindow {
+    /// Service token (per-window identity in the service).
+    token: u64,
+    /// Reply channel sender, created with the pump.
+    tx: Option<std::sync::mpsc::Sender<spell::SpellReply>>,
+    pump_started: bool,
+    /// seq -> submission time (exactly-once accounting).
+    pending: std::collections::HashMap<u64, std::time::Instant>,
+    base: SpellBase,
+    nodict: std::collections::BTreeSet<u32>,
+    broken: std::collections::BTreeSet<u32>,
+    /// First edit since open with no task yet (Dead probe).
+    edited_at: Option<std::time::Instant>,
+    task_seen: bool,
+    cm_count: u64,
+    /// Last displayed state name (transition ledgering).
+    displayed: String,
+}
+
+impl SpellWindow {
+    fn new() -> Self {
+        SpellWindow {
+            token: spell::next_token(),
+            tx: None,
+            pump_started: false,
+            pending: std::collections::HashMap::new(),
+            base: SpellBase::Pending,
+            nodict: std::collections::BTreeSet::new(),
+            broken: std::collections::BTreeSet::new(),
+            edited_at: None,
+            task_seen: false,
+            cm_count: 0,
+            displayed: "Pending".to_string(),
+        }
+    }
+}
+
+/// The displayed state: worst wins (round 2's failure table
+/// is a severity order, not a race).
+fn spell_display(shell: &Rc<Shell>) -> (&'static str, String) {
+    let st = shell.spell.borrow();
+    if st.base == SpellBase::WrongRoute {
+        return ("WrongRoute", "Spellcheck: editor took the browser route (shim missed the frame)".to_string());
+    }
+    if !st.broken.is_empty() {
+        let names: Vec<String> = st.broken.iter().map(|l| lcid_label(*l)).collect();
+        return (
+            "BrokenDict",
+            format!("Spellcheck: dictionary failed its self-test ({})", names.join(", ")),
+        );
+    }
+    if st.base == SpellBase::Dead {
+        return ("Dead", "Spellcheck: not responding".to_string());
+    }
+    if !st.nodict.is_empty() {
+        let names: Vec<String> = st.nodict.iter().map(|l| lcid_label(*l)).collect();
+        return (
+            "NoDict",
+            format!("Spellcheck: no dictionary for {}", names.join(", ")),
+        );
+    }
+    match st.base {
+        SpellBase::Capped => ("Capped", "Spellcheck: stopped at the error limit".to_string()),
+        SpellBase::Disabled => ("Disabled", "Spellcheck: off".to_string()),
+        SpellBase::Live => ("Live", "Spellcheck: on".to_string()),
+        _ => ("Pending", String::new()),
+    }
+}
+
+fn lcid_label(lcid: u32) -> String {
+    match lcid {
+        1033 => "en-US".to_string(),
+        2057 => "en-GB".to_string(),
+        4105 => "en-CA".to_string(),
+        3081 => "en-AU".to_string(),
+        7177 => "en-ZA".to_string(),
+        other => format!("LCID {other}"),
+    }
+}
+
+/// Refresh the indicator label; ledger every transition of
+/// the DISPLAYED state (SPELL_LIVENESS).
+fn spell_refresh_indicator(shell: &Rc<Shell>) {
+    let (name, text) = spell_display(shell);
+    let changed = {
+        let mut st = shell.spell.borrow_mut();
+        if st.displayed != name {
+            st.displayed = name.to_string();
+            true
+        } else {
+            false
+        }
+    };
+    if changed {
+        eprintln!("joffice: SPELL_LIVENESS {name}");
+    }
+    if let Some(label) = shell.spell_label.borrow().as_ref() {
+        label.set_text(&text);
+        label.set_visible(!text.is_empty());
+    }
+}
+
+fn spell_apply_event(shell: &Rc<Shell>, ev: &spell::SpellEvent) {
+    {
+        let mut st = shell.spell.borrow_mut();
+        match ev {
+            spell::SpellEvent::Judged { .. } => {
+                if st.base == SpellBase::Pending || st.base == SpellBase::Dead {
+                    st.base = SpellBase::Live;
+                }
+                st.edited_at = None;
+            }
+            spell::SpellEvent::NoDict { lcid } => {
+                if st.nodict.insert(*lcid) {
+                    eprintln!("joffice: SPELL_NO_DICT lcid={lcid}");
+                }
+            }
+            spell::SpellEvent::BrokenDict { lcid } => {
+                if st.broken.insert(*lcid) {
+                    eprintln!("joffice: SPELL_BROKEN_DICT lcid={lcid}");
+                }
+            }
+        }
+    }
+    spell_refresh_indicator(shell);
+}
+
+/// Dual-channel spell-reply delivery (the cycle-3/4 pattern):
+/// the postMessage ack is only an acceptance receipt; the
+/// answer itself rides evaluate_javascript into the shim's
+/// waiter registry.
+fn deliver_spell_reply_js(shell: &Rc<Shell>, seq: u64, payload: &str) {
+    let js = format!("window.__joDeliverSpellReply && window.__joDeliverSpellReply({seq}, {payload})");
+    eval_in_view(shell, &js);
+}
+
+/// Start the per-window spell pump (once): poll the reply
+/// channel on the main thread (the x2t pattern), deliver
+/// payloads, apply liveness events, and run the watchdog
+/// ticks (pending-stuck accounting + the Dead probe).
+fn ensure_spell_pump(shell: &Rc<Shell>) {
+    let rx = {
+        let mut st = shell.spell.borrow_mut();
+        if st.pump_started {
+            return;
+        }
+        st.pump_started = true;
+        let (tx, rx) = std::sync::mpsc::channel::<spell::SpellReply>();
+        st.tx = Some(tx);
+        rx
+    }; // senders are cloned per submit from st.tx
+    let shell_p = shell.clone();
+    let mut tick: u64 = 0;
+    gtk4::glib::timeout_add_local(std::time::Duration::from_millis(40), move || {
+        loop {
+            match rx.try_recv() {
+                Ok(rep) => {
+                    shell_p.spell.borrow_mut().pending.remove(&rep.seq);
+                    if let Some(ev) = &rep.event {
+                        spell_apply_event(&shell_p, ev);
+                    }
+                    if let Some(payload) = &rep.payload {
+                        deliver_spell_reply_js(&shell_p, rep.seq, payload);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return gtk4::glib::ControlFlow::Break;
+                }
+            }
+        }
+        tick += 1;
+        if tick % 25 == 0 {
+            // ~1 s: watchdog accounting + Dead probe.
+            let now = std::time::Instant::now();
+            let mut stuck: Vec<u64> = Vec::new();
+            let mut go_dead = false;
+            {
+                let st = shell_p.spell.borrow();
+                for (seq, at) in st.pending.iter() {
+                    if now.duration_since(*at) > std::time::Duration::from_secs(15) {
+                        stuck.push(*seq);
+                    }
+                }
+                if let Some(ed) = st.edited_at {
+                    if !st.task_seen
+                        && st.base == SpellBase::Pending
+                        && now.duration_since(ed) > std::time::Duration::from_secs(5)
+                    {
+                        go_dead = true;
+                    }
+                }
+            }
+            if !stuck.is_empty() {
+                let mut st = shell_p.spell.borrow_mut();
+                for seq in &stuck {
+                    st.pending.remove(seq);
+                    eprintln!("joffice: SPELL_PENDING_STUCK seq={seq} (shim watchdog should have settled it)");
+                }
+            }
+            if go_dead {
+                shell_p.spell.borrow_mut().base = SpellBase::Dead;
+                eprintln!("joffice: SPELL_DEAD_PROBE edits seen, no task within 5 s");
+                spell_refresh_indicator(&shell_p);
+            }
+        }
+        gtk4::glib::ControlFlow::Continue
+    });
+}
+
+/// A spell.js/spell.wasm scheme request means sdkjs fell to
+/// the WASM worker in some frame — the shim missed that frame
+/// (round 2 §2, SPELL_WRONG_ROUTE).
+fn spell_wrong_route(shell: &Rc<Shell>, rel: &str) {
+    let first = {
+        let mut st = shell.spell.borrow_mut();
+        if st.base == SpellBase::WrongRoute {
+            false
+        } else {
+            st.base = SpellBase::WrongRoute;
+            true
+        }
+    };
+    if first {
+        eprintln!("joffice: SPELL_WRONG_ROUTE path={rel}");
+    }
+    spell_refresh_indicator(shell);
 }
 
 /// Refresh the window title (with the dirty bullet) and the
@@ -1887,6 +2136,12 @@ struct Shell {
     pw_btn: RefCell<Option<gtk4::Button>>,
     /// The "Read-only" badge shown on ViewOnly windows.
     readonly_label: RefCell<Option<gtk4::Label>>,
+    /// Cycle 7: this window's spellcheck state (liveness,
+    /// pending tasks, per-window service token).
+    spell: RefCell<SpellWindow>,
+    /// Cycle 7: the spellcheck indicator label in the chrome
+    /// row under the format badge.
+    spell_label: RefCell<Option<gtk4::Label>>,
 }
 
 impl Shell {
@@ -2039,6 +2294,8 @@ impl Shell {
             copy_btn: RefCell::new(None),
             pw_btn: RefCell::new(None),
             readonly_label: RefCell::new(None),
+            spell: RefCell::new(SpellWindow::new()),
+            spell_label: RefCell::new(None),
         });
         shell.log_manifest();
         shell.ensure_doctrenderer_config();
@@ -4251,6 +4508,14 @@ fn handle_uri_scheme(shell: &Rc<Shell>, req: &URISchemeRequest) {
         .map(|s| s.to_string())
         .unwrap_or_else(|| path_part.to_string());
     let rel = decoded.trim_start_matches('/');
+
+    // Cycle 7 WrongRoute detection: a request for the WASM
+    // spellchecker's script or binary means sdkjs fell to the
+    // browser route in some frame — the shim (which installs
+    // AscDesktopEditor in every frame) missed that frame.
+    if rel.contains("common/spell/spell") && (rel.ends_with(".js") || rel.ends_with(".wasm")) {
+        spell_wrong_route(shell, rel);
+    }
 
     // Route /docmedia/<name>: images staged for insertion
     // (marathon 2 cycle 2). The name is shim-chosen; the copy
@@ -8849,6 +9114,79 @@ fn handle_bridge(
     }
 
     match msg.cmd.as_str() {
+        "spellTask" => {
+            // Cycle 7: one spell task from the shim. The
+            // postMessage reply is an acceptance ack only; the
+            // answer rides the JS channel (__joDeliverSpellReply)
+            // from the pump, because a deferred postMessage
+            // reply can arrive garbled (cycle 3/4 finding) and a
+            // garbled spell reply would read as a lost one —
+            // and one lost reply stalls the document forever.
+            let task = msg.args.get("task").and_then(|v| v.as_str()).unwrap_or("");
+            let seq = msg.args.get("spellSeq").and_then(|v| v.as_u64()).unwrap_or(0);
+            ensure_spell_pump(shell);
+            let protected = shell
+                .doc
+                .borrow()
+                .as_ref()
+                .map(|d| d.protected.is_some())
+                .unwrap_or(false);
+            let tx = shell.spell.borrow().tx.clone();
+            {
+                let mut st = shell.spell.borrow_mut();
+                st.pending.insert(seq, std::time::Instant::now());
+                st.task_seen = true;
+                st.edited_at = None;
+            }
+            if let Some(tx) = tx {
+                let token = shell.spell.borrow().token;
+                spell::submit(token, seq, protected, task, tx);
+            }
+            reply_json(reply, ctx, &serde_json::json!({ "accepted": true }));
+        }
+
+        "spellEvent" => {
+            // Cycle 7: shim-side spell probes (edited /
+            // disabled / enabled / capped / watchdog / probe).
+            let kind = msg.args.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            match kind {
+                "edited" => {
+                    let mut st = shell.spell.borrow_mut();
+                    if !st.task_seen && st.edited_at.is_none() {
+                        st.edited_at = Some(std::time::Instant::now());
+                    }
+                }
+                "disabled" => {
+                    shell.spell.borrow_mut().base = SpellBase::Disabled;
+                    spell_refresh_indicator(shell);
+                }
+                "enabled" => {
+                    let mut st = shell.spell.borrow_mut();
+                    if st.base == SpellBase::Disabled {
+                        st.base = SpellBase::Pending;
+                    }
+                    drop(st);
+                    spell_refresh_indicator(shell);
+                }
+                "capped" => {
+                    shell.spell.borrow_mut().base = SpellBase::Capped;
+                    eprintln!("joffice: SPELL_CAPPED editor reports ErrorsExceed");
+                    spell_refresh_indicator(shell);
+                }
+                "watchdog" => {
+                    let seq = msg.args.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+                    shell.spell.borrow_mut().pending.remove(&seq);
+                    eprintln!("joffice: SPELL_WATCHDOG seq={seq} (shim settled a stale waiter)");
+                }
+                "probe" => {
+                    let detail = msg.args.get("detail").and_then(|v| v.as_str()).unwrap_or("");
+                    eprintln!("joffice: SPELL_PROBE {detail}");
+                }
+                _ => {}
+            }
+            reply_json(reply, ctx, &serde_json::json!({ "accepted": true }));
+        }
+
         "pendingFile" => {
             // CONSUME once: take() clears it so a second LocalStartOpen
             // does not re-open the same file.
@@ -12058,6 +12396,16 @@ fn main() {
             }
         }
     }
+    // Hidden spellcheck self-test (marathon 2 cycle 7):
+    // `joffice-shell --spell-selftest <dict-dir>` initializes
+    // the real spell service against that dictionary tree and
+    // runs the DT1 + protocol battery, then exits with the
+    // failure count as the status. No GTK is started. The
+    // harness points JOFFICE_PERSONAL_DIR at a scratch dir so
+    // the add leg never touches a real personal dictionary.
+    if args.len() >= 3 && args[1] == "--spell-selftest" {
+        std::process::exit(spell::run_selftest_cli(&PathBuf::from(&args[2])));
+    }
     let mut pending_file: Option<PathBuf> = None;
     let mut i = 1;
     while i < args.len() {
@@ -12110,6 +12458,12 @@ fn main() {
             }
             if std::env::var_os("JOFFICE_X2T").is_none() {
                 std::env::set_var("JOFFICE_X2T", rt.join("converter/x2t"));
+            }
+            // Cycle 7: the spell dictionaries ride the same
+            // discovery (the Nix runtime ships the pinned
+            // English tree as spell-dictionaries/ + manifest).
+            if std::env::var_os("JOFFICE_DICT_DIR").is_none() {
+                std::env::set_var("JOFFICE_DICT_DIR", rt.join("spell-dictionaries"));
             }
             // The runtime manifest (written by the Nix runtime
             // derivation) is checked against the live tree:
@@ -12201,6 +12555,18 @@ fn main() {
         }
     }
 
+    // Cycle 7: the spellcheck service initializes before the
+    // app (registry + DT1 self-tests ledger at startup; the
+    // installed LCID list must exist before the first
+    // WebView's config script is built). A refused service
+    // never blocks startup — tasks fall back to silence.
+    {
+        let dict_dir = std::env::var_os("JOFFICE_DICT_DIR")
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir());
+        spell::init(dict_dir);
+    }
+
     let app = Application::builder()
         .application_id("io.nowlin.jOffice")
         .build();
@@ -12231,6 +12597,10 @@ fn main() {
         {
             let shell_c = shell.clone();
             window.connect_destroy(move |_| {
+                // Cycle 7: the window's spell token dies with
+                // it — a protected window's memory-only adds
+                // are dropped by the service here (PD7).
+                spell::unregister(shell_c.spell.borrow().token);
                 shell_c.session_finalize_destroy();
             });
         }
@@ -12369,10 +12739,16 @@ fn main() {
         // Cycle 4 config: flush mode + the per-process bridge
         // secret, as a user script so EVERY frame (including
         // the editor iframe) gets them before the shim runs.
+        // Cycle 7 adds the installed spellcheck LCIDs: the
+        // shim's language-list filter advertises only these
+        // (round 2 §2 — stock advertises all ~49 whether or
+        // not a dictionary exists, a silent failure built
+        // into stock).
         let config_js = format!(
-            "window.__joFlushMode = {}; window.__joSecret = {};",
+            "window.__joFlushMode = {}; window.__joSecret = {}; window.__joSpellLcids = {};",
             serde_json::to_string(&shell.flush_mode).unwrap_or_else(|_| "\"journal\"".into()),
             serde_json::to_string(&shell.secret).unwrap_or_else(|_| "\"\"".into()),
+            serde_json::to_string(&spell::installed_lcids()).unwrap_or_else(|_| "[]".into()),
         );
         let config_script = UserScript::new(
             &config_js,
@@ -12397,6 +12773,26 @@ fn main() {
             .web_context(&context)
             .network_session(&network_session)
             .build();
+
+        // Cycle 7 context menu (round 2 §4): the editor's
+        // suggestion menu is a DOM menu web-apps builds from
+        // our suggest replies. A GTK menu (or any shell
+        // secondary-click gesture) would eat the right-click
+        // before sdkjs sees it, so the context-menu signal is
+        // suppressed unconditionally on editor views: return
+        // TRUE, always, and ledger it (CM1 counts these).
+        {
+            let shell_cm = shell.clone();
+            view.connect_context_menu(move |_view, _menu, _hit| {
+                let n = {
+                    let mut st = shell_cm.spell.borrow_mut();
+                    st.cm_count += 1;
+                    st.cm_count
+                };
+                eprintln!("joffice: SPELL_CONTEXT_MENU n={n} action=suppressed");
+                true
+            });
+        }
 
         // Bridge: JS -> Rust, with origin check inside handle_bridge.
         // Weak ref breaks the WebView -> manager -> closure -> WebView cycle.
@@ -12729,6 +13125,21 @@ fn main() {
         badge_label.set_visible(false);
         *shell.badge_label.borrow_mut() = Some(badge_label.clone());
         vbox.append(&badge_label);
+
+        // Spellcheck indicator (cycle 7): the liveness state
+        // of this window's spellcheck, under the format badge.
+        // Empty (hidden) while Pending; the wall rule is that
+        // "no errors" never reads as "working" — Live is shown
+        // only after a self-tested dictionary judged a word.
+        let spell_label = gtk4::Label::new(None);
+        spell_label.set_halign(gtk4::Align::Start);
+        spell_label.set_margin_start(12);
+        spell_label.set_margin_end(12);
+        spell_label.set_margin_top(3);
+        spell_label.set_margin_bottom(3);
+        spell_label.set_visible(false);
+        *shell.spell_label.borrow_mut() = Some(spell_label.clone());
+        vbox.append(&spell_label);
 
         // Action row (cycle 3): native Export as PDF… / Print…
         // entries beside the badge. Export drives the editor's
