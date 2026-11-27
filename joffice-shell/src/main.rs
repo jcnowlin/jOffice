@@ -5718,7 +5718,7 @@ fn modal_parent(shell: &Rc<Shell>) -> Option<gtk4::Window> {
 }
 
 fn run_nested_modal(win: &gtk4::Window) {
-    eprintln!("joffice: MODAL enter");
+    eprintln!("joffice: MODAL enter thread={:?}", std::thread::current().id());
     let loop_ = gtk4::glib::MainLoop::new(None, false);
     let quit = loop_.clone();
     win.connect_destroy(move |_| {
@@ -5794,11 +5794,16 @@ fn prompt_password_sync(
         let entry_c = entry.clone();
         let win_c = win.clone();
         ok.connect_clicked(move |_| {
+            eprintln!(
+                "joffice: PW_OK clicked thread={:?}",
+                std::thread::current().id()
+            );
             if !*decided.borrow() {
                 *decided.borrow_mut() = true;
                 *result.borrow_mut() = Some(entry_c.text().to_string());
             }
             win_c.close();
+            eprintln!("joffice: PW_OK close returned");
         });
     }
     {
@@ -11699,6 +11704,7 @@ fn build_launcher(
 // ---------------------------------------------------------------------------
 
 fn main() {
+    eprintln!("joffice: MAIN_THREAD id={:?}", std::thread::current().id());
     // Protected-documents cycle, build order step 1 (KAO
     // round 2 correction of round 1): a document password will
     // live in this process's memory; a core dump would carry
