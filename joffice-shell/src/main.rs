@@ -7018,7 +7018,30 @@ fn protected_pdf_print_source(shell: &Rc<Shell>) -> Result<PathBuf, String> {
 /// replaces the old one. A dirty document must save first —
 /// the re-seal converts the file on disk, not the editor's
 /// unsaved state.
+thread_local! {
+    /// The sync password dialogs pump the main context, which
+    /// leaves the header buttons live: a second click on
+    /// "Password…" while a flow is parked in its nested pump
+    /// would stack a second flow on top of the first (found by
+    /// driving, protected cycle: two flows interleaved and the
+    /// dialog state became unrecoverable). One flow at a time.
+    static PW_FLOW_ACTIVE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 fn change_password_flow(shell: &Rc<Shell>) {
+    if PW_FLOW_ACTIVE.with(|a| a.get()) {
+        eprintln!("joffice: ENC_PWCHANGE refused: a password flow is already open");
+        return;
+    }
+    PW_FLOW_ACTIVE.with(|a| a.set(true));
+    // The nested modal pumps run INSIDE the inner call; when
+    // it returns, the flow is over and the flag clears.
+    change_password_flow_inner(shell);
+    PW_FLOW_ACTIVE.with(|a| a.set(false));
+}
+
+fn change_password_flow_inner(shell: &Rc<Shell>) {
     let (bound, base_code) = {
         let doc = shell.doc.borrow();
         match doc.as_ref() {
@@ -7113,7 +7136,10 @@ fn change_password_flow(shell: &Rc<Shell>) {
                     // The output goes to a tmpfs staging file
                     // first — detect_format reads paths.
                     let dir = protected_tmp_new(shell);
-                    let staged = dir.join("removed.bin");
+                    let staged = dir.join(format!(
+                        "removed.{}",
+                        ext_of_code(base_code).unwrap_or("bin")
+                    ));
                     let _ = std::fs::write(&staged, &bytes);
                     if matches!(detect_format(&staged), Detected::Encrypted(_)) {
                         show_save_banner(
@@ -7159,7 +7185,13 @@ fn change_password_flow(shell: &Rc<Shell>) {
                 Some(d) => d,
                 None => protected_tmp_new(shell),
             };
-            let staged = dir.join("resealed.bin");
+            // The detector keys the encrypted family off the
+            // file name (dbf692b's lesson): stage with the real
+            // extension or the wall refuses its own reseal.
+            let staged = dir.join(format!(
+                "resealed.{}",
+                ext_of_code(base_code).unwrap_or("bin")
+            ));
             if let Err(e) = std::fs::write(&staged, &bytes) {
                 show_save_banner(shell, &format!("Password change failed: {e}"));
                 return;
