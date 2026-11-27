@@ -6259,7 +6259,17 @@ fn convert_and_write_protected(
                     Some(d) => d,
                     None => protected_tmp_new(&shell_c),
                 };
-                let out_path = dir.join("verify-output.bin");
+                // The staged name carries the format's real
+                // extension: detect_format derives the
+                // encrypted family of an OLE/zip container
+                // from it (a ".bin" name reads as family 0 and
+                // the wall-rule comparison against the
+                // document's own code can never match — the
+                // r2 drive's ENC_VERIFY_FAIL).
+                let out_path = dir.join(format!(
+                    "verify-output.{}",
+                    ext_of_code(code).unwrap_or("bin")
+                ));
                 if let Err(e) = std::fs::write(&out_path, &bytes) {
                     save_fail(
                         &shell_c,
