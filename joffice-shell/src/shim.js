@@ -152,6 +152,10 @@
         active: false, mode: null, degradedLogged: false,
         protected: false, perms: null
     };
+    // Protected cycle: true while this window's document is
+    // password-protected (any format — set from the open
+    // reply's `protected` flag).
+    var joProtectedDoc = false;
     window.__joPdf = joPdf;
 
     // -----------------------------------------------------------
@@ -859,6 +863,7 @@
         // is never logged. Permission bits (read by Rust from
         // /Encrypt) arm the clipboard gate when copy is off.
         joPdf.protected = !!res.protected;
+        joProtectedDoc = !!res.protected;
         joPdf.perms = res.pdfPerms || null;
         if (joPdf.perms) joInstallClipboardGate();
         joPdfPw = (typeof res.pdfPassword === 'string' && res.pdfPassword.length > 0)
@@ -2258,6 +2263,16 @@
                     unmodified = false;
                     joLedger('UNMOD_FORCED', seq, { unsavedItems: unsavedItems });
                 }
+            }
+            // Protected windows (protected cycle): there is
+            // no journal to flush to, but sdkjs still marks
+            // flushed changes saved — isDocumentModified goes
+            // false while the bound file holds none of the
+            // edits. The §6a shortcuts must never fire here:
+            // only a verified re-seal makes the file current.
+            if (unmodified && joProtectedDoc) {
+                unmodified = false;
+                joLedger('UNMOD_FORCED', seq, { reason: 'protected' });
             }
             joLedger('localfilesave', seq, {
                 saveAs: isSaveAs, fileType: fileType || 0, origin: origin,

@@ -10057,6 +10057,7 @@ fn handle_bridge(
                     if unmodified
                         && !*shell.save_failed_outstanding.borrow()
                         && !journal_pending(shell)
+                        && policy != Policy::Protected
                     {
                         // §6a (KAO round 1): an unedited document
                         // is never converted — Ctrl+S on an
@@ -10066,7 +10067,18 @@ fn handle_bridge(
                         // ask about.) Cycle 4: journal_pending
                         // defeats the no-op when the "unedited"
                         // verdict only means "already flushed
-                        // to the journal".
+                        // to the journal". Protected cycle drive
+                        // finding: the exemption for Protected is
+                        // load-bearing — a protected window has
+                        // NO journal, the editor's changes flush
+                        // goes nowhere, sdkjs still advances its
+                        // saved index and reports the document
+                        // unmodified, and the no-op then silently
+                        // eats a real edit (r1 drive: typed text,
+                        // modified flickered true then false,
+                        // Ctrl+S no-opped, the sealed file came
+                        // back without the edit). A protected
+                        // save ALWAYS seals + verifies + writes.
                         let _ = std::fs::remove_file(&tmp_bin);
                         eprintln!(
                             "joffice: SAVE-UNEDITED no-op (code={code}, origin={origin})"
