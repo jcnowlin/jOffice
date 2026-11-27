@@ -331,6 +331,18 @@ fn request_page_save(shell: &Rc<Shell>, mode: &str) {
 /// Fire-and-forget JS in the editor view (cycle 3 action bar /
 /// printRequest kick-off).
 fn eval_in_view(shell: &Rc<Shell>, script: &str) {
+    // Hardening (cycle 4 §5): evaluated scripts are built from
+    // serde_json-escaped values only, and a script over 1 MB
+    // is refused outright — no legitimate shell message is
+    // anywhere near that size; a giant one is a bug or an
+    // attack, and either way it does not run.
+    if script.len() > 1_000_000 {
+        eprintln!(
+            "joffice: EVAL_OVERSIZE refused ({} bytes)",
+            script.len()
+        );
+        return;
+    }
     let Some(view) = shell.view.borrow().clone() else {
         return;
     };
@@ -383,6 +395,17 @@ fn refresh_chrome(shell: &Rc<Shell>) {
     // while a document is open (cycle 3).
     if let Some(row) = shell.action_row.borrow().as_ref() {
         row.set_visible(doc.is_some());
+    }
+    // Save a Copy… + Read-only badge: ViewOnly windows only.
+    let viewonly = matches!(
+        doc.as_ref().map(|d| d.policy),
+        Some(Policy::ViewOnly)
+    );
+    if let Some(b) = shell.copy_btn.borrow().as_ref() {
+        b.set_visible(viewonly);
+    }
+    if let Some(l) = shell.readonly_label.borrow().as_ref() {
+        l.set_visible(viewonly);
     }
 }
 
@@ -471,6 +494,557 @@ fn file_stamp(path: &Path) -> Option<FileStamp> {
         mtime: md.modified().ok(),
         inode,
     })
+}
+
+// ============================================================
+// Sessions + journal (marathon 2 cycle 4, mode J; KAO rounds
+// 1-2 are the design authority).
+//
+// A session is one open document's crash-recovery state:
+//   $XDG_STATE_HOME/joffice/sessions/<sid>/
+//     manifest.json   bound fingerprint, format, sdk hash,
+//                     epoch/base, last_bound_save_index
+//     seed.bin        epoch 0 seed (the open-time Editor.bin)
+//     seed-<n>.bin    epoch n seed (checkpoint snapshots)
+//     journal-<n>.jsonl  framed change records for epoch n
+//     uploads/        chunked-upload assemblies
+//     lock            pid file (O_EXCL create; dead pid = free)
+// Directory 0700, files 0600. The journal stores the editor's
+// own change records; recovery folds them (truncate to
+// deleteIndex, then append) and replays the fold over the
+// epoch seed via DesktopOfflineAppDocumentApplyChanges.
+// ============================================================
+
+/// The bound file's fingerprint for the session manifest
+/// (round 1 §2a): device, inode, size, mtime in nanoseconds.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Fingerprint {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime_ns: i64,
+}
+
+fn fingerprint(path: &Path) -> Option<Fingerprint> {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(path).ok()?;
+    Some(Fingerprint {
+        dev: md.dev(),
+        ino: md.ino(),
+        size: md.size(),
+        mtime_ns: md.mtime() * 1_000_000_000 + md.mtime_nsec(),
+    })
+}
+
+fn fingerprint_json(fp: &Fingerprint) -> serde_json::Value {
+    serde_json::json!({
+        "dev": fp.dev, "ino": fp.ino, "size": fp.size, "mtime_ns": fp.mtime_ns
+    })
+}
+
+fn fingerprint_from_json(v: &serde_json::Value) -> Option<Fingerprint> {
+    Some(Fingerprint {
+        dev: v.get("dev")?.as_u64()?,
+        ino: v.get("ino")?.as_u64()?,
+        size: v.get("size")?.as_u64()?,
+        mtime_ns: v.get("mtime_ns")?.as_i64()?,
+    })
+}
+
+/// Rebuild the FileStamp a manifest fingerprint describes, so a
+/// recovered window's external-change check compares the disk
+/// against the fingerprint at CRASH time (F0), not at recovery
+/// time (K4/K7: a file saved by another window meanwhile must
+/// trip the check at first save).
+fn stamp_from_fingerprint(fp: &Fingerprint) -> FileStamp {
+    let secs = fp.mtime_ns.div_euclid(1_000_000_000);
+    let nanos = fp.mtime_ns.rem_euclid(1_000_000_000) as u32;
+    FileStamp {
+        size: fp.size,
+        mtime: Some(
+            std::time::UNIX_EPOCH + std::time::Duration::new(secs as u64, nanos),
+        ),
+        inode: fp.ino,
+    }
+}
+
+/// CRC-32 (IEEE) — the journal frame checksum. Hand-rolled:
+/// the shell's dependency set is frozen for this cycle.
+fn crc32(data: &[u8]) -> u32 {
+    static mut TABLE: [u32; 256] = [0; 256];
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        for i in 0..256u32 {
+            let mut c = i;
+            for _ in 0..8 {
+                c = if c & 1 != 0 { 0xEDB88320 ^ (c >> 1) } else { c >> 1 };
+            }
+            TABLE[i as usize] = c;
+        }
+    });
+    let table = unsafe { &*(&raw const TABLE) };
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc = table[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
+fn sessions_root() -> PathBuf {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".local/state"));
+    base.join("joffice").join("sessions")
+}
+
+fn new_sid() -> String {
+    let mut buf = [0u8; 16];
+    let ok = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| {
+            use std::io::Read;
+            f.read_exact(&mut buf)
+        })
+        .is_ok();
+    if !ok {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let x = t ^ (std::process::id() as u128) << 64;
+        buf.copy_from_slice(&x.to_le_bytes());
+    }
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn new_secret() -> String {
+    new_sid()
+}
+
+/// One journal record as it arrives from the shim's wrap.
+#[derive(Clone)]
+struct JournalFrame {
+    delete_index: Option<i64>,
+    changes: Vec<String>,
+}
+
+struct SessionState {
+    sid: String,
+    dir: PathBuf,
+    bound_path: Option<PathBuf>,
+    name: String,
+    origin_code: i32,
+    editor: String,
+    sdk_hash: String,
+    /// Bound-file fingerprint at open / last own write.
+    fp: Option<Fingerprint>,
+    epoch: u32,
+    /// History items folded into the current epoch's seed.
+    base: i64,
+    /// Next journal seq expected in this epoch (1-based).
+    next_seq: u64,
+    /// Out-of-order arrivals waiting for their predecessors.
+    reorder: std::collections::BTreeMap<u64, JournalFrame>,
+    /// The current epoch's fold (wire strings), maintained live.
+    folded: Vec<String>,
+    /// Fold base for the CURRENT fold (reset by a null
+    /// deleteIndex record — the history-cleared degradation).
+    fold_base: i64,
+    /// History.Index reported by the last bound save.
+    last_bound_save_index: Option<i64>,
+    /// History items (base + folded) known to be in the bound
+    /// file as of the last bound save. unsaved = the rest.
+    bound_items: i64,
+    created_unix: u64,
+    recovered: bool,
+    /// A recovered session holds content the bound file does
+    /// not have until a bound save lands — pinned independently
+    /// of the base/folded arithmetic, whose units restart with
+    /// the new editor instance (cycle 4, K6 follow-up: the
+    /// recovery-finalize checkpoint reset base to the fold
+    /// length and the §6a unedited no-op ate the recovered
+    /// save). Cleared only by session_on_bound_save.
+    recovered_unsaved: bool,
+}
+
+impl SessionState {
+    /// Journal-side items not yet in the bound file. A
+    /// checkpoint moves items into a new seed but NOT into the
+    /// file, so this survives checkpoints — it is what makes a
+    /// crashed-after-checkpoint session a recovery candidate.
+    fn unsaved(&self) -> i64 {
+        (self.base + self.folded.len() as i64 - self.bound_items).max(0)
+    }
+}
+
+impl SessionState {
+    fn journal_path(&self, epoch: u32) -> PathBuf {
+        self.dir.join(format!("journal-{epoch}.jsonl"))
+    }
+    fn seed_path(&self, epoch: u32) -> PathBuf {
+        if epoch == 0 {
+            self.dir.join("seed.bin")
+        } else {
+            self.dir.join(format!("seed-{epoch}.bin"))
+        }
+    }
+    fn write_manifest(&self) {
+        let manifest = serde_json::json!({
+            "sid": self.sid,
+            "bound_path": self.bound_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            "name": self.name,
+            "origin_code": self.origin_code,
+            "editor": self.editor,
+            "sdk_hash": self.sdk_hash,
+            "fingerprint": self.fp.map(|f| fingerprint_json(&f)),
+            "epoch": self.epoch,
+            "base": self.base,
+            "last_bound_save_index": self.last_bound_save_index,
+            "unsaved_items": self.unsaved(),
+            "created_unix": self.created_unix,
+            "pid": std::process::id(),
+        });
+        let tmp = self.dir.join("manifest.json.tmp");
+        if std::fs::write(&tmp, manifest.to_string()).is_ok() {
+            let _ = std::fs::rename(&tmp, self.dir.join("manifest.json"));
+        }
+    }
+    /// Append one frame to the epoch journal and fdatasync —
+    /// a record is only "journaled" once this returns.
+    fn append_frame(&self, epoch: u32, frame: &JournalFrame) -> std::io::Result<()> {
+        let payload = serde_json::json!({
+            "del": frame.delete_index,
+            "changes": frame.changes,
+        })
+        .to_string();
+        let bytes = payload.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len() + 8);
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&crc32(bytes).to_le_bytes());
+        out.extend_from_slice(bytes);
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.journal_path(epoch))?;
+        f.write_all(&out)?;
+        f.sync_data()?;
+        Ok(())
+    }
+}
+
+/// Read a journal file's frames. Stops at the first torn or
+/// corrupt frame (K3: a crash mid-append leaves a partial tail;
+/// everything before it is good). Returns (frames, torn).
+fn read_journal_frames(path: &Path) -> (Vec<JournalFrame>, bool) {
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(_) => return (Vec::new(), false),
+    };
+    let mut frames = Vec::new();
+    let mut pos = 0usize;
+    let mut torn = false;
+    while pos < data.len() {
+        if data.len() - pos < 8 {
+            torn = true;
+            break;
+        }
+        let len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        let crc = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap());
+        if data.len() - pos - 8 < len {
+            torn = true;
+            break;
+        }
+        let payload = &data[pos + 8..pos + 8 + len];
+        if crc32(payload) != crc {
+            torn = true;
+            break;
+        }
+        match serde_json::from_slice::<serde_json::Value>(payload) {
+            Ok(v) => {
+                let changes = v
+                    .get("changes")
+                    .and_then(|c| c.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                            .collect::<Vec<String>>()
+                    })
+                    .unwrap_or_default();
+                frames.push(JournalFrame {
+                    delete_index: v.get("del").and_then(|d| d.as_i64()),
+                    changes,
+                });
+            }
+            Err(_) => {
+                torn = true;
+                break;
+            }
+        }
+        pos += 8 + len;
+    }
+    (frames, torn)
+}
+
+/// The fold (round 2 §C): for each record, truncate the list
+/// to deleteIndex (rebased by the epoch base), then append.
+/// A null deleteIndex RESETS the list (the history was
+/// cleared; the fold restarts from this record). Stops at the
+/// first BeyondEnd record and reports how many records were
+/// applied — the caller replays the contiguous prefix and says
+/// so (the K3/gap banner).
+fn fold_frames(
+    frames: &[JournalFrame],
+    base: i64,
+) -> (Vec<String>, usize, Option<String>) {
+    let mut list: Vec<String> = Vec::new();
+    let mut fold_base = base;
+    for (i, f) in frames.iter().enumerate() {
+        match f.delete_index {
+            None => {
+                list.clear();
+                list.extend(f.changes.iter().cloned());
+                fold_base = 0;
+            }
+            Some(d) => {
+                let rebased = d - fold_base;
+                if rebased < 0 || rebased as usize > list.len() {
+                    let msg = format!(
+                        "deleteIndex {d} beyond folded length {} (base {fold_base})",
+                        list.len()
+                    );
+                    return (list, i, Some(msg));
+                }
+                list.truncate(rebased as usize);
+                list.extend(f.changes.iter().cloned());
+            }
+        }
+    }
+    (list, frames.len(), None)
+}
+
+/// Apply ONE frame to a live fold (the journalAppend path —
+/// the same rules as fold_frames, one record at a time).
+fn fold_one(
+    folded: &mut Vec<String>,
+    fold_base: &mut i64,
+    f: &JournalFrame,
+) -> Result<(), String> {
+    match f.delete_index {
+        None => {
+            folded.clear();
+            folded.extend(f.changes.iter().cloned());
+            *fold_base = 0;
+            Ok(())
+        }
+        Some(d) => {
+            let rebased = d - *fold_base;
+            if rebased < 0 || rebased as usize > folded.len() {
+                Err(format!(
+                    "deleteIndex {d} beyond folded length {} (base {fold_base})",
+                    folded.len()
+                ))
+            } else {
+                folded.truncate(rebased as usize);
+                folded.extend(f.changes.iter().cloned());
+                Ok(())
+            }
+        }
+    }
+}
+
+/// A crashed session offered for recovery at launch.
+struct RecoveryCandidate {
+    sid: String,
+    dir: PathBuf,
+    name: String,
+    bound_path: Option<PathBuf>,
+    last_edit_unix: u64,
+    total_bytes: u64,
+    unsaved_items: i64,
+}
+
+/// Load a crashed session for recovery: verify the sdk hash
+/// (K5 — a mismatch means NO replay; the caller opens the
+/// original file and the session stays on disk), fold the
+/// current epoch's journal over its base, and re-lock the
+/// session to this process. Returns (state, folded, gap).
+fn load_recovery_session(
+    shell: &Rc<Shell>,
+    sid: &str,
+) -> Option<(SessionState, Vec<String>, bool)> {
+    let dir = sessions_root().join(sid);
+    let manifest: serde_json::Value = std::fs::read_to_string(dir.join("manifest.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())?;
+    let sdk_hash = manifest
+        .get("sdk_hash")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if sdk_hash != shell.sdk_hash {
+        eprintln!(
+            "joffice: RECOVERY_SDK_MISMATCH sid={sid} manifest={sdk_hash} live={}",
+            shell.sdk_hash
+        );
+        return None;
+    }
+    let epoch = manifest.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let base = manifest.get("base").and_then(|v| v.as_i64()).unwrap_or(0);
+    let seed = if epoch == 0 {
+        dir.join("seed.bin")
+    } else {
+        dir.join(format!("seed-{epoch}.bin"))
+    };
+    if !seed.exists() {
+        eprintln!("joffice: RECOVERY_NO_SEED sid={sid} epoch={epoch}");
+        return None;
+    }
+    let (frames, torn) = read_journal_frames(&dir.join(format!("journal-{epoch}.jsonl")));
+    let (folded, applied, stop) = fold_frames(&frames, base);
+    let gap = torn || stop.is_some() || applied < frames.len();
+    if gap {
+        eprintln!(
+            "joffice: RECOVERY_GAP sid={sid} applied={applied}/{} torn={torn} stop={:?}",
+            frames.len(),
+            stop
+        );
+    }
+    write_session_lock(&dir);
+    let st = SessionState {
+        sid: sid.to_string(),
+        dir,
+        bound_path: manifest
+            .get("bound_path")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from),
+        name: manifest
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("document")
+            .to_string(),
+        origin_code: manifest
+            .get("origin_code")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(fmt::DOCX as i64) as i32,
+        editor: manifest
+            .get("editor")
+            .and_then(|v| v.as_str())
+            .unwrap_or("word")
+            .to_string(),
+        sdk_hash,
+        fp: manifest
+            .get("fingerprint")
+            .and_then(|v| if v.is_null() { None } else { Some(v) })
+            .and_then(|v| fingerprint_from_json(v)),
+        epoch,
+        base,
+        next_seq: frames.len() as u64 + 1,
+        reorder: std::collections::BTreeMap::new(),
+        folded: folded.clone(),
+        fold_base: base,
+        last_bound_save_index: manifest
+            .get("last_bound_save_index")
+            .and_then(|v| v.as_i64()),
+        bound_items: base + folded.len() as i64
+            - manifest.get("unsaved_items").and_then(|v| v.as_i64()).unwrap_or(0),
+        created_unix: manifest
+            .get("created_unix")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        recovered: true,
+        recovered_unsaved: true,
+    };
+    st.write_manifest();
+    Some((st, folded, gap))
+}
+
+fn session_lock_alive(dir: &Path) -> bool {
+    let pid: Option<u32> = std::fs::read_to_string(dir.join("lock"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok());
+    match pid {
+        Some(p) => Path::new(&format!("/proc/{p}")).exists(),
+        None => false,
+    }
+}
+
+fn write_session_lock(dir: &Path) {
+    let _ = std::fs::write(dir.join("lock"), format!("{}", std::process::id()));
+}
+
+fn scan_recovery_candidates() -> Vec<RecoveryCandidate> {
+    let root = sessions_root();
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(&root) {
+        Ok(e) => e,
+        Err(_) => return out,
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let manifest: serde_json::Value = match std::fs::read_to_string(dir.join("manifest.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+        {
+            Some(m) => m,
+            None => continue,
+        };
+        if session_lock_alive(&dir) {
+            continue;
+        }
+        // Only sessions with unsaved journal work are offered.
+        let epoch = manifest.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let (frames, _torn) = read_journal_frames(&dir.join(format!("journal-{epoch}.jsonl")));
+        let unsaved = manifest
+            .get("unsaved_items")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        if frames.is_empty() && unsaved <= 0 {
+            continue;
+        }
+        let mut total_bytes = 0u64;
+        let mut last_edit = 0u64;
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for f in rd.flatten() {
+                if let Ok(md) = f.metadata() {
+                    total_bytes += md.len();
+                    if let Ok(m) = md.modified() {
+                        let u = m
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        if u > last_edit {
+                            last_edit = u;
+                        }
+                    }
+                }
+            }
+        }
+        out.push(RecoveryCandidate {
+            sid: entry.file_name().to_string_lossy().into_owned(),
+            dir,
+            name: manifest
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("document")
+                .to_string(),
+            bound_path: manifest
+                .get("bound_path")
+                .and_then(|v| v.as_str())
+                .map(PathBuf::from),
+            last_edit_unix: last_edit,
+            total_bytes,
+            unsaved_items: unsaved,
+        });
+    }
+    out.sort_by(|a, b| b.last_edit_unix.cmp(&a.last_edit_unix));
+    out
 }
 
 /// FNV-1a 64-bit — a build-identity hash for the runtime manifest
@@ -1031,6 +1605,37 @@ struct Shell {
     media_dir: PathBuf,
     /// The EndSave build identity the page reported (SDK_DRIFT).
     endsave_hash_seen: RefCell<Option<String>>,
+    // --- marathon 2 cycle 4 ---
+    /// Flush mode (JOFFICE_FLUSH_MODE): journal (mode J,
+    /// production) / bound (cycle-3 fallback) / m0..m3 (E0).
+    flush_mode: String,
+    /// Per-process bridge secret, injected into the page as
+    /// window.__joSecret; state-affecting bridge commands and
+    /// session scheme requests must present it (hardening §5).
+    secret: String,
+    /// Identity hash of the pinned sdkjs Local loader; journal
+    /// replay is refused across a mismatch (K5).
+    sdk_hash: String,
+    /// The active document session (journal mode).
+    session: RefCell<Option<SessionState>>,
+    /// A recovery the launcher armed: the convert path serves
+    /// this session's seed + folded journal instead of a fresh
+    /// conversion of the bound file.
+    recovery_arm: RefCell<Option<String>>,
+    /// Set by the close paths when the session directory must
+    /// be deleted at destroy (saved, or Don't Save chosen).
+    /// Left false, a destroy keeps the session — a crash and a
+    /// clean-but-undecided close look the same from here, and
+    /// keeping is the safe side.
+    session_discard: RefCell<bool>,
+    /// The shim-reported History.Index of the in-flight save
+    /// (cycle 4): consumed by write_save_checked to record
+    /// last_bound_save_index in the session manifest.
+    pending_hist_index: RefCell<Option<i64>>,
+    /// The ViewOnly "Save a Copy…" button (cycle 4 step 4).
+    copy_btn: RefCell<Option<gtk4::Button>>,
+    /// The "Read-only" badge shown on ViewOnly windows.
+    readonly_label: RefCell<Option<gtk4::Label>>,
 }
 
 impl Shell {
@@ -1096,6 +1701,11 @@ impl Shell {
             }
         });
         let font_index = FontIndex::load(sdkjs_dir.as_deref());
+        // Cycle 4: the sdk identity hash (journal replay gate).
+        let sdk_hash = sdkjs_dir
+            .as_ref()
+            .and_then(|d| fnv_file(&d.join("common/Local/common.js")))
+            .unwrap_or_else(|| "unknown".to_string());
 
         let mut handles = HandleTable::new();
         // Register --file at startup so it is resolvable as a handle.
@@ -1160,6 +1770,18 @@ impl Shell {
             held_image_requests: RefCell::new(Vec::new()),
             media_dir: std::env::temp_dir().join(format!("joffice-media-{}", std::process::id())),
             endsave_hash_seen: RefCell::new(None),
+            flush_mode: std::env::var("JOFFICE_FLUSH_MODE")
+                .ok()
+                .filter(|m| ["journal", "bound", "m0", "m1", "m2", "m3"].contains(&m.as_str()))
+                .unwrap_or_else(|| "journal".to_string()),
+            secret: new_secret(),
+            sdk_hash,
+            session: RefCell::new(None),
+            recovery_arm: RefCell::new(None),
+            session_discard: RefCell::new(false),
+            pending_hist_index: RefCell::new(None),
+            copy_btn: RefCell::new(None),
+            readonly_label: RefCell::new(None),
         });
         shell.log_manifest();
         shell.ensure_doctrenderer_config();
@@ -1171,6 +1793,16 @@ impl Shell {
     /// which x2t, which font maps, how many fonts — so a drive
     /// log states the exact runtime it graded.
     fn log_manifest(&self) {
+        // Cycle 4: the WebKit version is part of the runtime
+        // identity (the chunked-upload floor depends on it).
+        eprintln!(
+            "joffice: MANIFEST webkit: {}.{}.{} flush_mode={} sdk_hash={}",
+            unsafe { webkit6::ffi::webkit_get_major_version() },
+            unsafe { webkit6::ffi::webkit_get_minor_version() },
+            unsafe { webkit6::ffi::webkit_get_micro_version() },
+            self.flush_mode,
+            self.sdk_hash
+        );
         let x2t_desc = match &self.x2t {
             Some(p) => format!(
                 "{} fnv={}",
@@ -1214,6 +1846,24 @@ impl Shell {
         *self.doc_stamp.borrow_mut() = file_stamp(path).map(|s| (path.to_path_buf(), s));
         let uri = gtk4::gio::File::for_path(path).uri();
         gtk4::RecentManager::default().add_item(&uri);
+        // Cycle 4: a Save As ADOPTION also lands here (the two
+        // save-completion callers), while plain opens run
+        // before any session exists or outside a save. Gate on
+        // an in-flight save so an ordinary Open never rebinds
+        // the previous document's session.
+        let in_save = *self.saves_active.borrow() > 0 || self.pending_save.borrow().is_some();
+        if in_save {
+            let differs = self
+                .session
+                .borrow()
+                .as_ref()
+                .map(|st| st.bound_path.as_deref() != Some(path))
+                .unwrap_or(false);
+            if differs {
+                let hist = self.pending_hist_index.borrow_mut().take();
+                self.session_on_bound_save(path, hist);
+            }
+        }
     }
 
     /// Before writing a save over `dest`: refuse if the file on
@@ -1241,6 +1891,150 @@ impl Shell {
         } else {
             Ok(())
         }
+    }
+
+    // --- cycle 4: sessions + journal ---
+
+    /// Create the session for a freshly opened document: seed
+    /// = the exact Editor.bin the editor is about to load.
+    /// Returns the sid. Directory 0700, files 0600 (the journal
+    /// holds document content — same care as the document).
+    fn session_create(
+        &self,
+        bound_path: Option<PathBuf>,
+        name: &str,
+        origin_code: i32,
+        bin: &[u8],
+    ) -> Option<String> {
+        use std::os::unix::fs::PermissionsExt;
+        let sid = new_sid();
+        let dir = sessions_root().join(&sid);
+        if std::fs::create_dir_all(&dir).is_err() {
+            eprintln!("joffice: SESSION_CREATE_FAIL dir={}", dir.display());
+            return None;
+        }
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::create_dir_all(dir.join("uploads"));
+        let seed = dir.join("seed.bin");
+        if std::fs::write(&seed, bin).is_err() {
+            eprintln!("joffice: SESSION_SEED_FAIL sid={sid}");
+            return None;
+        }
+        let _ = std::fs::set_permissions(&seed, std::fs::Permissions::from_mode(0o600));
+        write_session_lock(&dir);
+        let kind = kind_of_code(origin_code)
+            .map(|k| format!("{k:?}").to_lowercase())
+            .unwrap_or_else(|| "word".to_string());
+        let st = SessionState {
+            sid: sid.clone(),
+            dir,
+            bound_path: bound_path.clone(),
+            name: name.to_string(),
+            origin_code,
+            editor: kind,
+            sdk_hash: self.sdk_hash.clone(),
+            fp: bound_path.as_deref().and_then(fingerprint),
+            epoch: 0,
+            base: 0,
+            next_seq: 1,
+            reorder: std::collections::BTreeMap::new(),
+            folded: Vec::new(),
+            fold_base: 0,
+            last_bound_save_index: None,
+            bound_items: 0,
+            created_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            recovered: false,
+            recovered_unsaved: false,
+        };
+        st.write_manifest();
+        eprintln!(
+            "joffice: SESSION_CREATE sid={sid} name={name} code={origin_code} seed_bytes={}",
+            bin.len()
+        );
+        *self.session.borrow_mut() = Some(st);
+        Some(sid)
+    }
+
+    /// Retire the current session because another document is
+    /// taking its place (the editor's Open flow closes the
+    /// previous file). A session with unsaved journal work is
+    /// KEPT as a recovery candidate; a clean one is deleted.
+    fn session_rotate_out(&self) {
+        let old = self.session.borrow_mut().take();
+        if let Some(st) = old {
+            let keep = st.unsaved() > 0 || st.recovered_unsaved;
+            eprintln!(
+                "joffice: SESSION_ROTATE sid={} keep={} unsaved={}",
+                st.sid,
+                keep,
+                st.unsaved()
+            );
+            if !keep {
+                let _ = std::fs::remove_dir_all(&st.dir);
+            }
+        }
+    }
+
+    /// After a successful bound write (or a Save As adoption):
+    /// the journal's unsaved tail is in the file; the manifest
+    /// tracks the new fingerprint + saved history index.
+    fn session_on_bound_save(&self, dest: &Path, hist_index: Option<i64>) {
+        let mut sess = self.session.borrow_mut();
+        if let Some(st) = sess.as_mut() {
+            st.fp = fingerprint(dest);
+            st.bound_path = Some(dest.to_path_buf());
+            if hist_index.is_some() {
+                st.last_bound_save_index = hist_index;
+            }
+            st.recovered_unsaved = false;
+            st.bound_items = st.base + st.folded.len() as i64;
+            st.write_manifest();
+            eprintln!(
+                "joffice: SESSION_BOUND_SAVE sid={} dest={} hist_index={:?}",
+                st.sid,
+                dest.display(),
+                hist_index
+            );
+        }
+    }
+
+    /// Window destroy: delete the session only when the close
+    /// paths marked it discardable (saved / Don't Save) or the
+    /// document is clean; otherwise keep it for recovery.
+    fn session_finalize_destroy(&self) {
+        let old = self.session.borrow_mut().take();
+        if let Some(st) = old {
+            let discard = *self.session_discard.borrow()
+                || (st.unsaved() <= 0 && !st.recovered_unsaved);
+            eprintln!(
+                "joffice: SESSION_FINALIZE sid={} discard={} unsaved={}",
+                st.sid,
+                discard,
+                st.unsaved()
+            );
+            if discard {
+                let _ = std::fs::remove_dir_all(&st.dir);
+            }
+        }
+    }
+
+    /// The bridge secret check (hardening): state-affecting
+    /// commands must carry the per-process secret the config
+    /// script injected. A mismatch is logged and refused.
+    fn check_secret(&self, msg: &BridgeMsg) -> bool {
+        let ok = msg
+            .args
+            .get("secret")
+            .and_then(|v| v.as_str())
+            .map(|s| s == self.secret)
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("joffice: BRIDGE_REJECT cmd={} (secret)", msg.cmd);
+        }
+        ok
     }
 
     /// After a successful save write: refresh the stamp, and
@@ -2548,6 +3342,7 @@ fn x2t_convert_sync(
     theme_dir: Option<&Path>,
     csv_delim: Option<i32>,
     pdfa: bool,
+    media: &[(String, PathBuf)],
 ) -> Result<Vec<u8>, String> {
     let t_start = std::time::Instant::now();
     let stem = temp_stem("x2t");
@@ -2567,9 +3362,30 @@ fn x2t_convert_sync(
 
     // x2t infers from extensions: the input extension must be right.
     // Copy the input to a temp file with its real extension if needed.
+    // The copy lives in a PRIVATE conversion dir with a media/
+    // subdir beside it: x2t resolves a bin's by-name image
+    // references from <input dir>/media/ (the desktop layout —
+    // cycle 4 K6 drive finding). Staging the bin bare in the
+    // shared temp root lost every inserted image from every
+    // save, silently, until the SAVE_MEDIA_MISSING guard caught
+    // the dangling references.
     let from_ext = from.extension().and_then(|e| e.to_str()).unwrap_or("docx");
-    let from_tmp = tmpdir.join(format!("{stem}.in.{from_ext}"));
+    let conv_dir = tmpdir.join(format!("{stem}-conv"));
+    std::fs::create_dir_all(&conv_dir).map_err(|e| format!("create x2t conv dir: {e}"))?;
+    let from_tmp = conv_dir.join(format!("in.{from_ext}"));
     std::fs::copy(from, &from_tmp).map_err(|e| format!("stage input: {e}"))?;
+    if !media.is_empty() {
+        let mdir = conv_dir.join("media");
+        if std::fs::create_dir_all(&mdir).is_ok() {
+            let mut staged = 0;
+            for (name, src) in media {
+                if std::fs::copy(src, mdir.join(name)).is_ok() {
+                    staged += 1;
+                }
+            }
+            eprintln!("joffice: X2T_MEDIA staged={staged} of {}", media.len());
+        }
+    }
 
     let mut extra = String::new();
     if let Some(f) = format_from {
@@ -2658,7 +3474,7 @@ fn x2t_convert_sync(
     let out = run_x2t(x2t, &params_path, &extra_env)?;
 
     let _ = std::fs::remove_file(&params_path);
-    let _ = std::fs::remove_file(&from_tmp);
+    let _ = std::fs::remove_dir_all(&conv_dir);
     let _ = std::fs::remove_dir_all(&work_temp);
 
     if !out.status.success() {
@@ -2719,6 +3535,21 @@ fn x2t_convert_async(
     } else {
         None
     };
+    // Cycle 4 K6 fix: the document's staged media (inserted
+    // images under their staged names; extracted stored media)
+    // travels with the conversion — x2t resolves a bin's
+    // by-name image references from a media/ directory beside
+    // the input file (the desktop layout). Without it, every
+    // inserted image silently vanished from every save.
+    let media: Vec<(String, PathBuf)> = shell
+        .staged_images
+        .borrow()
+        .iter()
+        .filter_map(|(n, s)| match s {
+            ImageStage::Ready(p) => Some((n.clone(), p.clone())),
+            _ => None,
+        })
+        .collect();
     let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
     std::thread::spawn(move || {
         let result = x2t_convert_sync(
@@ -2731,6 +3562,7 @@ fn x2t_convert_async(
             theme_dir.as_deref(),
             csv_delim,
             pdfa,
+            &media,
         );
         let _ = tx.send(result);
     });
@@ -2980,6 +3812,16 @@ fn handle_uri_scheme(shell: &Rc<Shell>, req: &URISchemeRequest) {
         return;
     }
 
+    // Route /session/<sid>/... (cycle 4): editor bins, epoch
+    // seeds, chunked uploads. Only the ACTIVE session of this
+    // process is served — a sid minted by another window or
+    // process is refused (H3). GET streams files; POST is the
+    // upload endpoint and nothing else.
+    if let Some(rest) = rel.strip_prefix("session/") {
+        handle_session_route(shell, req, rest, &uri);
+        return;
+    }
+
     // Route /sdkjs/* to the sdkjs tree, /core-fonts/* to the
     // core-fonts tree; everything else to web-apps.
     let (root, sub) = match rel.strip_prefix("sdkjs/") {
@@ -3052,6 +3894,247 @@ fn handle_uri_scheme(shell: &Rc<Shell>, req: &URISchemeRequest) {
             req.finish_error(&mut err);
         }
     }
+}
+
+/// Finish a scheme request with a small JSON body + status
+/// (the session upload endpoint's replies).
+fn finish_json(req: &URISchemeRequest, status: u32, body: &serde_json::Value) {
+    let data = body.to_string().into_bytes();
+    let stream = gtk4::gio::MemoryInputStream::from_bytes(&gtk4::glib::Bytes::from(&data[..]));
+    let response = webkit6::URISchemeResponse::new(&stream, data.len() as i64);
+    response.set_status(status, None);
+    response.set_content_type("application/json");
+    let headers = webkit6::soup::MessageHeaders::new(webkit6::soup::MessageHeadersType::Response);
+    headers.append("Access-Control-Allow-Origin", "*");
+    response.set_http_headers(headers);
+    req.finish_with_response(&response);
+}
+
+/// Stream a file as a scheme response (session bins/seeds):
+/// the 240 MB editor bin must never be materialized as a
+/// base64 string NOR fully buffered by the handler.
+fn finish_stream_file(req: &URISchemeRequest, path: &Path) {
+    use gtk4::gio::prelude::*;
+    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    match gtk4::gio::File::for_path(path).read(None::<&gtk4::gio::Cancellable>) {
+        Ok(stream) => {
+            let response = webkit6::URISchemeResponse::new(&stream, len as i64);
+            response.set_status(200, None);
+            response.set_content_type("application/octet-stream");
+            let headers =
+                webkit6::soup::MessageHeaders::new(webkit6::soup::MessageHeadersType::Response);
+            headers.append("Access-Control-Allow-Origin", "*");
+            headers.append("Access-Control-Expose-Headers", "*");
+            response.set_http_headers(headers);
+            eprintln!(
+                "joffice: SESSION_SERVE path={} bytes={len}",
+                path.display()
+            );
+            req.finish_with_response(&response);
+        }
+        Err(e) => {
+            eprintln!("joffice: SESSION_SERVE_FAIL path={}: {e}", path.display());
+            let mut err = gtk4::glib::Error::new(
+                gtk4::gio::IOErrorEnum::NotFound,
+                "joffice: session file unreadable",
+            );
+            req.finish_error(&mut err);
+        }
+    }
+}
+
+/// Read a scheme request's full HTTP body (upload slices are
+/// ≤ 8 MiB by protocol; a hard cap refuses abuse).
+fn read_scheme_body(req: &URISchemeRequest, cap: usize) -> Option<Vec<u8>> {
+    use gtk4::gio::prelude::*;
+    let body = req.http_body()?;
+    let mut out = Vec::new();
+    loop {
+        match body.read_bytes(1 << 16, None::<&gtk4::gio::Cancellable>) {
+            Ok(bytes) => {
+                if bytes.is_empty() {
+                    break;
+                }
+                out.extend_from_slice(&bytes);
+                if out.len() > cap {
+                    return None;
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    Some(out)
+}
+
+/// The session route (cycle 4). `rest` is the path after
+/// /session/; `full_uri` carries the query string (?of=<n>).
+fn handle_session_route(shell: &Rc<Shell>, req: &URISchemeRequest, rest: &str, full_uri: &str) {
+    let mut parts = rest.splitn(2, '/');
+    let sid = parts.next().unwrap_or("");
+    let tail = parts.next().unwrap_or("");
+    let method = req
+        .http_method()
+        .map(|m| m.to_string())
+        .unwrap_or_else(|| "GET".to_string());
+    // The sid must be THIS process's active session.
+    let session_dir = {
+        let sess = shell.session.borrow();
+        match sess.as_ref() {
+            Some(st) if st.sid == sid => st.dir.clone(),
+            _ => {
+                eprintln!("joffice: SCHEME_SID_REJECT sid={sid} tail={tail} method={method}");
+                finish_json(req, 403, &serde_json::json!({ "ok": false, "error": "sid" }));
+                return;
+            }
+        }
+    };
+    if method == "GET" {
+        if tail == "editor.bin" {
+            let epoch = shell
+                .session
+                .borrow()
+                .as_ref()
+                .map(|st| st.epoch)
+                .unwrap_or(0);
+            let path = if epoch == 0 {
+                session_dir.join("seed.bin")
+            } else {
+                session_dir.join(format!("seed-{epoch}.bin"))
+            };
+            finish_stream_file(req, &path);
+            return;
+        }
+        if let Some(n) = tail
+            .strip_prefix("seed-")
+            .and_then(|s| s.strip_suffix(".bin"))
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            let path = if n == 0 {
+                session_dir.join("seed.bin")
+            } else {
+                session_dir.join(format!("seed-{n}.bin"))
+            };
+            finish_stream_file(req, &path);
+            return;
+        }
+        eprintln!("joffice: SESSION_GET_404 tail={tail}");
+        finish_json(req, 404, &serde_json::json!({ "ok": false, "error": "not-found" }));
+        return;
+    }
+    if method == "POST" {
+        // Uploads carry the bridge secret as a header — a
+        // scheme request has no other credential channel.
+        let secret_ok = req
+            .http_headers()
+            .and_then(|h| h.one("X-JOffice-Secret"))
+            .map(|v| v.to_string() == shell.secret)
+            .unwrap_or(false);
+        if !secret_ok {
+            eprintln!("joffice: UPLOAD_REJECT tail={tail} (secret)");
+            finish_json(req, 403, &serde_json::json!({ "ok": false, "error": "secret" }));
+            return;
+        }
+        // upload/<kind>/<key>/<i>  — one slice; upload/<kind>/<key>/commit — assemble.
+        let segs: Vec<&str> = tail.split('/').collect();
+        if segs.len() == 4 && segs[0] == "upload" {
+            let kind = segs[1];
+            let key = segs[2];
+            let last = segs[3];
+            if !kind.chars().all(|c| c.is_ascii_alphanumeric())
+                || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            {
+                finish_json(req, 400, &serde_json::json!({ "ok": false, "error": "name" }));
+                return;
+            }
+            let uploads = session_dir.join("uploads");
+            if last == "commit" {
+                let body = match read_scheme_body(req, 65536) {
+                    Some(b) => b,
+                    None => {
+                        finish_json(req, 400, &serde_json::json!({ "ok": false, "error": "body" }));
+                        return;
+                    }
+                };
+                let spec: serde_json::Value =
+                    serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                let of = spec.get("of").and_then(|v| v.as_u64()).unwrap_or(0);
+                let want_len = spec.get("len").and_then(|v| v.as_u64()).unwrap_or(u64::MAX);
+                let mut assembled = Vec::new();
+                // of == 0 is the zero-length upload (U0): the
+                // client commits directly with no slices.
+                let mut ok = of > 0 || want_len == 0;
+                for i in 0..of {
+                    match std::fs::read(uploads.join(format!("{kind}-{key}.part{i}"))) {
+                        Ok(part) => assembled.extend_from_slice(&part),
+                        Err(_) => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok && assembled.len() as u64 != want_len {
+                    ok = false;
+                }
+                if !ok {
+                    eprintln!(
+                        "joffice: UPLOAD_COMMIT_FAIL kind={kind} key={key} of={of} got={} want={want_len}",
+                        assembled.len()
+                    );
+                    finish_json(req, 400, &serde_json::json!({ "ok": false, "error": "assemble" }));
+                    return;
+                }
+                let dest = uploads.join(format!("{kind}-{key}.bin"));
+                let tmp = uploads.join(format!("{kind}-{key}.tmp"));
+                if std::fs::write(&tmp, &assembled).is_ok() {
+                    let _ = std::fs::rename(&tmp, &dest);
+                }
+                for i in 0..of {
+                    let _ = std::fs::remove_file(uploads.join(format!("{kind}-{key}.part{i}")));
+                }
+                let sha = hex32(&sha256(&assembled));
+                eprintln!(
+                    "joffice: UPLOAD_COMMIT kind={kind} key={key} bytes={} sha256={sha}",
+                    assembled.len()
+                );
+                finish_json(
+                    req,
+                    200,
+                    &serde_json::json!({ "ok": true, "bytes": assembled.len(), "sha256": sha }),
+                );
+                return;
+            }
+            // A slice: last is the index.
+            if let Ok(idx) = last.parse::<u64>() {
+                let body = match read_scheme_body(req, 16 * 1024 * 1024) {
+                    Some(b) => b,
+                    None => {
+                        finish_json(req, 413, &serde_json::json!({ "ok": false, "error": "size" }));
+                        return;
+                    }
+                };
+                let part = uploads.join(format!("{kind}-{key}.part{idx}"));
+                match std::fs::write(&part, &body) {
+                    Ok(()) => {
+                        eprintln!(
+                            "joffice: UPLOAD_PART kind={kind} key={key} idx={idx} bytes={}",
+                            body.len()
+                        );
+                        finish_json(req, 200, &serde_json::json!({ "ok": true, "bytes": body.len() }));
+                    }
+                    Err(e) => {
+                        eprintln!("joffice: UPLOAD_PART_FAIL kind={kind} key={key}: {e}");
+                        finish_json(req, 500, &serde_json::json!({ "ok": false, "error": "write" }));
+                    }
+                }
+                return;
+            }
+        }
+        eprintln!("joffice: SESSION_POST_404 tail={tail}");
+        finish_json(req, 404, &serde_json::json!({ "ok": false, "error": "not-found" }));
+        return;
+    }
+    eprintln!("joffice: SESSION_METHOD_DENY method={method} tail={tail}");
+    finish_json(req, 405, &serde_json::json!({ "ok": false, "error": "method" }));
 }
 
 /// Finish a font-scheme request with an explicit status and
@@ -3257,6 +4340,32 @@ fn handle_font_scheme(shell: &Shell, req: &URISchemeRequest) {
 // file's state, so it cannot make the document dirty.)
 // ---------------------------------------------------------------------------
 
+/// Cycle 4 journal-mode guard for the §6a shortcuts: in
+/// journal mode the editor calls a document "unmodified" once
+/// a flush has journaled its changes, but the bound file does
+/// not hold them yet. The shortcuts (no-op Ctrl+S, byte-copy
+/// Save As) are only honest when the session has no unsaved
+/// journal items. The shim applies the same rule to the
+/// `unmodified` flag it sends; this is the belt-and-braces
+/// side (a record can land between the snapshot and a dialog
+/// response).
+/// Journal machinery applies to the production "journal"
+/// mode and to E0's "m1" alias alike (m1 is the journal
+/// design under its experiment label).
+fn journal_mode(mode: &str) -> bool {
+    mode == "journal" || mode == "m1"
+}
+
+fn journal_pending(shell: &Rc<Shell>) -> bool {
+    if !journal_mode(&shell.flush_mode) {
+        return false;
+    }
+    match shell.session.borrow().as_ref() {
+        Some(st) => st.unsaved() > 0 || st.recovered_unsaved,
+        None => false,
+    }
+}
+
 fn shell_is_dirty(shell: &Rc<Shell>) -> bool {
     if *shell.cell_editing.borrow() {
         return true;
@@ -3318,6 +4427,14 @@ fn evaluate_close(shell: &Rc<Shell>) {
 }
 
 fn destroy_window(shell: &Rc<Shell>) {
+    // Session finalize (cycle 4): every shell-initiated
+    // teardown passes through here. (GTK4's widget destroy
+    // signal does not fire on window teardown, so the
+    // connect_destroy hook alone never ran — found by the K1
+    // drive: the session survived a save-and-close.) A crash
+    // or kill bypasses this funnel, which is precisely what
+    // leaves the session for the recovery offer.
+    shell.session_finalize_destroy();
     if let Some(win) = shell.window.borrow().as_ref() {
         win.destroy();
     }
@@ -3437,6 +4554,7 @@ fn show_close_prompt(shell: &Rc<Shell>, unknown: bool) {
         let cp = close_prompt.clone();
         discard_btn.connect_clicked(move |_| {
             cp(&shell_c);
+            *shell_c.session_discard.borrow_mut() = true;
             destroy_window(&shell_c);
         });
         buttons.append(&discard_btn);
@@ -3455,6 +4573,7 @@ fn show_close_prompt(shell: &Rc<Shell>, unknown: bool) {
         let cp = close_prompt.clone();
         discard_btn.connect_clicked(move |_| {
             cp(&shell_c);
+            *shell_c.session_discard.borrow_mut() = true;
             destroy_window(&shell_c);
         });
         buttons.append(&discard_btn);
@@ -3546,12 +4665,21 @@ fn refuse_encrypted(shell: &Rc<Shell>, path: &Path) {
 /// cleared first.
 fn extract_doc_media(shell: &Rc<Shell>, path: &Path) {
     {
+        // Remove the staged files by their RECORDED paths:
+        // inserted images may live in the session media dir
+        // (K6 fix), not the process media dir.
         let mut staged = shell.staged_images.borrow_mut();
-        let names: Vec<String> = staged.keys().cloned().collect();
+        let paths: Vec<PathBuf> = staged
+            .values()
+            .filter_map(|s| match s {
+                ImageStage::Ready(p) => Some(p.clone()),
+                _ => None,
+            })
+            .collect();
         staged.clear();
         drop(staged);
-        for n in names {
-            let _ = std::fs::remove_file(shell.media_dir.join(&n));
+        for p in paths {
+            let _ = std::fs::remove_file(&p);
         }
     }
     let Ok(data) = std::fs::read(path) else { return };
@@ -3632,6 +4760,75 @@ fn save_output_sane(dest: &Path, bytes: &[u8]) -> bool {
         }
         _ => !bytes.is_empty(),
     }
+}
+
+/// Media-reference integrity of a converted OOXML package
+/// (cycle 4, K6): every internal relationship whose target
+/// resolves into a */media/ part must name a part that is
+/// actually in the package. x2t writes the reference even
+/// when the editor could not supply the image bytes (a staged
+/// insert lost across a crash, pre-fix), producing a document
+/// that points at a missing image — plausible-but-wrong
+/// output the save must refuse, never rename over the user's
+/// file. Returns the resolved part names that are missing.
+fn media_refs_missing(bytes: &[u8]) -> Vec<String> {
+    let Some(entries) = zip_central_dir(bytes) else {
+        return Vec::new();
+    };
+    let names: std::collections::HashSet<&str> =
+        entries.iter().map(|e| e.name.as_str()).collect();
+    let mut missing = Vec::new();
+    for e in &entries {
+        if !e.name.ends_with(".rels") {
+            continue;
+        }
+        let Some(text) = zip_part_text(bytes, &entries, &e.name) else {
+            continue;
+        };
+        // The rels part "word/_rels/document.xml.rels" belongs
+        // to "word/document.xml": its base dir is "word/".
+        let base: String = match e.name.find("/_rels/") {
+            Some(idx) => e.name[..idx + 1].to_string(),
+            None if e.name.starts_with("_rels/") => String::new(),
+            _ => continue,
+        };
+        for chunk in text.split("<Relationship").skip(1) {
+            let chunk = chunk.split('>').next().unwrap_or("");
+            if chunk.contains("TargetMode=\"External\"") {
+                continue;
+            }
+            let Some(tstart) = chunk.find("Target=\"") else {
+                continue;
+            };
+            let rest = &chunk[tstart + 8..];
+            let Some(tend) = rest.find('"') else { continue };
+            let target = &rest[..tend];
+            if target.contains("://") {
+                continue;
+            }
+            let resolved = if let Some(abs) = target.strip_prefix('/') {
+                abs.to_string()
+            } else {
+                // Join with the base dir, resolving . and ..
+                let joined = format!("{base}{target}");
+                let mut parts: Vec<&str> = Vec::new();
+                for seg in joined.split('/') {
+                    match seg {
+                        "" | "." => {}
+                        ".." => {
+                            parts.pop();
+                        }
+                        s => parts.push(s),
+                    }
+                }
+                parts.join("/")
+            };
+            if resolved.contains("/media/") && !names.contains(resolved.as_str()) {
+                missing.push(resolved);
+            }
+        }
+    }
+    missing
 }
 
 /// Parse a page-range spec ("2-3", "1,3-5", "4") into 1-based
@@ -3829,6 +5026,94 @@ fn probe_print_environment() {
 /// round-trip). `origin` is Some when the reply belongs to a
 /// saveFile cycle (save_done bookkeeping applies), None for a
 /// direct printRequest on a PDF window.
+/// ViewOnly "Save a Copy…" (cycle 4 step 4): the pinned
+/// view-mode pdfeditor emits no save gesture at all (cycle 3
+/// PO2), so the copy is a host action: the existing save
+/// dialog (default: the source's filename, in the source's
+/// folder), the source path itself refused, then an atomic
+/// copy (temp + rename + fsync via write_atomic) that never
+/// touches the source. Completion surfaces as a banner toast.
+fn begin_save_copy(shell: &Rc<Shell>) {
+    let (policy, src) = {
+        let doc = shell.doc.borrow();
+        (
+            doc.as_ref().map(|d| d.policy),
+            doc.as_ref().and_then(|d| d.path.clone()),
+        )
+    };
+    if policy != Some(Policy::ViewOnly) {
+        return;
+    }
+    let Some(src) = src else { return };
+    let Some(parent) = shell.window.borrow().clone() else {
+        return;
+    };
+    if shell.active_dialog.borrow().is_some() {
+        return;
+    }
+    let dialog = FileChooserNative::new(
+        Some("Save a Copy"),
+        Some(&parent),
+        FileChooserAction::Save,
+        Some("_Save"),
+        Some("_Cancel"),
+    );
+    if let Some(name) = src.file_name() {
+        dialog.set_current_name(&name.to_string_lossy());
+    }
+    if let Some(dir) = src.parent() {
+        let _ = dialog.set_current_folder(Some(&gtk4::gio::File::for_path(dir)));
+    }
+    *shell.active_dialog.borrow_mut() = Some(dialog.clone());
+    let shell_c = shell.clone();
+    dialog.connect_response(move |d, resp| {
+        *shell_c.active_dialog.borrow_mut() = None;
+        if resp != ResponseType::Accept {
+            return;
+        }
+        let Some(dest) = d.file().and_then(|f| f.path()) else {
+            return;
+        };
+        let same = src.canonicalize().ok() == dest.canonicalize().ok()
+            && src.canonicalize().is_ok();
+        if same {
+            eprintln!("joffice: COPY_REFUSED_SAME {}", dest.display());
+            show_save_banner(
+                &shell_c,
+                "That is the open file itself — choose a different name or folder for the copy.",
+            );
+            return;
+        }
+        // Synchronous on the GTK thread: a file copy is short
+        // disk IO, and Rc<Shell> cannot cross a thread boundary.
+        let result = std::fs::read(&src)
+            .map_err(|e| format!("read {}: {e}", src.display()))
+            .and_then(|bytes| {
+                write_atomic(&dest, &bytes)
+                    .map_err(|e| format!("write {}: {e}", dest.display()))
+            });
+        match result {
+            Ok(()) => {
+                eprintln!("joffice: COPY_OK {} -> {}", src.display(), dest.display());
+                show_save_banner(
+                    &shell_c,
+                    &format!(
+                        "Copy saved to {}",
+                        dest.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    ),
+                );
+            }
+            Err(e) => {
+                eprintln!("joffice: COPY_FAIL {e}");
+                show_save_banner(&shell_c, &format!("Copy failed: {e}"));
+            }
+        }
+    });
+    dialog.show();
+}
+
 fn begin_print(
     shell: &Rc<Shell>,
     reply: Option<(ScriptMessageReply, Context)>,
@@ -4087,6 +5372,39 @@ fn write_save_checked(
             dest.display()
         ));
     }
+    // K6 guard: an OOXML output whose relationships point at
+    // media parts that are not in the package is refused —
+    // writing it would hand the user a document with a
+    // dangling image reference.
+    {
+        let ext = dest
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if matches!(ext.as_str(), "docx" | "xlsx" | "pptx") {
+            let missing = media_refs_missing(bytes);
+            if !missing.is_empty() {
+                eprintln!(
+                    "joffice: SAVE_MEDIA_MISSING dest={} missing={missing:?}",
+                    dest.display()
+                );
+                // Diagnostic dump (support): with
+                // JOFFICE_DUMP_REFUSED=<path> set, the refused
+                // bytes are kept for inspection instead of
+                // vanishing with the conversion temp dir.
+                if let Ok(dump) = std::env::var("JOFFICE_DUMP_REFUSED") {
+                    if !dump.is_empty() {
+                        let _ = std::fs::write(&dump, bytes);
+                        eprintln!("joffice: SAVE_REFUSED_DUMP path={dump}");
+                    }
+                }
+                return Err(format!(
+                    "save refused: the converted output references media missing from the package ({}). Your original file was not touched.",
+                    missing.join(", ")
+                ));
+            }
+        }
+    }
     shell.check_unchanged(dest)?;
     if seq <= *shell.save_written_seq.borrow() {
         eprintln!(
@@ -4098,6 +5416,20 @@ fn write_save_checked(
     write_atomic(dest, bytes).map_err(|e| format!("save write: {e}"))?;
     *shell.save_written_seq.borrow_mut() = seq;
     shell.note_save_completed(dest);
+    // Cycle 4: the session manifest tracks BOUND writes only —
+    // a write to the session's own bound path. Exports land
+    // here too (other dest): they must not rebind the session.
+    // Adoptions rebind via note_document_opened instead.
+    let is_bound = shell
+        .session
+        .borrow()
+        .as_ref()
+        .map(|st| st.bound_path.as_deref() == Some(dest))
+        .unwrap_or(false);
+    if is_bound {
+        let hist = shell.pending_hist_index.borrow_mut().take();
+        shell.session_on_bound_save(dest, hist);
+    }
     Ok(true)
 }
 
@@ -4203,6 +5535,10 @@ fn handle_bridge(
         }
 
         "openFileDialog" => {
+            // Cycle 4: dual-channel open-reply sequence (the
+            // dialog's response is a deferred reply, same
+            // garbling exposure as the x2t completion).
+            let open_seq = msg.args.get("openSeq").and_then(|v| v.as_u64());
             // A dialog is already open: reject instead of overwriting
             // active_dialog (which would drop the first dialog mid-flight).
             if shell.active_dialog.borrow().is_some() {
@@ -4247,22 +5583,41 @@ fn handle_bridge(
                             .map(|n| n.to_string_lossy().into_owned())
                             .unwrap_or_default();
                         let handle = shell_c.handles.borrow_mut().insert(path);
-                        reply_json(
+                        reply_open(
+                            &shell_c,
                             &reply_c,
                             &ctx_c,
                             &serde_json::json!({ "handle": handle, "name": name }),
+                            open_seq,
                         );
                     } else {
-                        reply_json(&reply_c, &ctx_c, &serde_json::json!({ "handle": null }));
+                        reply_open(
+                            &shell_c,
+                            &reply_c,
+                            &ctx_c,
+                            &serde_json::json!({ "handle": null }),
+                            open_seq,
+                        );
                     }
                 } else {
-                    reply_json(&reply_c, &ctx_c, &serde_json::json!({ "handle": null }));
+                    reply_open(
+                        &shell_c,
+                        &reply_c,
+                        &ctx_c,
+                        &serde_json::json!({ "handle": null }),
+                        open_seq,
+                    );
                 }
             });
             dialog.show();
         }
 
         "openFile" | "convertFile" => {
+            // Cycle 4: the shim's dual-channel open-reply
+            // sequence (see reply_open). Synchronous replies in
+            // this arm (recovery serve, PDF, encrypted refusal)
+            // don't need it; the deferred x2t completion does.
+            let open_seq = msg.args.get("openSeq").and_then(|v| v.as_u64());
             let handle = msg.args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let path = match shell.handles.borrow().resolve(handle) {
                 Some(p) => p,
@@ -4271,6 +5626,125 @@ fn handle_bridge(
                     return;
                 }
             };
+            // Cycle 4 recovery intercept: the launcher armed a
+            // crashed session for exactly this path — serve its
+            // seed + folded journal instead of converting the
+            // bound file (which may be older OR newer; the
+            // journal replays over the seed either way, and the
+            // F0 fingerprint in doc_stamp makes the first save
+            // run the external-change check — K4/K7).
+            if shell.recovery_arm.borrow().is_some() {
+                let arm_sid = shell.recovery_arm.borrow_mut().take().unwrap();
+                match load_recovery_session(shell, &arm_sid) {
+                    Some((st, folded, gap)) if st.bound_path.as_deref() == Some(path.as_path()) => {
+                        let name = st.name.clone();
+                        let code = st.origin_code;
+                        let sid = st.sid.clone();
+                        let epoch = st.epoch;
+                        let base = st.base;
+                        let seed_len = std::fs::metadata(st.seed_path(epoch))
+                            .map(|m| m.len())
+                            .unwrap_or(0);
+                        *shell.current_path.borrow_mut() = Some(path.clone());
+                        if let Some(fp) = st.fp {
+                            *shell.doc_stamp.borrow_mut() =
+                                Some((path.clone(), stamp_from_fingerprint(&fp)));
+                        }
+                        set_doc_state(shell, Some(path.clone()), code, false);
+                        shell.session_rotate_out();
+                        let journal_on = journal_mode(&shell.flush_mode);
+                        let n_frames = st.next_seq - 1;
+                        *shell.session.borrow_mut() = Some(st);
+                        eprintln!(
+                            "joffice: RECOVERY_SERVE sid={sid} epoch={epoch} folded={} gap={gap} seed_bytes={seed_len}",
+                            folded.len()
+                        );
+                        // Cycle 4 K6 fix, second half: the
+                        // normal open path registers the bound
+                        // file's STORED media via
+                        // extract_doc_media; the recovery path
+                        // skipped it, so a recovered window's
+                        // saves resolved inserted images but
+                        // dropped every stored one (the
+                        // SAVE_MEDIA_MISSING guard caught the
+                        // dangling references). Extract BEFORE
+                        // the session-media registration below:
+                        // extract clears staged_images (the
+                        // new-open replacement semantics), and
+                        // the inserts must survive it.
+                        extract_doc_media(shell, &path);
+                        // Cycle 4 K6 fix: re-register the
+                        // recovered session's staged media
+                        // (inserted images live only there) so
+                        // docmedia requests in this process
+                        // serve them instead of holding into a
+                        // timeout and losing the image at save.
+                        {
+                            let media_dir = sessions_root().join(&sid).join("media");
+                            let mut registered = 0;
+                            if let Ok(rd) = std::fs::read_dir(&media_dir) {
+                                for ent in rd.flatten() {
+                                    let p = ent.path();
+                                    if p.is_file() {
+                                        if let Some(n) =
+                                            p.file_name().map(|n| n.to_string_lossy().into_owned())
+                                        {
+                                            shell
+                                                .staged_images
+                                                .borrow_mut()
+                                                .insert(n, ImageStage::Ready(p));
+                                            registered += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            eprintln!(
+                                "joffice: RECOVERY_MEDIA sid={sid} registered={registered}"
+                            );
+                        }
+                        let mut reply_v = serde_json::json!({
+                            "name": name, "boundSaved": false,
+                            "sid": sid, "journal": journal_on,
+                            "epoch": epoch, "base": base, "seq": n_frames,
+                            "openChanges": folded.len(),
+                            "recovery": { "folded": folded, "gap": gap },
+                        });
+                        if seed_len > 64 * 1024 * 1024 {
+                            reply_v["binUrl"] =
+                                serde_json::json!(format!("joffice:///session/{sid}/editor.bin"));
+                            reply_v["binBytes"] = serde_json::json!(seed_len);
+                        } else {
+                            let seed_path = sessions_root().join(&arm_sid).join(
+                                if epoch == 0 {
+                                    "seed.bin".to_string()
+                                } else {
+                                    format!("seed-{epoch}.bin")
+                                },
+                            );
+                            match std::fs::read(&seed_path) {
+                                Ok(bytes) => {
+                                    use base64::Engine;
+                                    reply_v["data"] = serde_json::json!(
+                                        base64::engine::general_purpose::STANDARD.encode(&bytes)
+                                    );
+                                }
+                                Err(e) => {
+                                    reply_err(reply, format!("recovery seed read: {e}"));
+                                    return;
+                                }
+                            }
+                        }
+                        reply_json(reply, ctx, &reply_v);
+                        return;
+                    }
+                    Some(_) => {
+                        eprintln!("joffice: RECOVERY_ARM_PATH_MISMATCH sid={arm_sid}");
+                    }
+                    None => {
+                        eprintln!("joffice: RECOVERY_ARM_UNUSABLE sid={arm_sid}");
+                    }
+                }
+            }
             if detect_format(&path) == Detected::Encrypted {
                 refuse_encrypted(shell, &path);
                 reply_err(
@@ -4295,6 +5769,9 @@ fn handle_bridge(
                     *shell.current_path.borrow_mut() = Some(path.clone());
                     shell.note_document_opened(&path);
                     set_doc_state(shell, Some(path.clone()), fmt::PDF, false);
+                    // A PDF replaces any journaled document in
+                    // this window (cycle 4): retire its session.
+                    shell.session_rotate_out();
                     eprintln!(
                         "joffice: DOC-DETECT path={} code=513 policy=ViewOnly",
                         path.display()
@@ -4367,11 +5844,70 @@ fn handle_bridge(
                     extract_doc_media(shell, &path);
                 }
             }
+            let is_open_conv = msg.cmd == "openFile"
+                || msg.args
+                    .get("forOpen")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
             let reply_c = reply.clone();
             let ctx_c = ctx.clone();
+            let shell_conv = shell.clone();
             x2t_convert_async(shell, path, fmt::BIN, None, false, move |result| match result {
                 Ok(bytes) => {
                     use base64::Engine;
+                    // Cycle 4: an OPEN conversion creates the
+                    // document session (seed = these bytes) and
+                    // picks the transport by size — session URL
+                    // over 64 MB, base64 below (round 2 §D).
+                    if is_open_conv {
+                        let (bound, code) = {
+                            let doc = shell_conv.doc.borrow();
+                            match doc.as_ref() {
+                                Some(d) => (d.path.clone(), d.origin_code),
+                                None => (None, fmt::DOCX),
+                            }
+                        };
+                        shell_conv.session_rotate_out();
+                        if let Some(sid) =
+                            shell_conv.session_create(bound, &name, code, &bytes)
+                        {
+                            let journal_on = journal_mode(&shell_conv.flush_mode);
+                            if bytes.len() > 64 * 1024 * 1024 {
+                                eprintln!(
+                                    "joffice: OPEN_TRANSPORT url sid={sid} bin_bytes={}",
+                                    bytes.len()
+                                );
+                                reply_open(
+                                    &shell_conv,
+                                    &reply_c,
+                                    &ctx_c,
+                                    &serde_json::json!({
+                                        "binUrl": format!("joffice:///session/{sid}/editor.bin"),
+                                        "binBytes": bytes.len(),
+                                        "images": {}, "name": name,
+                                        "boundSaved": bound_saved,
+                                        "sid": sid, "journal": journal_on,
+                                    }),
+                                    open_seq,
+                                );
+                                return;
+                            }
+                            let b64 =
+                                base64::engine::general_purpose::STANDARD.encode(&bytes);
+                            reply_open(
+                                &shell_conv,
+                                &reply_c,
+                                &ctx_c,
+                                &serde_json::json!({
+                                    "data": b64, "images": {}, "name": name,
+                                    "boundSaved": bound_saved,
+                                    "sid": sid, "journal": journal_on,
+                                }),
+                                open_seq,
+                            );
+                            return;
+                        }
+                    }
                     let t_enc = std::time::Instant::now();
                     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                     eprintln!(
@@ -4379,14 +5915,307 @@ fn handle_bridge(
                         t_enc.elapsed().as_millis(),
                         bytes.len()
                     );
-                    reply_json(
+                    reply_open(
+                        &shell_conv,
                         &reply_c,
                         &ctx_c,
                         &serde_json::json!({ "data": b64, "images": {}, "name": name, "boundSaved": bound_saved }),
+                        open_seq,
                     );
                 }
-                Err(e) => reply_err(&reply_c, e),
+                Err(e) => {
+                    if let Some(seq) = open_seq {
+                        deliver_open_reply_js(
+                            &shell_conv,
+                            seq,
+                            &serde_json::json!({ "error": e }),
+                        );
+                    }
+                    reply_err(&reply_c, e)
+                }
             });
+        }
+
+        "driveEvalResult" => {
+            // The env-gated drive hook's return channel: the
+            // evaluated script reports its JSON result here and
+            // it lands in the eval dir for the drive to read.
+            // Only wired when JOFFICE_EVAL_DIR is set.
+            if let Ok(dir) = std::env::var("JOFFICE_EVAL_DIR") {
+                let id = msg
+                    .args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("eval")
+                    .to_string();
+                let result = msg
+                    .args
+                    .get("result")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("{}")
+                    .to_string();
+                let _ = std::fs::write(
+                    PathBuf::from(dir).join(format!("{id}.result")),
+                    result,
+                );
+            }
+            reply_json(reply, ctx, &serde_json::json!({ "ok": true }));
+        }
+
+        "journalAppend" => {
+            // Mode J: one change record from the saveChanges
+            // wrap. Rust appends strictly in seq order (a
+            // reorder buffer absorbs transport stragglers —
+            // D1), frames it with length + CRC32, fdatasyncs,
+            // and maintains the live fold the recovery path
+            // would replay.
+            if !shell.check_secret(msg) {
+                reply_err(reply, "journalAppend: secret".to_string());
+                return;
+            }
+            let sid = msg.args.get("sid").and_then(|v| v.as_str()).unwrap_or("");
+            let epoch = msg.args.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let seq = msg.args.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+            let changes: Option<Vec<String>> = match msg.args.get("changes") {
+                Some(c) => c.as_array().map(|a| {
+                    a.iter()
+                        .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                        .collect()
+                }),
+                None => {
+                    // Upload reference: the payload JSON the
+                    // shim POSTed to the session endpoint.
+                    let up = msg.args.get("uploadRef").and_then(|v| v.as_u64());
+                    let sess_dir = shell
+                        .session
+                        .borrow()
+                        .as_ref()
+                        .map(|st| st.dir.clone());
+                    match (up, sess_dir) {
+                        (Some(n), Some(dir)) => {
+                            let p = dir.join("uploads").join(format!("journal-{n}.bin"));
+                            let parsed = std::fs::read(&p).ok().and_then(|bytes| {
+                                serde_json::from_slice::<serde_json::Value>(&bytes).ok()
+                            });
+                            let _ = std::fs::remove_file(&p);
+                            parsed.and_then(|v| {
+                                v.as_array().map(|a| {
+                                    a.iter()
+                                        .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                                        .collect()
+                                })
+                            })
+                        }
+                        _ => None,
+                    }
+                }
+            };
+            let changes = match changes {
+                Some(c) => c,
+                None => {
+                    reply_err(reply, "journalAppend: no changes".to_string());
+                    return;
+                }
+            };
+            let frame = JournalFrame {
+                delete_index: msg.args.get("deleteIndex").and_then(|d| d.as_i64()),
+                changes,
+            };
+            let mut sess = shell.session.borrow_mut();
+            let st = match sess.as_mut() {
+                Some(s) if s.sid == sid => s,
+                _ => {
+                    reply_err(reply, "journalAppend: no such session".to_string());
+                    return;
+                }
+            };
+            if epoch != st.epoch {
+                eprintln!(
+                    "joffice: JOURNAL_EPOCH_MISMATCH sid={sid} got={epoch} want={}",
+                    st.epoch
+                );
+                reply_json(reply, ctx, &serde_json::json!({ "ok": false, "error": "epoch" }));
+                return;
+            }
+            if seq < st.next_seq {
+                eprintln!("joffice: JOURNAL_DUP_SEQ seq={seq} next={}", st.next_seq);
+                reply_json(reply, ctx, &serde_json::json!({ "ok": true, "dup": true }));
+                return;
+            }
+            if seq > st.next_seq {
+                st.reorder.insert(seq, frame);
+                eprintln!(
+                    "joffice: JOURNAL_BUFFERED seq={seq} next={} depth={}",
+                    st.next_seq,
+                    st.reorder.len()
+                );
+                reply_json(reply, ctx, &serde_json::json!({ "ok": true, "buffered": true }));
+                return;
+            }
+            // In-order: append this frame, then drain the
+            // reorder buffer while the front is contiguous.
+            let mut to_apply = vec![(seq, frame)];
+            let mut next = seq + 1;
+            while let Some(f) = st.reorder.remove(&next) {
+                to_apply.push((next, f));
+                next += 1;
+            }
+            for (s, f) in &to_apply {
+                if let Err(e) = st.append_frame(epoch, f) {
+                    eprintln!("joffice: JOURNAL_APPEND_IO seq={s}: {e}");
+                    reply_json(
+                        reply,
+                        ctx,
+                        &serde_json::json!({ "ok": false, "error": "io" }),
+                    );
+                    return;
+                }
+                if let Err(e) = fold_one(&mut st.folded, &mut st.fold_base, f) {
+                    // The fold diverging is a recovery-time
+                    // hazard, not an append failure: the frame
+                    // is durable; the fold stops here and a
+                    // later recovery replays the prefix + says
+                    // so. Logged at full strength.
+                    eprintln!("joffice: JOURNAL_FOLD_STOP seq={s}: {e}");
+                }
+            }
+            st.next_seq = next;
+            st.write_manifest();
+            if to_apply.len() > 1 {
+                // Drained reorder-buffer frames are appends
+                // too — D1's audit reads them from this line.
+                let drained: Vec<String> =
+                    to_apply[1..].iter().map(|(s, _)| s.to_string()).collect();
+                eprintln!(
+                    "joffice: JOURNAL_DRAIN sid={sid} epoch={epoch} seqs={}",
+                    drained.join(",")
+                );
+            }
+            eprintln!(
+                "joffice: JOURNAL_APPEND sid={sid} epoch={epoch} seq={seq} folded={} unsaved={}",
+                st.folded.len(),
+                st.unsaved()
+            );
+            reply_json(
+                reply,
+                ctx,
+                &serde_json::json!({ "ok": true, "folded": st.folded.len() }),
+            );
+        }
+
+        "journalCheckpoint" => {
+            // An epoch checkpoint from the wrap: the snapshot
+            // bytes become seed-<epoch>.bin, committed by
+            // rename BEFORE any record of the new epoch is
+            // appended (journalAppend enforces epoch match).
+            if !shell.check_secret(msg) {
+                reply_err(reply, "journalCheckpoint: secret".to_string());
+                return;
+            }
+            let sid = msg.args.get("sid").and_then(|v| v.as_str()).unwrap_or("");
+            let epoch = msg.args.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let base = msg.args.get("base").and_then(|v| v.as_i64()).unwrap_or(0);
+            let trigger = msg
+                .args
+                .get("trigger")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let bytes: Option<Vec<u8>> = match msg.args.get("data").and_then(|v| v.as_str()) {
+                Some(b64) => {
+                    use base64::Engine;
+                    base64::engine::general_purpose::STANDARD.decode(b64).ok()
+                }
+                None => msg
+                    .args
+                    .get("uploadRef")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|n| {
+                        let dir = shell.session.borrow().as_ref()?.dir.clone();
+                        let p = dir.join("uploads").join(format!("ckpt-{n}.bin"));
+                        let b = std::fs::read(&p).ok();
+                        let _ = std::fs::remove_file(&p);
+                        b
+                    }),
+            };
+            let bytes = match bytes {
+                Some(b) if !b.is_empty() => b,
+                _ => {
+                    reply_err(reply, "journalCheckpoint: no bytes".to_string());
+                    return;
+                }
+            };
+            let mut sess = shell.session.borrow_mut();
+            let st = match sess.as_mut() {
+                Some(s) if s.sid == sid => s,
+                _ => {
+                    reply_err(reply, "journalCheckpoint: no such session".to_string());
+                    return;
+                }
+            };
+            if epoch != st.epoch + 1 {
+                eprintln!(
+                    "joffice: JOURNAL_CHECKPOINT_EPOCH sid={sid} got={epoch} want={}",
+                    st.epoch + 1
+                );
+                reply_json(reply, ctx, &serde_json::json!({ "ok": false, "error": "epoch" }));
+                return;
+            }
+            let seed_tmp = st.dir.join(format!("seed-{epoch}.bin.tmp"));
+            let seed_dest = st.seed_path(epoch);
+            use std::os::unix::fs::PermissionsExt;
+            if std::fs::write(&seed_tmp, &bytes).is_err()
+                || std::fs::rename(&seed_tmp, &seed_dest).is_err()
+            {
+                eprintln!("joffice: JOURNAL_CHECKPOINT_IO sid={sid} epoch={epoch}");
+                reply_json(reply, ctx, &serde_json::json!({ "ok": false, "error": "io" }));
+                return;
+            }
+            let _ = std::fs::set_permissions(&seed_dest, std::fs::Permissions::from_mode(0o600));
+            st.epoch = epoch;
+            st.base = base;
+            st.fold_base = base;
+            st.folded.clear();
+            st.next_seq = 1;
+            st.reorder.clear();
+            st.write_manifest();
+            eprintln!(
+                "joffice: JOURNAL_CHECKPOINT sid={sid} epoch={epoch} base={base} trigger={trigger} bytes={}",
+                bytes.len()
+            );
+            reply_json(reply, ctx, &serde_json::json!({ "ok": true }));
+        }
+
+        "recoveryOpened" => {
+            // The shim applied the folded journal over the
+            // seed: show the recovery banner (round 1 §3
+            // wording; the gap variant names the loss).
+            if !shell.check_secret(msg) {
+                reply_err(reply, "recoveryOpened: secret".to_string());
+                return;
+            }
+            let gap = msg.args.get("gap").and_then(|v| v.as_bool()).unwrap_or(false);
+            let name = shell
+                .session
+                .borrow()
+                .as_ref()
+                .map(|st| st.name.clone())
+                .unwrap_or_else(|| "document".to_string());
+            let text = if gap {
+                format!(
+                    "Recovered changes up to the last intact record — later changes were lost. Not yet saved to {name}."
+                )
+            } else {
+                format!("Recovered changes — not yet saved to {name}.")
+            };
+            if let Some(label) = shell.save_banner_label.borrow().as_ref() {
+                label.set_text(&text);
+            }
+            if let Some(rev) = shell.save_banner_revealer.borrow().as_ref() {
+                rev.set_reveal_child(true);
+            }
+            eprintln!("joffice: RECOVERY_BANNER gap={gap} name={name}");
+            reply_json(reply, ctx, &serde_json::json!({ "ok": true }));
         }
 
         "saveFile" => {
@@ -4396,7 +6225,18 @@ fn handle_bridge(
             // Rust owns the format policy from here: bound save,
             // Save As dialog, or the AskOnce prompt (round 1 §2/§4
             // + round 2 restatements 3/7/§D).
+            if !shell.check_secret(msg) {
+                reply_err(reply, "saveFile: secret".to_string());
+                return;
+            }
             *shell.saves_active.borrow_mut() += 1;
+            // The history index this save's bin was captured at
+            // (cycle 4): write_save_checked records it in the
+            // session manifest as last_bound_save_index.
+            *shell.pending_hist_index.borrow_mut() = msg
+                .args
+                .get("histIndex")
+                .and_then(|v| v.as_i64());
             let origin = msg
                 .args
                 .get("origin")
@@ -4469,11 +6309,52 @@ fn handle_bridge(
             }
             use base64::Engine;
             let t_dec = Instant::now();
-            let bin = match base64::engine::general_purpose::STANDARD.decode(b64) {
-                Ok(b) => b,
-                Err(e) => {
-                    save_fail(shell, reply, format!("saveFile: bad base64: {e}"), &origin);
-                    return;
+            // Cycle 4: the bin arrives base64 (small) or as an
+            // upload reference (large — the shim POSTed the
+            // getFile3 payload to the session endpoint in 8 MiB
+            // slices and Rust assembled it there).
+            let bin = if let Some(up) = msg.args.get("uploadRef").and_then(|v| v.as_u64()) {
+                let sess_dir = shell.session.borrow().as_ref().map(|st| st.dir.clone());
+                match sess_dir {
+                    Some(dir) => {
+                        let p = dir.join("uploads").join(format!("save-{up}.bin"));
+                        match std::fs::read(&p) {
+                            Ok(b) => {
+                                let _ = std::fs::remove_file(&p);
+                                eprintln!(
+                                    "joffice: SAVE_UPLOAD_REF seq={js_seq} bin_bytes={}",
+                                    b.len()
+                                );
+                                b
+                            }
+                            Err(e) => {
+                                save_fail(
+                                    shell,
+                                    reply,
+                                    format!("saveFile: upload read: {e}"),
+                                    &origin,
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    None => {
+                        save_fail(
+                            shell,
+                            reply,
+                            "saveFile: uploadRef without a session".to_string(),
+                            &origin,
+                        );
+                        return;
+                    }
+                }
+            } else {
+                match base64::engine::general_purpose::STANDARD.decode(b64) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        save_fail(shell, reply, format!("saveFile: bad base64: {e}"), &origin);
+                        return;
+                    }
                 }
             };
             eprintln!(
@@ -4565,6 +6446,58 @@ fn handle_bridge(
                 return;
             }
 
+            // E0 mode M3 (cycle 4 experiment): a flush-origin
+            // save converts to a WORKING-COPY path in the
+            // session dir — never the bound file — and completes
+            // with export semantics (the document stays dirty;
+            // the gesture's own save is still to come).
+            if shell.flush_mode == "m3" && origin == "changes" {
+                let wc = {
+                    let sess = shell.session.borrow();
+                    let dir = sess
+                        .as_ref()
+                        .map(|st| st.dir.clone())
+                        .unwrap_or_else(std::env::temp_dir);
+                    dir.join(format!(
+                        "workcopy.{}",
+                        ext_of_code(origin_code).unwrap_or("docx")
+                    ))
+                };
+                let shell_w = shell.clone();
+                let reply_w = reply.clone();
+                let ctx_w = ctx.clone();
+                let origin_w = origin.clone();
+                eprintln!("joffice: SAVE_WORKCOPY seq={js_seq} dest={}", wc.display());
+                x2t_convert_async(
+                    shell,
+                    tmp_bin,
+                    origin_code,
+                    None,
+                    false,
+                    move |result| match result {
+                        Ok(bytes) => match write_atomic(&wc, &bytes) {
+                            Ok(()) => {
+                                reply_save(
+                                    &shell_w,
+                                    &reply_w,
+                                    &ctx_w,
+                                    &serde_json::json!({ "ok": true, "export": true }),
+                                );
+                                save_done(&shell_w, true);
+                            }
+                            Err(e) => save_fail(
+                                &shell_w,
+                                &reply_w,
+                                format!("workcopy write: {e}"),
+                                &origin_w,
+                            ),
+                        },
+                        Err(e) => save_fail(&shell_w, &reply_w, e, &origin_w),
+                    },
+                );
+                return;
+            }
+
             // Route decision.
             enum Route {
                 Bound(i32),
@@ -4609,13 +6542,19 @@ fn handle_bridge(
                             "joffice: SAVE-UNEDITED refused: a failed save is outstanding; converting for real"
                         );
                     }
-                    if unmodified && !*shell.save_failed_outstanding.borrow() {
+                    if unmodified
+                        && !*shell.save_failed_outstanding.borrow()
+                        && !journal_pending(shell)
+                    {
                         // §6a (KAO round 1): an unedited document
                         // is never converted — Ctrl+S on an
                         // unedited bound doc is a no-op success.
                         // (Also covers the AskOnce keep-pref
                         // route: nothing to write, nothing to
-                        // ask about.)
+                        // ask about.) Cycle 4: journal_pending
+                        // defeats the no-op when the "unedited"
+                        // verdict only means "already flushed
+                        // to the journal".
                         let _ = std::fs::remove_file(&tmp_bin);
                         eprintln!(
                             "joffice: SAVE-UNEDITED no-op (code={code}, origin={origin})"
@@ -4864,8 +6803,23 @@ fn handle_bridge(
             let src = shell.handles.borrow().resolve(handle);
             match src {
                 Some(src) => {
-                    let _ = std::fs::create_dir_all(&shell.media_dir);
-                    let dest = shell.media_dir.join(&name);
+                    // Cycle 4 K6 fix: with a journal session
+                    // bound, the staged copy belongs in the
+                    // SESSION's media dir — it is the only copy
+                    // of an inserted image, the journal record
+                    // references it by name, and recovery (a new
+                    // process, same sid) re-registers it from
+                    // there. The per-process temp dir lost it
+                    // across a crash and the recovered save
+                    // wrote a dangling media reference. Without
+                    // a session there is no recovery to serve,
+                    // so the process dir is right.
+                    let dest_dir = match shell.session.borrow().as_ref() {
+                        Some(st) => st.dir.join("media"),
+                        None => shell.media_dir.clone(),
+                    };
+                    let _ = std::fs::create_dir_all(&dest_dir);
+                    let dest = dest_dir.join(&name);
                     shell
                         .staged_images
                         .borrow_mut()
@@ -4873,12 +6827,30 @@ fn handle_bridge(
                     // Copy on a worker; poll completion from the
                     // main thread (the x2t_convert_async pattern —
                     // an Rc cannot cross to a glib idle callback
-                    // on another thread).
+                    // on another thread). The worker fsyncs the
+                    // copy (and its directory, best effort)
+                    // before reporting success: Ready must mean
+                    // durable, because the editor creates the
+                    // history point — and the journal then
+                    // records it — as soon as the image loads
+                    // (round 2's insert-image rule).
                     let (tx, rx) = std::sync::mpsc::channel::<bool>();
                     {
                         let dest_t = dest.clone();
                         std::thread::spawn(move || {
-                            let _ = tx.send(std::fs::copy(&src, &dest_t).is_ok());
+                            let ok = std::fs::copy(&src, &dest_t)
+                                .and_then(|_| {
+                                    std::fs::File::open(&dest_t).and_then(|f| f.sync_all())
+                                })
+                                .is_ok();
+                            if ok {
+                                if let Some(parent) = dest_t.parent() {
+                                    if let Ok(d) = std::fs::File::open(parent) {
+                                        let _ = d.sync_all();
+                                    }
+                                }
+                            }
+                            let _ = tx.send(ok);
                         });
                     }
                     let shell_c = shell.clone();
@@ -5002,6 +6974,35 @@ fn reply_save(
 ) {
     reply_json(reply, ctx, v);
     deliver_save_reply_js(shell, v);
+}
+
+/// Dual-channel open-reply delivery (cycle 4): the deferred-
+/// reply garbling first found on save replies in cycle 3 also
+/// hits open-family replies — a 240 MB open whose x2t
+/// conversion had succeeded was reported by the shim as
+/// "convertFile returned no data" because the postMessage
+/// promise resolved with an empty object (B1). Every deferred
+/// open-family completion therefore ALSO goes through
+/// evaluate_javascript into the shim's open-reply waiter
+/// registry, keyed by the shim-supplied openSeq.
+fn deliver_open_reply_js(shell: &Rc<Shell>, seq: u64, v: &serde_json::Value) {
+    let js = format!(
+        "window.__joDeliverOpenReply && window.__joDeliverOpenReply({seq}, {v})"
+    );
+    eval_in_view(shell, &js);
+}
+
+fn reply_open(
+    shell: &Rc<Shell>,
+    reply: &ScriptMessageReply,
+    ctx: &Context,
+    v: &serde_json::Value,
+    open_seq: Option<u64>,
+) {
+    reply_json(reply, ctx, v);
+    if let Some(seq) = open_seq {
+        deliver_open_reply_js(shell, seq, v);
+    }
 }
 
 /// Convert the staged Editor.bin to `code` and write it to
@@ -5270,6 +7271,7 @@ fn show_save_dialog(shell: &Rc<Shell>) {
         let copy_from = p.copy_source.clone().or_else(|| {
             if p.unmodified
                 && format == p.origin_code
+                && !journal_pending(&shell_c)
                 && !*shell_c.save_failed_outstanding.borrow()
             {
                 p.doc_path.clone()
@@ -5567,7 +7569,10 @@ fn show_askonce(shell: &Rc<Shell>) {
                     "joffice: SAVE-UNEDITED askonce-keep refused: a failed save is outstanding; converting for real"
                 );
             }
-            if p.unmodified && !*shell_c.save_failed_outstanding.borrow() {
+            if p.unmodified
+                && !*shell_c.save_failed_outstanding.borrow()
+                && !journal_pending(&shell_c)
+            {
                 // §6a (cycle 3): "Keep format" on an unedited
                 // document writes nothing — there is nothing to
                 // convert. (The ask still happened; the write
@@ -5771,6 +7776,82 @@ fn build_launcher(
     title.set_halign(gtk4::Align::Start);
     bx.append(&title);
 
+    // Crash recovery (cycle 4, round 1 §3): sessions whose
+    // lock is free hold journaled edits that never reached
+    // their files. Offered here — Recover replays the journal
+    // over the session's seed; Discard deletes the session;
+    // Decide Later leaves it on disk for a future launch.
+    let candidates = scan_recovery_candidates();
+    if !candidates.is_empty() {
+        let rec_title = gtk4::Label::new(None);
+        rec_title.set_markup("<b>Recover unsaved changes</b>");
+        rec_title.set_halign(gtk4::Align::Start);
+        rec_title.set_margin_top(10);
+        bx.append(&rec_title);
+        for cand in candidates {
+            let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+            let when = gtk4::glib::DateTime::from_unix_local(cand.last_edit_unix as i64)
+                .and_then(|d| d.format("%Y-%m-%d %H:%M"))
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| "unknown time".to_string());
+            let text = format!(
+                "{} — last edited {}, {} unsaved change{} ({} KB) — the file on disk does not have them",
+                cand.name,
+                when,
+                cand.unsaved_items,
+                if cand.unsaved_items == 1 { "" } else { "s" },
+                cand.total_bytes / 1024
+            );
+            let label = gtk4::Label::new(Some(&text));
+            label.set_wrap(true);
+            label.set_xalign(0.0);
+            label.set_hexpand(true);
+            row.append(&label);
+            let recover_btn = gtk4::Button::with_label("Recover");
+            recover_btn.set_sensitive(cand.bound_path.is_some());
+            {
+                let shell_c = shell.clone();
+                let od_c = open_document.clone();
+                let sid_c = cand.sid.clone();
+                let path_c = cand.bound_path.clone();
+                recover_btn.connect_clicked(move |_| {
+                    let Some(path) = path_c.clone() else {
+                        return;
+                    };
+                    eprintln!("joffice: RECOVERY_ARMED sid={sid_c} (launcher)");
+                    *shell_c.recovery_arm.borrow_mut() = Some(sid_c.clone());
+                    od_c(path, None);
+                });
+            }
+            row.append(&recover_btn);
+            let discard_btn = gtk4::Button::with_label("Discard");
+            {
+                let row_c = row.clone();
+                let dir_c = cand.dir.clone();
+                let sid_c = cand.sid.clone();
+                discard_btn.connect_clicked(move |_| {
+                    match std::fs::remove_dir_all(&dir_c) {
+                        Ok(()) => eprintln!("joffice: RECOVERY_DISCARD sid={sid_c}"),
+                        Err(e) => {
+                            eprintln!("joffice: RECOVERY_DISCARD failed sid={sid_c}: {e}")
+                        }
+                    }
+                    row_c.set_visible(false);
+                });
+            }
+            row.append(&discard_btn);
+            let later_btn = gtk4::Button::with_label("Decide Later");
+            {
+                let row_c = row.clone();
+                later_btn.connect_clicked(move |_| {
+                    row_c.set_visible(false);
+                });
+            }
+            row.append(&later_btn);
+            bx.append(&row);
+        }
+    }
+
     // Open…
     let open_btn = gtk4::Button::with_label("Open…");
     open_btn.set_halign(gtk4::Align::Start);
@@ -5910,6 +7991,16 @@ fn main() {
     // first time Save As opened one. If the runtime ships a
     // compiled schema dir and the environment does not already
     // provide one, point GLib at it before anything GTK starts.
+    if let Some(existing) = std::env::var_os("GSETTINGS_SCHEMA_DIR") {
+        // Already provided (the Nix wrapper does this): leave
+        // it alone, but log the effective value (cycle 4 §5 —
+        // the two mechanisms coexist; GSETTINGS_SCHEMA_DIR is
+        // searched in addition to XDG_DATA_DIRS).
+        eprintln!(
+            "joffice: GSETTINGS_SCHEMA_DIR={} (inherited)",
+            PathBuf::from(existing).display()
+        );
+    }
     if std::env::var_os("GSETTINGS_SCHEMA_DIR").is_none() {
         if let Ok(exe) = std::env::current_exe() {
             let bin_dir = exe.parent().map(|p| p.to_path_buf());
@@ -6031,6 +8122,44 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
 
+    // Runtime discovery (cycle 4 step 5): JOFFICE_RUNTIME_DIR
+    // (the Nix wrapper sets it by default) names a runtime
+    // tree with web-apps/, sdkjs/, converter/ side by side;
+    // it seeds the per-piece variables when they are unset.
+    // Then <exe>/../share/joffice/runtime is tried as the
+    // installed layout. Per-piece env always wins.
+    {
+        let rt = std::env::var_os("JOFFICE_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|e| e.parent().map(|p| p.join("../share/joffice/runtime")))
+                    .filter(|p| p.is_dir())
+            });
+        if let Some(rt) = rt {
+            eprintln!("joffice: RUNTIME_DIR {}", rt.display());
+            if std::env::var_os("JOFFICE_WEBAPPS").is_none() {
+                std::env::set_var("JOFFICE_WEBAPPS", rt.join("web-apps"));
+            }
+            if std::env::var_os("JOFFICE_SDKJS").is_none() {
+                std::env::set_var("JOFFICE_SDKJS", rt.join("sdkjs"));
+            }
+            if std::env::var_os("JOFFICE_X2T").is_none() {
+                std::env::set_var("JOFFICE_X2T", rt.join("converter/x2t"));
+            }
+            // The runtime manifest (written by the Nix runtime
+            // derivation) is checked against the live tree:
+            // its sdk_hash must equal the hash Shell computes
+            // from the sdkjs tree it actually loaded — checked
+            // after Shell::new below via RUNTIME_MANIFEST log.
+            if !rt.join("runtime-manifest.json").exists() {
+                eprintln!("joffice: RUNTIME_MANIFEST missing in {}", rt.display());
+            }
+        }
+    }
+
     // Resolve the web-apps dir: $JOFFICE_WEBAPPS, else
     // <exe-dir>/../web-apps, or ./web-apps.
     let webapps_dir = std::env::var_os("JOFFICE_WEBAPPS")
@@ -6070,6 +8199,46 @@ fn main() {
 
     let shell = Shell::new(webapps_dir, sdkjs_dir, pending_file);
 
+    // Runtime manifest verification (cycle 4 step 5): when a
+    // runtime tree carries runtime-manifest.json, its recorded
+    // sdk_hash must match the hash of the sdkjs tree actually
+    // loaded — a skewed runtime (mixed builds) is exactly the
+    // failure this catches, loudly, at startup.
+    {
+        let rt = std::env::var_os("JOFFICE_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|e| e.parent().map(|p| p.join("../share/joffice/runtime")))
+            });
+        if let Some(rt) = rt {
+            let mpath = rt.join("runtime-manifest.json");
+            if let Ok(text) = std::fs::read_to_string(&mpath) {
+                let recorded = serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("sdk_hash")
+                            .and_then(|h| h.as_str().map(|s| s.to_string()))
+                    });
+                match recorded {
+                    Some(h) if h == shell.sdk_hash => {
+                        eprintln!("joffice: RUNTIME_MANIFEST ok sdk_hash={h}");
+                    }
+                    Some(h) => {
+                        eprintln!(
+                            "joffice: RUNTIME_MANIFEST MISMATCH manifest={h} loaded={}",
+                            shell.sdk_hash
+                        );
+                    }
+                    None => {
+                        eprintln!("joffice: RUNTIME_MANIFEST unparsable {}", mpath.display());
+                    }
+                }
+            }
+        }
+    }
+
     let app = Application::builder()
         .application_id("io.nowlin.jOffice")
         .build();
@@ -6092,6 +8261,46 @@ fn main() {
             .default_height(geo_h)
             .build();
         *shell.window.borrow_mut() = Some(window.clone());
+
+        // Session finalize (cycle 4): whatever path destroyed
+        // the window, the journal session is deleted only when
+        // its content is safe (saved, or Don't Save chosen);
+        // anything else leaves it for the recovery offer.
+        {
+            let shell_c = shell.clone();
+            window.connect_destroy(move |_| {
+                shell_c.session_finalize_destroy();
+            });
+        }
+
+        // ViewOnly Ctrl+Shift+S (cycle 4 step 4): capture
+        // phase, GTK side. The view-mode editor never turns
+        // the gesture into a bridge call (cycle 3 PO2), so the
+        // host intercepts it — ONLY for ViewOnly documents;
+        // editable documents keep the editor's own Save As.
+        {
+            let keys = gtk4::EventControllerKey::new();
+            keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            let shell_c = shell.clone();
+            keys.connect_key_pressed(move |_, keyval, _code, state| {
+                let is_copy_chord = keyval.to_lower() == gtk4::gdk::Key::s
+                    && state.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
+                    && state.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
+                if !is_copy_chord {
+                    return gtk4::glib::Propagation::Proceed;
+                }
+                let viewonly = matches!(
+                    shell_c.doc.borrow().as_ref().map(|d| d.policy),
+                    Some(Policy::ViewOnly)
+                );
+                if !viewonly {
+                    return gtk4::glib::Propagation::Proceed;
+                }
+                begin_save_copy(&shell_c);
+                gtk4::glib::Propagation::Stop
+            });
+            window.add_controller(keys);
+        }
 
         // Close flow (marathon 2 cycle 2): when a document is
         // open, the close-request always Stops and the Rust-side
@@ -6120,8 +8329,48 @@ fn main() {
         });
 
         // WebContext with the joffice:// scheme + CORS. Register the
-        // scheme BEFORE constructing the WebView.
+        // scheme BEFORE constructing the WebView. WebKit 6.0
+        // puts storage on the NetworkSession: its data/cache
+        // directories are pinned under the XDG data/cache
+        // homes (cycle 4 step 5) — never the CWD, never the
+        // (possibly read-only) runtime tree. Downloads are
+        // cancelled at the session: the shell's own export
+        // paths are the only way bytes leave.
         let context = WebContext::default().expect("default WebContext");
+        let network_session = {
+            let data_home = std::env::var_os("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .unwrap_or_else(|| {
+                    PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+                        .join(".local/share")
+                });
+            let cache_home = std::env::var_os("XDG_CACHE_HOME")
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .unwrap_or_else(|| {
+                    PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache")
+                });
+            let session = webkit6::NetworkSession::builder()
+                .data_directory(
+                    data_home
+                        .join("joffice/webkit")
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+                .cache_directory(
+                    cache_home
+                        .join("joffice/webkit")
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+                .build();
+            session.connect_download_started(|_, download| {
+                eprintln!("joffice: DOWNLOAD_DENIED");
+                download.cancel();
+            });
+            session
+        };
         let security = context.security_manager().expect("security manager");
         security.register_uri_scheme_as_cors_enabled(EDITOR_SCHEME);
         security.register_uri_scheme_as_secure(EDITOR_SCHEME);
@@ -6155,6 +8404,23 @@ fn main() {
         );
         manager.add_script(&bootstrap);
 
+        // Cycle 4 config: flush mode + the per-process bridge
+        // secret, as a user script so EVERY frame (including
+        // the editor iframe) gets them before the shim runs.
+        let config_js = format!(
+            "window.__joFlushMode = {}; window.__joSecret = {};",
+            serde_json::to_string(&shell.flush_mode).unwrap_or_else(|_| "\"journal\"".into()),
+            serde_json::to_string(&shell.secret).unwrap_or_else(|_| "\"\"".into()),
+        );
+        let config_script = UserScript::new(
+            &config_js,
+            UserContentInjectedFrames::AllFrames,
+            UserScriptInjectionTime::Start,
+            &[],
+            &[],
+        );
+        manager.add_script(&config_script);
+
         let shim = UserScript::new(
             SHIM_JS,
             UserContentInjectedFrames::AllFrames,
@@ -6167,6 +8433,7 @@ fn main() {
         let view = WebView::builder()
             .user_content_manager(&manager)
             .web_context(&context)
+            .network_session(&network_session)
             .build();
 
         // Bridge: JS -> Rust, with origin check inside handle_bridge.
@@ -6194,11 +8461,31 @@ fn main() {
             },
         );
 
-        // NAVIGATION POLICY: allow the editor origin + the schemes the
-        // editor itself uses (blob/data/about:blank for its iframes).
-        // External http/https/mailto links open in the system browser.
-        // Everything else: let WebKit decide (don't break internals).
+        // NAVIGATION POLICY (cycle 4, round 1 §5 matrix):
+        //   joffice://            allow (the editor, any frame)
+        //   about:blank / srcdoc  allow (editor subframes)
+        //   blob:                 allow — blob URLs are bound
+        //                         to their creating origin by
+        //                         construction, and the editor
+        //                         navigates its own workers/
+        //                         frames to them. (The binding
+        //                         exposes no frame origin here;
+        //                         recorded deviation.)
+        //   http(s): / mailto:    hand to the system handler
+        //                         (GtkUriLauncher via AppInfo),
+        //                         deny in-page.
+        //   file: data: javascript: and everything else:
+        //                         DENY + NAV_DENY log.
+        // New windows never create a WebView (connect_create
+        // returns None); downloads are cancelled (the shell's
+        // own export paths are the only way bytes leave).
         view.connect_decide_policy(|_view, decision, decision_type| {
+            if decision_type == PolicyDecisionType::NewWindowAction {
+                // New windows never create a WebView.
+                eprintln!("joffice: NAV_NEW_WINDOW_DENIED");
+                decision.ignore();
+                return true;
+            }
             if decision_type != PolicyDecisionType::NavigationAction {
                 return false;
             }
@@ -6214,18 +8501,51 @@ fn main() {
             let uri = nav.request().and_then(|r| r.uri()).unwrap_or_default();
             if uri.starts_with(EDITOR_ORIGIN)
                 || uri.starts_with("blob:")
-                || uri.starts_with("data:")
                 || uri == "about:blank"
+                || uri == "about:srcdoc"
                 || uri.is_empty()
             {
-                return false; // allow editor + its own frames
+                return false; // allow
             }
-            if uri.starts_with("http://") || uri.starts_with("https://") || uri.starts_with("mailto:") {
-                let _ = AppInfo::launch_default_for_uri(&uri, None::<&gtk4::gio::AppLaunchContext>);
+            if uri.starts_with("http://")
+                || uri.starts_with("https://")
+                || uri.starts_with("mailto:")
+            {
+                let _ = AppInfo::launch_default_for_uri(
+                    &uri,
+                    None::<&gtk4::gio::AppLaunchContext>,
+                );
+                eprintln!("joffice: NAV_EXTERNAL {}", &uri[..uri.len().min(120)]);
                 decision.ignore();
                 return true;
             }
-            false
+            eprintln!("joffice: NAV_DENY {}", &uri[..uri.len().min(120)]);
+            decision.ignore();
+            true
+        });
+
+        // JavaScript dialogs are suppressed, never presented
+        // (cycle 4, H1 finding): WebKitGTK does not route a
+        // javascript: self-assignment through decide-policy, so
+        // page script CAN raise alert()/confirm()/prompt() —
+        // and the default dialog is modal: it froze the whole
+        // editor behind an alert during the H1 drive. The page
+        // is our own trusted editor origin (documents cannot
+        // execute script in it), so the dialogs carry no user
+        // decision worth a modal; confirm/prompt resolve as
+        // cancelled and every suppression is ledgered.
+        view.connect_script_dialog(|_view, dialog| {
+            use webkit6::ScriptDialogType;
+            eprintln!(
+                "joffice: JS_DIALOG_SUPPRESSED type={:?}",
+                dialog.dialog_type()
+            );
+            match dialog.dialog_type() {
+                ScriptDialogType::Confirm => dialog.confirm_set_confirmed(false),
+                ScriptDialogType::Prompt => dialog.prompt_set_text(""),
+                _ => {}
+            }
+            true
         });
 
         // Snapshot mode (test drives): capture the rendered page
@@ -6368,6 +8688,55 @@ fn main() {
             false
         });
 
+        // Drive eval hook (cycle 4; env-gated like
+        // JOFFICE_SNAPSHOT): with JOFFICE_EVAL_DIR set, poll it
+        // for <id>.js files, run each in the editor frame via
+        // the shim's __joDriveEval, and let the result come
+        // back over the bridge as <id>.result. Test drives use
+        // this to set markers, force transports, and read
+        // editor state deterministically instead of scraping
+        // screenshots for state.
+        if let Ok(dir) = std::env::var("JOFFICE_EVAL_DIR") {
+            let dir = PathBuf::from(dir);
+            let _ = std::fs::create_dir_all(&dir);
+            let seen: Rc<RefCell<std::collections::HashSet<String>>> =
+                Rc::new(RefCell::new(std::collections::HashSet::new()));
+            let shell_ev = shell.clone();
+            gtk4::glib::timeout_add_local(
+                std::time::Duration::from_millis(250),
+                move || {
+                    let mut names: Vec<String> = Vec::new();
+                    if let Ok(rd) = std::fs::read_dir(&dir) {
+                        for e in rd.flatten() {
+                            let n = e.file_name().to_string_lossy().into_owned();
+                            if n.ends_with(".js") {
+                                names.push(n);
+                            }
+                        }
+                    }
+                    names.sort();
+                    for n in names {
+                        let id = n.trim_end_matches(".js").to_string();
+                        if seen.borrow().contains(&id) {
+                            continue;
+                        }
+                        seen.borrow_mut().insert(id.clone());
+                        let path = dir.join(&n);
+                        let code = std::fs::read_to_string(&path).unwrap_or_default();
+                        let _ = std::fs::remove_file(&path);
+                        let script = format!(
+                            "(function(){{ try {{ var r = window.__joDriveEval({}); window.joffice.invoke('driveEvalResult', {{ id: {}, result: r }}); }} catch (e) {{ window.joffice.invoke('driveEvalResult', {{ id: {}, result: JSON.stringify({{ ok: false, error: String(e) }}) }}); }} }})()",
+                            serde_json::to_string(&code).unwrap_or_else(|_| "\"\"".into()),
+                            serde_json::to_string(&id).unwrap_or_else(|_| "\"eval\"".into()),
+                            serde_json::to_string(&id).unwrap_or_else(|_| "\"eval\"".into()),
+                        );
+                        eval_in_view(&shell_ev, &script);
+                    }
+                    gtk4::glib::ControlFlow::Continue
+                },
+            );
+        }
+
         // Window layout (marathon 2): a vertical box holding the
         // font-substitution banner (hidden until a substitution
         // happens, §5) above the content — the WebView when a
@@ -6415,6 +8784,28 @@ fn main() {
         let print_btn = gtk4::Button::with_label("Print…");
         action_row.append(&export_btn);
         action_row.append(&print_btn);
+        // Save a Copy… + Read-only badge (cycle 4 step 4): a
+        // ViewOnly window's editor emits no save gesture at all
+        // (cycle 3 PO2), so the copy action is host-side. Both
+        // widgets sit at the END of the bar and are visible only
+        // for ViewOnly documents (refresh_chrome).
+        let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        spacer.set_hexpand(true);
+        action_row.append(&spacer);
+        let readonly_label = gtk4::Label::new(Some("Read-only"));
+        readonly_label.set_visible(false);
+        action_row.append(&readonly_label);
+        *shell.readonly_label.borrow_mut() = Some(readonly_label);
+        let copy_btn = gtk4::Button::with_label("Save a Copy…");
+        copy_btn.set_visible(false);
+        action_row.append(&copy_btn);
+        *shell.copy_btn.borrow_mut() = Some(copy_btn.clone());
+        {
+            let shell_cp = shell.clone();
+            copy_btn.connect_clicked(move |_| {
+                begin_save_copy(&shell_cp);
+            });
+        }
         action_row.set_visible(false);
         *shell.action_row.borrow_mut() = Some(action_row.clone());
         vbox.append(&action_row);
@@ -6505,6 +8896,27 @@ fn main() {
                 .unwrap_or(false)
         {
             // --file launch: straight into the editor, as before.
+            // Cycle 4: if a crashed session belongs to this
+            // exact file, arm its recovery — the open below
+            // replays the journal instead of loading the stale
+            // on-disk bytes.
+            if let Some(p) = shell.pending_file.borrow().as_ref() {
+                let canon = p.canonicalize().ok();
+                for cand in scan_recovery_candidates() {
+                    let cand_canon = cand
+                        .bound_path
+                        .as_ref()
+                        .and_then(|bp| bp.canonicalize().ok());
+                    if cand_canon == canon && canon.is_some() {
+                        eprintln!(
+                            "joffice: RECOVERY_ARMED sid={} (--file match)",
+                            cand.sid
+                        );
+                        *shell.recovery_arm.borrow_mut() = Some(cand.sid);
+                        break;
+                    }
+                }
+            }
             vbox.append(&view);
             let entry = editor_entry_url(
                 shell.pending_file.borrow().as_ref(),

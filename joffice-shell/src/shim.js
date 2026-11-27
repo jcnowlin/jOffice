@@ -35,7 +35,15 @@
         if (!handlers || !handlers.joffice) {
             return Promise.reject(new Error('joffice bridge handler missing'));
         }
-        return handlers.joffice.postMessage({ cmd: cmd, args: args || {} });
+        args = args || {};
+        // Cycle 4 hardening: every bridge call carries the
+        // per-process secret Rust injected as window.__joSecret.
+        // A frame the config script never reached (a foreign
+        // subframe) cannot mint valid calls.
+        if (window.__joSecret && args.secret === undefined) {
+            args.secret = window.__joSecret;
+        }
+        return handlers.joffice.postMessage({ cmd: cmd, args: args });
     }
 
     // The editor API object sdkjs hands us via CreateEditorApi.
@@ -77,14 +85,396 @@
         pendingSeq: null,     // seq still owed its one EndSave
         started: false,       // StartSave fired during a requested save
         startSaveSeen: false, // StartSave wrap has fired at least once
+        startSaveOpen: false, // a StartSave cycle is open (cycle 4 alarm)
         boundSaved: false,    // LocalFileGetSaved value
         lastPushedModified: null, // last onDocumentModifiedChanged value
+        overlayForced: false,     // last push was journal-overlay-forced (W2)
         handshakeSent: false,
         cellEditing: false,
         replyWaiters: {},     // seq -> settle fn (dual-channel replies)
         nextOrigin: null      // 'changes' when LocalFileSaveChanges delegates
     };
     window.__joSave = joSave;
+
+    // -----------------------------------------------------------
+    // Cycle 4: flush mode + journal state. The mode is injected
+    // by Rust (window.__joFlushMode, from JOFFICE_FLUSH_MODE):
+    //   'journal' — mode J (production): saveChanges is journaled
+    //     by the wrap below; LocalFileSaveChanges is log-only.
+    //   'bound'   — cycle-3 behavior: the flush delegates to a
+    //     full LocalFileSave (the fallback if E0 condemns J).
+    //   'm0'/'m1'/'m2'/'m3' — the E0 experiment modes.
+    // -----------------------------------------------------------
+    function joFlushMode() {
+        return window.__joFlushMode || 'journal';
+    }
+    // The journal machinery (recorder, UNMOD gate, modified
+    // overlay, open-changes count) applies to the production
+    // 'journal' mode and to E0's 'm1' alias alike: m1 IS the
+    // journal design under its experiment label. Before this
+    // helper existed the gates tested === 'journal' exactly,
+    // so an m1 run journaled nothing and the section-6a
+    // unmodified shortcut could eat edits on Save As.
+    function joJournalMode() {
+        var m = joFlushMode();
+        return m === 'journal' || m === 'm1';
+    }
+    var joJournal = {
+        epoch: 0,          // current journal epoch
+        seq: 0,            // last assigned journal seq (this epoch)
+        base: 0,           // history items folded into the epoch seed
+        foldedLen: 0,      // items in seed + journal (the fold)
+        openChanges: 0,    // LocalFileGetOpenChangesCount value
+        sid: null,         // session id (from the open reply)
+        enabled: false,    // journal active for this document
+        wrapAsserted: false,
+        checkpointBusy: false,
+        imageStaged: false, // an image was inserted since the last checkpoint (K6)
+        histLen: 0,        // items through History.Index (last send)
+        boundHistLen: 0    // histLen as of the last bound save
+    };
+    window.__joJournal = joJournal;
+
+    // E0 instrumentation: search a byte array for the drive's
+    // marker in UTF-8 and UTF-16LE forms. The marker is set by
+    // the drive (window.__joE0Marker) before typing.
+    function joMarkerInBytes(bytes) {
+        var marker = window.__joE0Marker;
+        if (!marker || !bytes) return null;
+        var i, j, ok;
+        // UTF-8 / ASCII form.
+        outer8: for (i = 0; i + marker.length <= bytes.length; i++) {
+            for (j = 0; j < marker.length; j++) {
+                if (bytes[i + j] !== marker.charCodeAt(j)) continue outer8;
+            }
+            return 'utf8';
+        }
+        // UTF-16LE form.
+        outer16: for (i = 0; i + marker.length * 2 <= bytes.length; i++) {
+            for (j = 0; j < marker.length; j++) {
+                if (bytes[i + j * 2] !== marker.charCodeAt(j)
+                    || bytes[i + j * 2 + 1] !== 0) continue outer16;
+            }
+            return 'utf16le';
+        }
+        return null;
+    }
+    window.__joMarkerInBytes = joMarkerInBytes;
+    window.__joUpload = joUpload;
+    window.__joGetFile3Snapshot = function (where) {
+        // Async form (cycle 4, B3-109/S0-109 fix): the
+        // ledger lines are the deliverable; the eval caller
+        // just kicks it off.
+        joGetFile3SnapshotAsync(where || 'eval', function () { /* ledger only */ });
+        return 'kicked';
+    };
+
+    // Parse an asc_nativeGetFile3 header:
+    // "<Signature>;v<ver>;<len>;" → len (the data byte count the
+    // header vouches for). Returns null on a malformed header
+    // (GETFILE3_HEADER in the ledger at the call site).
+    function joParseGetFile3Header(header) {
+        if (typeof header !== 'string') return null;
+        var parts = header.split(';');
+        if (parts.length < 4 || parts[1].charAt(0) !== 'v') return null;
+        var len = parseInt(parts[2], 10);
+        if (isNaN(len) || len < 0) return null;
+        return len;
+    }
+
+    // Raw capture for a snapshot: asc_nativeGetFile3 + header
+    // validation, WITHOUT turning the payload into bytes. The
+    // capture is synchronous on purpose: at checkpoint time
+    // the serialized state must be the document state at that
+    // exact instant. Turning the payload into bytes is a
+    // separate step because in 9.3.8 the payload is BASE64
+    // TEXT of the writer's memory (Write(true, true) →
+    // GetBase64Memory), and at large sizes (a 219 MB memory
+    // is ~292M chars) the decode must be sliced — see
+    // joGetFile3SnapshotAsync.
+    function joGetFile3Raw(where) {
+        var ref = getEditor();
+        if (!ref.editor || typeof ref.editor.asc_nativeGetFile3 !== 'function') {
+            joLedger('GETFILE3_MISSING', null, { where: where });
+            return null;
+        }
+        var t0 = Date.now();
+        var res;
+        try {
+            res = ref.editor.asc_nativeGetFile3();
+        } catch (e) {
+            joLedger('GETFILE3_THROW', null, { where: where, err: String(e) });
+            return null;
+        }
+        var ms = Date.now() - t0;
+        if (!res || typeof res !== 'object') {
+            joLedger('GETFILE3_BADSHAPE', null, { where: where });
+            return null;
+        }
+        var len = joParseGetFile3Header(res.header);
+        if (len === null) {
+            joLedger('GETFILE3_HEADER', null, { where: where, header: String(res.header).slice(0, 80) });
+            return null;
+        }
+        return { header: res.header, len: len, ms: ms, data: res.data, ew: ref.ew };
+    }
+
+    // Validate decoded bytes against the header length, emit
+    // the GETFILE3_MS ledger + the E0 marker check, and hand
+    // back the snapshot object (or null, with the failure in
+    // the ledger).
+    function joSnapshotFinish(where, raw, bytes) {
+        if (!bytes) {
+            joLedger('GETFILE3_BADSHAPE', null, { where: where, dataType: typeof raw.data });
+            return null;
+        }
+        if (bytes.length !== raw.len) {
+            // The header length field is the writer's total
+            // memory position: it must equal the memory length.
+            joLedger('GETFILE3_SHORT', null, { where: where, len: raw.len, have: bytes.length });
+            return null;
+        }
+        joLedger('GETFILE3_MS', null, { where: where, ms: raw.ms, len: raw.len, raw: bytes.length });
+        if (window.__joE0Marker) {
+            var hit = joMarkerInBytes(bytes);
+            var histIdx = null;
+            try {
+                var w = raw.ew || window;
+                if (w.AscCommon && w.AscCommon.History) histIdx = w.AscCommon.History.Index;
+            } catch (e) { /* ledger input only */ }
+            joLedger('BIN_HAS_MARKER', null, {
+                where: where, hit: hit || 'none', histIdx: histIdx, len: raw.len
+            });
+        }
+        return { header: raw.header, len: raw.len, bytes: bytes };
+    }
+
+    function joRawBytesSync(raw) {
+        var data = raw.data;
+        if (data instanceof Uint8Array) return data;
+        if (typeof data === 'string') {
+            // Decode the base64 text to the raw bytes.
+            // (Treating the text as raw bytes made x2t salvage
+            // the UNEDITED document from the truncated stream
+            // and silently drop the edit — caught by Bp in
+            // cycle 4.)
+            try { return _b64ToBytes(data); } catch (e) { return null; }
+        }
+        if (data && data.buffer) {
+            return new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength);
+        }
+        return null;
+    }
+
+    // Snapshot the live document via asc_nativeGetFile3 WITHOUT
+    // converting or writing (E0 mode M2 + S0 timing + epoch
+    // checkpoints). Returns {header, len, bytes} where bytes is
+    // the writer's memory EXACTLY as serialized — Bp parity
+    // (cycle 4, settled empirically): the memory begins with
+    // the in-data header ("DOCY;v10;0;") and IS the whole
+    // Editor.bin; prepending the outer header guts the
+    // document, and the getFile (v5, header + base64) form
+    // converts to a byte-identical result.
+    // SYNCHRONOUS decode; kept for callers that need the bytes
+    // in the same turn. The save / S0 / checkpoint paths use
+    // the async form below.
+    function joGetFile3Snapshot(where) {
+        var raw = joGetFile3Raw(where);
+        if (!raw) return null;
+        return joSnapshotFinish(where, raw, joRawBytesSync(raw));
+    }
+
+    // Async form: the capture is the same synchronous
+    // asc_nativeGetFile3 call (the document state is exact at
+    // that instant), but a base64-string payload is decoded in
+    // setTimeout slices so the main thread keeps servicing
+    // IPC. The synchronous decode blocked the main thread for
+    // minutes at 109.5 MB and WebKit's crashAfter10Seconds
+    // watchdog aborted the web process mid-save (cycle 4,
+    // B3-109/S0-109: two SIGABRT core dumps). done(snap|null)
+    // mirrors joGetFile3Snapshot's return.
+    function joGetFile3SnapshotAsync(where, done) {
+        var raw = joGetFile3Raw(where);
+        if (!raw) { done(null); return; }
+        if (typeof raw.data !== 'string') {
+            done(joSnapshotFinish(where, raw, joRawBytesSync(raw)));
+            return;
+        }
+        _b64ToBytesSliced(raw.data, function (bytes) {
+            done(joSnapshotFinish(where, raw, bytes));
+        });
+    }
+
+    // The Editor.bin from a getFile3 snapshot IS the snapshot
+    // bytes (Bp-proven, cycle 4): the writer's memory starts
+    // with its own in-data header and converts byte-identically
+    // to the getFile form. Kept as a named step so the save
+    // path reads clearly.
+    function joAssembleBin(snap) {
+        return snap.bytes;
+    }
+
+    // E0 mode M2: the flush IS a snapshot (timed, marker-checked,
+    // never written anywhere). Async decode: a flush must never
+    // stall the main thread at large sizes.
+    function joE0Snapshot(where) {
+        joGetFile3SnapshotAsync(where, function () { /* ledger only */ });
+    }
+
+    // -----------------------------------------------------------
+    // joOpen (cycle 4, round 2 §D): ONE entry point for every
+    // document open — launcher/--file (LocalStartOpen), the
+    // editor's Open dialog (LocalFileOpen), and crash recovery.
+    // The Rust convert reply carries either base64 (small bins)
+    // or a session URL + exact byte count (large bins); the URL
+    // path fetches same-origin via XHR (WebKitGTK gives
+    // custom-scheme pages an empty Origin cross-origin, so the
+    // session is served from the page's OWN host), parks the
+    // buffer in the one-shot GetOpenedFile slot, and EndLoads
+    // with binary_content://editor.bin. Fallback order: XHR →
+    // fetch → base64 (only when the reply carries it) → refuse
+    // with a logged size message. joOpen resolves only when the
+    // buffer's byteLength equals the expected count.
+    // -----------------------------------------------------------
+    var joOpenedSlot = { buf: null };
+    window.__joOpenedSlot = joOpenedSlot;
+
+    function joOpenApplySession(res) {
+        if (res.sid) {
+            joJournal.sid = res.sid;
+            joJournal.enabled = !!res.journal;
+            joJournal.epoch = res.epoch || 0;
+            joJournal.base = res.base || 0;
+            joJournal.seq = res.seq || 0;
+            joJournal.histLen = res.base || 0;
+            joJournal.openChanges = res.openChanges || 0;
+            joJournal.unsavedFloor = res.openChanges || 0;
+        }
+        if (res.recovery) {
+            joJournal.pendingRecovery = res.recovery;
+        }
+    }
+
+    function joEndLoadWith(name, data, len) {
+        // CR1 (round 2 §D): the crypto path must not be armed
+        // when EndLoad runs — in the pinned 9.3.8 tree nothing
+        // assigns AscCommon.CryptoProvider at all, and our
+        // CryptoMode is 0. Asserted here, at the one place
+        // every open passes through.
+        var cp = null;
+        try { cp = window.AscCommon ? window.AscCommon.CryptoProvider : null; } catch (e) { /* log only */ }
+        joLedger('CRYPTO_STATE', null, {
+            provider: String(cp), mode: window.AscDesktopEditor
+                ? window.AscDesktopEditor.CryptoMode : '?'
+        });
+        if (typeof window.DesktopOfflineAppDocumentEndLoad === 'function') {
+            window.DesktopOfflineAppDocumentEndLoad(name || '', data, len);
+            return true;
+        }
+        return false;
+    }
+
+    function joOpenWithBin(res, name, resetHandshake) {
+        joOpenApplySession(res);
+        if (resetHandshake) joSave.handshakeSent = false;
+        if (res.binUrl) {
+            joOpenStage.stage = 'fetch_bin';
+            var expected = res.binBytes || 0;
+            console.log('[jOffice][measure] OPEN_STAGE fetch_begin t=' + Date.now()
+                + ' url=' + res.binUrl + ' expect=' + expected);
+            var xhr = new XMLHttpRequest();
+            xhr.open('GET', res.binUrl, true);
+            xhr.responseType = 'arraybuffer';
+            xhr.onload = function () {
+                if (xhr.status !== 200 || !xhr.response
+                    || xhr.response.byteLength !== expected) {
+                    console.error('[jOffice] OPEN_BIN_FAIL status=' + xhr.status
+                        + ' got=' + (xhr.response ? xhr.response.byteLength : -1)
+                        + ' expect=' + expected);
+                    joOpenFetchFallback(res, name);
+                    return;
+                }
+                joOpenedSlot.buf = xhr.response;
+                joOpenStage.stage = 'received';
+                console.log('[jOffice][measure] OPEN_STAGE received t=' + Date.now()
+                    + ' bin_bytes=' + xhr.response.byteLength + ' via=url');
+                joOpenStage.stage = 'endload_in';
+                if (!joEndLoadWith(name, 'binary_content://editor.bin', 0)) {
+                    console.error('[jOffice] EndLoad missing on the URL open path');
+                    return;
+                }
+                joOpenStage.stage = 'endload_out';
+                console.log('[jOffice][measure] OPEN_STAGE endload_done t=' + Date.now());
+                setTimeout(joHandshake, 300);
+            };
+            xhr.onerror = function () {
+                console.error('[jOffice] OPEN_BIN_XHR_ERROR url=' + res.binUrl);
+                joOpenFetchFallback(res, name);
+            };
+            xhr.send(null);
+            return;
+        }
+        if (res.data) {
+            var bin = _b64ToBytes(res.data);
+            joOpenStage.stage = 'received';
+            console.log('[jOffice][measure] OPEN_STAGE received t=' + Date.now()
+                + ' b64_chars=' + res.data.length);
+            joOpenStage.stage = 'decoded';
+            console.log('[jOffice][measure] OPEN_STAGE decoded t=' + Date.now()
+                + ' bin_bytes=' + bin.length);
+            joOpenStage.stage = 'endload_in';
+            if (!joEndLoadWith(name, res.data, bin.length)) {
+                console.warn('[jOffice] DesktopOfflineAppDocumentEndLoad MISSING, using fallback openDocument');
+                var ref = getEditor();
+                if (!ref.editor) throw new Error('no editor API');
+                var file = new ref.ew.AscCommon.OpenFileResult();
+                file.data = bin;
+                file.bSerFormat = true;
+                file.url = name || '';
+                ref.editor.openDocument(file);
+            }
+            joOpenStage.stage = 'endload_out';
+            console.log('[jOffice][measure] OPEN_STAGE endload_done t=' + Date.now());
+            setTimeout(joHandshake, 300);
+            return;
+        }
+        console.error('[jOffice] joOpen: reply carried neither binUrl nor data');
+    }
+
+    function joOpenFetchFallback(res, name) {
+        // Fallback order (round 2 §D): fetch, then base64 when
+        // the reply carries it, then refuse with a size message.
+        if (typeof fetch === 'function' && res.binUrl) {
+            fetch(res.binUrl).then(function (r) { return r.arrayBuffer(); })
+                .then(function (buf) {
+                    if (buf.byteLength !== (res.binBytes || 0)) {
+                        throw new Error('fetch size mismatch');
+                    }
+                    joOpenedSlot.buf = buf;
+                    joOpenStage.stage = 'endload_in';
+                    if (!joEndLoadWith(name, 'binary_content://editor.bin', 0)) {
+                        console.error('[jOffice] EndLoad missing on the fetch open path');
+                        return;
+                    }
+                    joOpenStage.stage = 'endload_out';
+                    setTimeout(joHandshake, 300);
+                })
+                .catch(function (e) {
+                    if (res.data) {
+                        joOpenWithBin({ data: res.data, sid: res.sid, journal: res.journal }, name, false);
+                    } else {
+                        console.error('[jOffice] OPEN_REFUSED bytes=' + (res.binBytes || 0)
+                            + ' (URL transports failed, no base64 fallback carried)');
+                    }
+                });
+            return;
+        }
+        if (res.data) {
+            joOpenWithBin({ data: res.data, sid: res.sid, journal: res.journal }, name, false);
+            return;
+        }
+        console.error('[jOffice] OPEN_REFUSED bytes=' + (res.binBytes || 0));
+    }
 
     // Dual-channel save-reply delivery (cycle 3): Rust evaluates
     // this in the top frame; the top frame forwards to the
@@ -100,6 +490,75 @@
         }
         return false;
     };
+
+    // Dual-channel OPEN-reply delivery (cycle 4): the deferred-
+    // reply garbling first found on save replies in cycle 3
+    // also hits open-family replies — the postMessage promise
+    // intermittently resolves with an EMPTY object when Rust
+    // answers from the x2t completion callback, so a 240 MB
+    // open whose conversion had succeeded was reported as
+    // "convertFile returned no data" and the document never
+    // loaded (B1). Open-family calls therefore carry an
+    // openSeq and settle on the first WELL-FORMED reply from
+    // either channel; Rust also evaluates
+    // window.__joDeliverOpenReply(seq, res) (top frame, which
+    // forwards to the editor frame, exactly as save replies).
+    var joOpenReply = { seq: 0, waiters: {} };
+    window.__joDeliverOpenReply = function (seq, res) {
+        if (joOpenReply.waiters[seq]) {
+            joOpenReply.waiters[seq](res);
+            return true;
+        }
+        var ref = getEditor();
+        if (ref.ew && ref.ew !== window && ref.ew.__joDeliverOpenReply) {
+            return ref.ew.__joDeliverOpenReply(seq, res);
+        }
+        return false;
+    };
+
+    function joOpenWellFormed(res) {
+        return !!(res && (res.data || res.binUrl || res.error));
+    }
+
+    // bridge() for open-family commands whose replies are
+    // deferred (x2t conversions, native dialogs): resolves
+    // with the first well-formed reply from the postMessage
+    // channel or the JS channel; a garbled postMessage reply
+    // is logged and ignored, never settled. Rejects if the
+    // postMessage promise rejects (an explicit Rust error is
+    // a final answer).
+    function joBridgeOpen(cmd, args, wellFormed) {
+        return new Promise(function (resolve, reject) {
+            var seq = ++joOpenReply.seq;
+            var settled = false;
+            var settle = function (res) {
+                if (settled) return;
+                settled = true;
+                delete joOpenReply.waiters[seq];
+                resolve(res);
+            };
+            joOpenReply.waiters[seq] = function (res) {
+                if (wellFormed(res)) settle(res);
+            };
+            args = args || {};
+            args.openSeq = seq;
+            bridge(cmd, args).then(function (res) {
+                if (wellFormed(res)) {
+                    settle(res);
+                } else {
+                    console.log('[jOffice] ' + cmd + ' postMessage reply garbled ('
+                        + JSON.stringify(res) + '); awaiting JS-channel delivery seq=' + seq);
+                    joLedger('OPEN_REPLY_GARBLED', null, { cmd: cmd, seq: seq });
+                }
+            }).catch(function (e) {
+                if (!settled) {
+                    settled = true;
+                    delete joOpenReply.waiters[seq];
+                    reject(e);
+                }
+            });
+        });
+    }
 
     // Inserted-image bookkeeping: dialog handle -> {name,
     // localName}; localName -> info. LocalFileGetImageUrl must
@@ -167,7 +626,8 @@
         if (pushed !== null && direct !== pushed) {
             console.log('[jOffice][save-ledger] MODIFIED_DISAGREE at=' + where
                 + ' pushed=' + pushed + ' direct=' + direct
-                + ' cellEditing=' + joSave.cellEditing);
+                + ' cellEditing=' + joSave.cellEditing
+                + ' overlay=' + !!joSave.overlayForced);
         }
     }
 
@@ -196,6 +656,17 @@
             joSave.absorbResolve = null;
             absorbRes();
         }
+        // Cycle 4 alarm (round 2 §B, never-cut): an EndSave for
+        // a cycle sdkjs never opened. StartSave sets
+        // startSaveOpen; a legitimate EndSave consumes it. In
+        // journal mode flushes send no EndSave at all, so any
+        // hit here is a genuine anomaly; in bound/m0 mode the
+        // flush's invented EndSave trips it by design — the
+        // count is the measure of that deviation.
+        if (!joSave.startSaveOpen) {
+            joLedger('ENDSAVE_UNCYCLED', seq, { outcome: outcome });
+        }
+        joSave.startSaveOpen = false;
         var code = JO_ENDSAVE_CODE[outcome];
         // bin_index assertion (cycle 3, round 2 §B): the bin
         // this EndSave(0) vouches for was captured at
@@ -213,6 +684,19 @@
                     code = 1;
                 }
             } catch (e) { /* assertion is best-effort */ }
+        }
+        if (outcome === 'bound_ok') {
+            // The journal's unsaved tail is now in the bound
+            // file (cycle 4): the recovery floor clears, and
+            // Rust records last_bound_save_index from the
+            // saveFile args (histIndex) in the manifest.
+            joJournal.unsavedFloor = 0;
+            joJournal.openChanges = 0;
+            // Item-scale baseline for the unmodified gate: the
+            // gesture's own send updated histLen synchronously
+            // before the snapshot, so histLen here is exactly
+            // the item count the bound file now holds.
+            joJournal.boundHistLen = joJournal.histLen || 0;
         }
         var ref = getEditor();
         var w = ref.ew || window;
@@ -256,6 +740,53 @@
         bridge('modifiedReady', { value: direct, endSaveHash: endSaveHash })
             .catch(function () { /* log-only channel */ });
         joAttachEditorHooks();
+        // Crash recovery replay (cycle 4): the folded journal
+        // is applied over the seed, then an immediate
+        // checkpoint makes the recovered state the new epoch's
+        // seed. Runs once, right after the handshake.
+        if (joJournal.pendingRecovery) {
+            var rec = joJournal.pendingRecovery;
+            joJournal.pendingRecovery = null;
+            joApplyRecovery(rec);
+        }
+    }
+
+    // Apply a recovered session's folded journal (round 1 §3).
+    // The window stays bound to the original path, dirty, with
+    // LocalFileGetSaved false and the open-changes count equal
+    // to the folded list length; Rust shows the banner.
+    function joApplyRecovery(rec) {
+        var folded = rec.folded || [];
+        joJournal.replaying = true;
+        try {
+            if (typeof window.DesktopOfflineAppDocumentApplyChanges === 'function') {
+                window.DesktopOfflineAppDocumentApplyChanges(folded);
+                joLedger('RECOVERY_APPLIED', null, { n: folded.length, gap: !!rec.gap });
+            } else {
+                joLedger('RECOVERY_APPLY_MISSING', null, {});
+            }
+        } catch (e) {
+            joLedger('RECOVERY_APPLY_THROW', null, { err: String(e) });
+        }
+        joJournal.replaying = false;
+        joSave.boundSaved = false;
+        joJournal.openChanges = folded.length;
+        joJournal.unsavedFloor = folded.length;
+        joJournal.histLen = folded.length;
+        bridge('recoveryOpened', {
+            secret: window.__joSecret || '',
+            sid: joJournal.sid, gap: !!rec.gap, through: rec.through || null,
+            count: folded.length
+        }).catch(function () { /* banner is best-effort */ });
+        // The checkpoint's base must count everything the new
+        // seed embodies: the recovered epoch's own base (the
+        // seed the window opened from) PLUS the folded records
+        // applied on top. Passing folded.length alone reset
+        // Rust's base to the fold size — with an empty fold
+        // (crash after a checkpoint) unsaved() fell to 0 and
+        // the §6a unedited no-op ate the recovered save
+        // (cycle 4, K6 follow-up).
+        joJournalCheckpoint('recovery', joJournal.base + folded.length);
     }
 
     // Cell-editor open/close forwarding (round 2 §B): a cell
@@ -294,6 +825,7 @@
                 var wrapped = function (isSaveAs, password, isForce, docinfo, options) {
                     joSave.started = true;
                     joSave.startSaveSeen = true;
+                    joSave.startSaveOpen = true;
                     // A save cycle opens (cycle 3): from here to
                     // EndSave, asc_Save requests are serialized
                     // by the wrapper above, never re-entered.
@@ -583,6 +1115,53 @@
         }
         return { fileType: fileType, isPdfPrint: !!isPrint, isNaturalDownload: false };
     }
+    // Drive/diagnostic channel (cycle 4): a JSON snapshot of
+    // the save/journal state, and an eval forwarder so the
+    // shell's env-gated drive hook can run code in the EDITOR
+    // frame (where the document lives), not just the top frame.
+    window.__joState = function () {
+        var ref = getEditor();
+        var ed = ref.editor;
+        var hist = null;
+        try {
+            var w = ref.ew || window;
+            hist = w.AscCommon && w.AscCommon.History;
+        } catch (e) { /* frame gone */ }
+        return JSON.stringify({
+            histIdx: hist ? hist.Index : null,
+            savedIdx: hist ? hist.SavedIndex : null,
+            userSavedIdx: hist ? hist.UserSavedIndex : null,
+            lusi: ed ? ed.LastUserSavedIndex : null,
+            canSave: ed ? ed.canSave : null,
+            modified: ed && typeof ed.isDocumentModified === 'function'
+                ? !!ed.isDocumentModified() : null,
+            pendingSeq: joSave.pendingSeq,
+            startSaveOpen: joSave.startSaveOpen,
+            journal: {
+                sid: joJournal.sid, enabled: joJournal.enabled,
+                epoch: joJournal.epoch, seq: joJournal.seq,
+                base: joJournal.base, openChanges: joJournal.openChanges,
+                histLen: joJournal.histLen || 0
+            },
+            flushMode: joFlushMode()
+        });
+    };
+    window.__joDriveEval = function (code) {
+        try {
+            // If THIS frame is the editor frame, run here.
+            if (window.Asc && window.editor && window.AscCommon
+                && window.AscCommon.History) {
+                var r0 = (0, eval)(code);
+                return JSON.stringify({ ok: true, value: r0 === undefined ? null : r0 });
+            }
+            var ref = getEditor();
+            var w = ref.ew || window;
+            var r = w.eval(code);
+            return JSON.stringify({ ok: true, value: r === undefined ? null : r });
+        } catch (e) {
+            return JSON.stringify({ ok: false, error: String(e) });
+        }
+    };
     window.__joSaveStarted = function () {
         var ref = getEditor();
         var ew = ref.ew || window;
@@ -744,8 +1323,15 @@
             return url;
         },
 
-        // Change-tracking count for the Local save path.
-        LocalFileGetOpenChangesCount: function () { return 0; },
+        // Change-tracking count for the Local save path. In
+        // journal mode this is the folded journal length — the
+        // changes that exist only in the session journal, not
+        // in the bound file (round 1 §3: a recovered window
+        // reports the folded list length here, which is what
+        // makes Have_Changes call it dirty at Index -1).
+        LocalFileGetOpenChangesCount: function () {
+            return joJournalMode() ? joJournal.openChanges : 0;
+        },
 
         // Logged no-ops: crypto, signatures, printing, media,
         // plugins, external conversion. A call is never an error;
@@ -831,8 +1417,25 @@
         // edits that fall into that hole.
         onDocumentModifiedChanged: function (bModified) {
             var v = !!bModified;
+            // Cycle 4, W2 finding: Have_Changes is measured
+            // against the EDITOR's saved index, which any
+            // completed save gesture advances — including an
+            // export or print, which write no bound file. In
+            // journal mode the shell's dirty truth is the
+            // history position vs the last BOUND save (round 2
+            // §6): items beyond boundHistLen mean the document
+            // is dirty whatever the editor's saved index says.
+            // (Undo-all returns histLen to boundHistLen, so a
+            // fully-undone document stays clean — W4.)
+            var overlay = false;
+            if (!v && joJournalMode() && joJournal.enabled
+                && (joJournal.histLen || 0) !== (joJournal.boundHistLen || 0)) {
+                v = true;
+                overlay = true;
+            }
             joSave.lastPushedModified = v;
-            joLedger('modified', null, { pushed: v });
+            joSave.overlayForced = overlay;
+            joLedger('modified', null, { pushed: v, overlay: overlay });
             bridge('modifiedChanged', { value: v }).catch(function () { /* log-only channel */ });
         },
         openExternalReference: function () { console.log('[jOffice] stub openExternalReference'); },
@@ -874,59 +1477,88 @@
         },
 
         // Used when data starts with binary_content://.
+        // Cycle 4: returns the buffer joOpen parked, EXACTLY
+        // once — EndLoad treats a null return as a critical
+        // open error, and a second call must not hand the same
+        // buffer to a different document.
         GetOpenedFile: function (_data) {
-            // No pre-opened file data in this shell; return null so
-            // sdkjs falls through to the normal LocalStartOpen path.
-            return null;
+            var buf = joOpenedSlot.buf;
+            joOpenedSlot.buf = null;
+            if (buf) {
+                console.log('[jOffice] GetOpenedFile -> buffer ' + buf.byteLength + ' bytes');
+            }
+            return buf;
         },
 
-        // Called by CDocsCoApi.saveChanges for change-tracking.
-        // Without it, save-on-close / unsaved-changes tracking is dead.
-        LocalFileSaveChanges: function (_param, _password, _docinfo, _fileType, _jsonOptions) {
-            // Treat as a normal save, but tag the origin: saves
-            // the user did not explicitly start get the banner
-            // treatment on failure, never a modal (Kagi round 2
-            // restatement 7).
-            //
-            // Cycle 3 (round 2 §A, second layer): the flush
-            // carries serialized CHANGES, not a document — the
-            // real desktop host owes it no EndSave. The shim's
-            // delegation to a full LocalFileSave is what made
-            // AskOnce documents emit the paired flush+user saves
-            // that collided in cycle 2; the cycle-3 serialization
-            // wrapper (gate + cycle + deferred slot) is what
-            // keeps the pair from colliding now, NOT any
-            // suppression of the flush itself. The pinned flow
-            // explains the pair: inside ONE asc_Save,
-            // askSaveChanges' synchronous callback runs
-            // Apply_Changes → saveChanges → THIS function first,
-            // and only then does asc_Save reach StartSave + the
-            // document LocalFileSave.
-            // Delegate IMMEDIATELY (cycle-3 final form,
-            // reverting the debounce/fold/hold experiments):
-            // the gesture's bin only contains the current
-            // changes if this flush's save round-trip
-            // completes before the gesture's StartSave
-            // snapshot — the immediate delegation is what
-            // cycle 2 shipped and what the s1b ledger
-            // proves (flush EndSave precedes startsave,
-            // both bins carry the edit). Debouncing,
-            // folding, and absorbing were each tried and
-            // each silently dropped the edit from the
-            // written file. The one fold kept: a flush
-            // arriving while ANOTHER save is in flight
-            // (pendingSeq set) trails — that save is a
-            // different gesture, the editor stays dirty,
-            // and the changes re-flush afterwards.
-            if (joSave.pendingSeq !== null) {
-                joSave.trailingFlush = true;
-                joLedger('SAVE_TRAILING_FLUSH', joSave.pendingSeq, {});
-                return;
+        // Called by CDocsCoApi.saveChanges for change-tracking:
+        // the JOINED changes string, the deleteIndex, and the
+        // change count (common/Local/common.js, pinned 9.3.8).
+        //
+        // CYCLE 4 — this function must NEVER throw (round 2 §B):
+        // it is called from inside Send_Changes, BEFORE
+        // Reset_SavedIndex and onUnSaveLock run; an escaping
+        // exception leaves canSave false forever and every later
+        // save silently no-ops. The whole body is try/caught,
+        // and the saveChanges wrap (below) catches again around
+        // the original sdkjs call.
+        //
+        // Behavior by flush mode (window.__joFlushMode):
+        //   journal / m1 — log-only (FLUSH_SEEN). The journal
+        //     wrap on CDocsCoApi.saveChanges already recorded
+        //     the changes; stock desktop never writes the
+        //     user's file from a flush, and neither do we.
+        //   m2 — E0: snapshot the live document via
+        //     asc_nativeGetFile3 (no x2t, no write), time it
+        //     (S0), and search the bytes for the drive marker.
+        //   bound / m0 / m3 — the cycle-3 delegation to a full
+        //     LocalFileSave (m3 differs only in Rust: the
+        //     flush's conversion lands on a working-copy path
+        //     instead of the bound file).
+        LocalFileSaveChanges: function (_changes, _deleteIndex, _count) {
+            var mode = joFlushMode();
+            var lusiBefore = null, lusiAfter = null;
+            try {
+                var ref0 = getEditor();
+                if (ref0.editor) lusiBefore = ref0.editor.LastUserSavedIndex;
+            } catch (e) { /* ledger input only */ }
+            try {
+                joLedger('FLUSH_SEEN', null, {
+                    mode: mode,
+                    deleteIndex: _deleteIndex,
+                    count: _count,
+                    chars: (_changes && _changes.length) || 0
+                });
+                if (mode === 'journal' || mode === 'm1') {
+                    // Log-only. Nothing else is owed.
+                } else if (mode === 'm2') {
+                    joE0Snapshot('flush');
+                } else {
+                    // bound / m0 / m3: cycle-3 delegation. A
+                    // flush arriving while ANOTHER save is in
+                    // flight trails — that save is a different
+                    // gesture, the editor stays dirty, and the
+                    // changes re-flush afterwards.
+                    if (joSave.pendingSeq !== null) {
+                        joSave.trailingFlush = true;
+                        joLedger('SAVE_TRAILING_FLUSH', joSave.pendingSeq, {});
+                    } else {
+                        joSave.nextOrigin = 'changes';
+                        window.AscDesktopEditor.LocalFileSave.apply(
+                            window.AscDesktopEditor,
+                            [_changes, undefined, undefined, undefined, undefined]);
+                    }
+                }
+            } catch (e) {
+                console.error('[jOffice][save-ledger] FLUSH_THROW swallowed: '
+                    + (e && e.message ? e.message : e));
             }
-            joSave.nextOrigin = 'changes';
-            window.AscDesktopEditor.LocalFileSave.apply(
-                window.AscDesktopEditor,
-                [_param, _password, _docinfo, _fileType, _jsonOptions]);
+            try {
+                var ref1 = getEditor();
+                if (ref1.editor) lusiAfter = ref1.editor.LastUserSavedIndex;
+            } catch (e) { /* ledger input only */ }
+            if (lusiBefore !== null && lusiAfter !== null && lusiBefore !== lusiAfter) {
+                joLedger('FLUSH_MOVED_USI', null, { from: lusiBefore, to: lusiAfter, mode: mode });
+            }
         },
 
         // Called by sdkjs when the editor is ready to open a document.
@@ -966,45 +1598,12 @@
                     // pending-file reply (cycle 2): boundSaved is
                     // the LocalFileGetSaved value for this open.
                     if (pending.boundSaved !== undefined) joSave.boundSaved = !!pending.boundSaved;
-                    return bridge('convertFile', { path: pending.handle }).then(function (res) {
-                        if (!res || !res.data) throw new Error('convertFile returned no data');
+                    return joBridgeOpen('convertFile', { path: pending.handle, forOpen: true }, joOpenWellFormed).then(function (res) {
+                        if (!res || (!res.data && !res.binUrl)) throw new Error('convertFile returned no data');
                         if (res.name) currentDocName = res.name;
-                        joOpenStage.stage = 'received';
-                        console.log('[jOffice][measure] OPEN_STAGE received t=' + Date.now()
-                            + ' b64_chars=' + res.data.length);
-                        var bin = _b64ToBytes(res.data);
-                        joOpenStage.stage = 'decoded';
-                        console.log('[jOffice][measure] OPEN_STAGE decoded t=' + Date.now()
-                            + ' bin_bytes=' + bin.length);
-                        console.log('[jOffice][measure] OPEN_STAGE endload_begin t=' + Date.now()
-                            + ' bin_bytes=' + Math.floor(res.data.length * 3 / 4));
-                        // INSTRUMENTATION (Kagi round 3): log which loader
-                        // path executes. If DesktopOfflineAppDocumentEndLoad
-                        // is namespaced / absent, the fallback may itself
-                        // fail to construct OpenFileResult — this log is
-                        // the first thing to check on a spinner.
-                        if (typeof window.DesktopOfflineAppDocumentEndLoad === 'function') {
-                            console.log('[jOffice] using DesktopOfflineAppDocumentEndLoad');
-                            // Contract (sdkjs Local/common.js): _data is a
-                            // BASE64 STRING (or binary_content:// URL);
-                            // _len is the decoded byte length. Passing the
-                            // Uint8Array itself breaks Base64.decode inside
-                            // getBinaryArray (cycle 2 fix).
-                            joOpenStage.stage = 'endload_in';
-                            window.DesktopOfflineAppDocumentEndLoad(pending.name || '', res.data, bin.length);
-                            joOpenStage.stage = 'endload_out';
-                            console.log('[jOffice][measure] OPEN_STAGE endload_done t=' + Date.now());
-                            setTimeout(joHandshake, 300);
-                        } else {
-                            console.warn('[jOffice] DesktopOfflineAppDocumentEndLoad MISSING, using fallback openDocument');
-                            var ref = getEditor();
-                            if (!ref.editor) throw new Error('no editor API');
-                            var file = new ref.ew.AscCommon.OpenFileResult();
-                            file.data = bin;
-                            file.bSerFormat = true;
-                            file.url = pending.name || '';
-                            ref.editor.openDocument(file);
-                        }
+                        // Cycle 4: ONE open path (joOpen) for
+                        // base64 and session-URL transports.
+                        joOpenWithBin(res, pending.name || res.name || '', false);
                     });
                 }).catch(function (e) {
                     console.error('[jOffice] LocalStartOpen failed: ' + (e && e.message ? e.message : e));
@@ -1013,7 +1612,8 @@
         },
 
         OpenFilenameDialog: function (filterType, allowMultiple, callback) {
-            bridge('openFileDialog', { filterType: filterType || 'any', allowMultiple: !!allowMultiple })
+            joBridgeOpen('openFileDialog', { filterType: filterType || 'any', allowMultiple: !!allowMultiple },
+                function (res) { return !!res && ('handle' in res); })
                 .then(function (res) {
                     if (res && res.handle && callback) {
                         // Remember the file name behind the
@@ -1035,17 +1635,11 @@
         LocalFileOpen: function (path) {
             // path is an opaque handle from OpenFilenameDialog.
             // Rust resolves it, converts via x2t, returns Editor.bin.
-            bridge('openFile', { path: path || null }).then(function (res) {
-                if (res && res.data) {
+            joBridgeOpen('openFile', { path: path || null }, joOpenWellFormed).then(function (res) {
+                if (res && (res.data || res.binUrl)) {
                     if (res.boundSaved !== undefined) joSave.boundSaved = !!res.boundSaved;
-                    joSave.handshakeSent = false;
-                    var bin = _b64ToBytes(res.data);
-                    if (typeof window.DesktopOfflineAppDocumentEndLoad === 'function') {
-                        // Base64 string + decoded byte length, as in
-                        // LocalStartOpen (see the contract note there).
-                        window.DesktopOfflineAppDocumentEndLoad(res.name || '', res.data, bin.length);
-                        setTimeout(joHandshake, 300);
-                    }
+                    // Cycle 4: the same joOpen path as startup.
+                    joOpenWithBin(res, res.name || '', true);
                 }
             }).catch(function (e) {
                 console.error('[jOffice] LocalFileOpen failed: ' + (e && e.message ? e.message : e));
@@ -1112,6 +1706,21 @@
                 unmodified = ref.editor && typeof ref.editor.isDocumentModified === 'function'
                     ? !ref.editor.isDocumentModified() : false;
             } catch (e) { /* leave false */ }
+            // Journal mode (cycle 4): sdkjs calls the document
+            // unmodified once a FLUSH has sent the changes —
+            // but the flush journaled them; the bound file does
+            // NOT hold them. "Unmodified" for the shell's §6a
+            // shortcuts (no-op Ctrl+S, byte-copy Save As) must
+            // mean the FILE holds the document: any journaled
+            // item beyond the last bound save defeats it.
+            if (unmodified && joJournalMode() && joJournal.enabled) {
+                var unsavedItems = Math.max(0,
+                    (joJournal.histLen || 0) - (joJournal.boundHistLen || 0));
+                if (unsavedItems > 0) {
+                    unmodified = false;
+                    joLedger('UNMOD_FORCED', seq, { unsavedItems: unsavedItems });
+                }
+            }
             joLedger('localfilesave', seq, {
                 saveAs: isSaveAs, fileType: fileType || 0, origin: origin,
                 isPrint: !!opts.isPrint, unmodified: unmodified
@@ -1133,15 +1742,55 @@
             }
             try {
                 var tGet = Date.now();
-                var binData = ref.editor.asc_nativeGetFile();
-                if (!binData) {
-                    console.error('[jOffice] LocalFileSave aborted: asc_nativeGetFile returned no data');
-                    joEndSave(seq, 'failed');
-                    return;
+                // Cycle 4 save transport: snapshot via
+                // asc_nativeGetFile3 (raw bytes, no base64) and
+                // assemble the bin; the upload path carries
+                // large bins to Rust in 8 MiB slices, small bins
+                // keep the proven base64 bridge. The base64
+                // asc_nativeGetFile path remains as the fallback
+                // if getFile3 is unavailable or malformed.
+                // The snapshot decode is ASYNC (sliced): the
+                // synchronous atob + char loop over a ~292M-char
+                // payload blocked the main thread past WebKit's
+                // 10 s IPC watchdog at 109.5 MB and the web
+                // process was aborted mid-save (cycle 4,
+                // B3-109). Everything from here to the end of
+                // proceed() runs in the snapshot continuation.
+                joGetFile3SnapshotAsync('save', function (snap) {
+                try {
+                var binBytes = null;
+                if (snap) {
+                    binBytes = joAssembleBin(snap);
+                } else {
+                    var binData = ref.editor.asc_nativeGetFile();
+                    if (!binData) {
+                        console.error('[jOffice] LocalFileSave aborted: asc_nativeGetFile returned no data');
+                        joEndSave(seq, 'failed');
+                        return;
+                    }
+                    binBytes = (typeof binData === 'string')
+                        ? _b64ToBytes(btoa(binData)) : new Uint8Array(binData);
+                    joLedger('GETFILE3_FALLBACK', seq, { len: binBytes.length });
                 }
-                var b64 = (typeof binData === 'string') ? btoa(binData) : _bytesToB64(new Uint8Array(binData));
                 console.log('[jOffice][measure] SAVE_STAGE getfile seq=' + seq
-                    + ' ms=' + (Date.now() - tGet) + ' bin_bytes=' + Math.floor(b64.length * 3 / 4));
+                    + ' ms=' + (Date.now() - tGet) + ' bin_bytes=' + binBytes.length);
+                // E0 discriminator (cycle 4, round 2 §A): is the
+                // drive's marker inside the bin this save is
+                // about to convert? Searched in the RAW bytes,
+                // before any x2t involvement.
+                if (window.__joE0Marker) {
+                    var mHit = joMarkerInBytes(binBytes);
+                    var mHist = null;
+                    try {
+                        if (window.AscCommon && window.AscCommon.History) {
+                            mHist = window.AscCommon.History.Index;
+                        }
+                    } catch (e) { /* ledger input only */ }
+                    joLedger('BIN_HAS_MARKER', seq, {
+                        where: 'save', hit: mHit || 'none', histIdx: mHist,
+                        len: binBytes.length
+                    });
+                }
                 // bin_index for the EndSave assertion (cycle 3):
                 // the history position these bytes represent.
                 try {
@@ -1176,29 +1825,60 @@
                 };
                 var absorbThis = !!joSave.absorbNext;
                 joSave.absorbNext = false;
-                bridge('saveFile', {
-                    data: b64, saveAs: isSaveAs, fileType: fileType || 0,
+                var saveArgs = {
+                    saveAs: isSaveAs, fileType: fileType || 0,
                     origin: origin, seq: seq,
                     unmodified: unmodified,
                     absorb: absorbThis,
+                    histIndex: joSave.lastBinIndex,
                     printIntent: !!opts.isPrint,
                     printPages: printPages,
                     pdfa: !!(opts.pdfa || opts.isPDFA)
-                })
-                    .then(function (res) {
-                        if (res && typeof res.ok !== 'undefined') {
-                            if (joSave.replyWaiters[seq]) {
-                                joSave.replyWaiters[seq](res);
+                };
+                var sendSave = function () {
+                    bridge('saveFile', saveArgs)
+                        .then(function (res) {
+                            if (res && typeof res.ok !== 'undefined') {
+                                if (joSave.replyWaiters[seq]) {
+                                    joSave.replyWaiters[seq](res);
+                                }
+                            } else {
+                                console.log('[jOffice][save-ledger] saveFile postMessage reply seq=' + seq + ' garbled (' + JSON.stringify(res) + '); awaiting JS-channel delivery');
                             }
-                        } else {
-                            console.log('[jOffice][save-ledger] saveFile postMessage reply seq=' + seq + ' garbled (' + JSON.stringify(res) + '); awaiting JS-channel delivery');
+                        })
+                        .catch(function (e) {
+                            if (joSave.replyWaiters[seq]) {
+                                joSave.replyWaiters[seq]({ ok: false, failed: true });
+                            }
+                        });
+                };
+                // Transport choice (round 2 §E): bins over
+                // 4 MiB — or when the drive forces it for the
+                // Bp parity test — go through the chunked
+                // upload endpoint; the bridge call then carries
+                // only the reference. Without a session (should
+                // not happen for an open document) base64 is the
+                // only channel.
+                var useUpload = !window.__joForceBase64
+                    && (binBytes.length > 4194304 || window.__joForceUpload)
+                    && !!joJournal.sid;
+                if (useUpload) {
+                    joUpload('save', String(seq), binBytes, function (ok, sha) {
+                        if (!ok) {
+                            console.error('[jOffice] save upload failed seq=' + seq);
+                            if (joSave.replyWaiters[seq]) {
+                                joSave.replyWaiters[seq]({ ok: false, failed: true });
+                            }
+                            return;
                         }
-                    })
-                    .catch(function (e) {
-                        if (joSave.replyWaiters[seq]) {
-                            joSave.replyWaiters[seq]({ ok: false, failed: true });
-                        }
+                        joLedger('SAVE_UPLOAD', seq, { bytes: binBytes.length, sha256: sha });
+                        saveArgs.uploadRef = seq;
+                        sendSave();
                     });
+                } else {
+                    saveArgs.data = _bytesToB64(binBytes);
+                    sendSave();
+                }
                 replyPromise
                     .then(function (res) {
                         console.log('[jOffice][measure] SAVE_STAGE bridge_done seq=' + seq + ' t=' + Date.now());
@@ -1229,6 +1909,25 @@
                             joEndSave(seq, 'export_ok');
                             return;
                         }
+                        if (!res || res.ok !== true) {
+                            // H6 (cycle 4): an empty or garbled
+                            // reply is a FAILURE, never a bound
+                            // success. Every real Rust reply
+                            // carries an explicit ok field; the
+                            // JS channel (__joDeliverSaveReply)
+                            // had no shape check, so an empty
+                            // object settled the save as bound_ok
+                            // with nothing written — the cycle-3
+                            // phantom-success shape, one channel
+                            // over. Fail it; the shell's
+                            // save_failed_outstanding guard then
+                            // forces a real conversion next save.
+                            console.error('[jOffice][save-ledger] saveFile reply seq=' + seq
+                                + ' unrecognized shape; treating as failure');
+                            joLedger('SAVE_REPLY_GARBLED', seq, {});
+                            joEndSave(seq, 'failed');
+                            return;
+                        }
                         // Bound save (in place, or a Save As that
                         // adopted a native path): the document is
                         // now bound to a saved native file.
@@ -1239,6 +1938,11 @@
                         console.error('[jOffice] LocalFileSave failed: ' + (e && e.message ? e.message : e));
                         joEndSave(seq, 'failed');
                     });
+                } catch (e) {
+                    console.error('[jOffice] LocalFileSave error: ' + (e && e.message ? e.message : e));
+                    joEndSave(seq, 'failed');
+                }
+                });
             } catch (e) {
                 console.error('[jOffice] LocalFileSave error: ' + (e && e.message ? e.message : e));
                 joEndSave(seq, 'failed');
@@ -1282,6 +1986,11 @@
             var ext = (info.name.split('.').pop() || 'png').toLowerCase();
             var localName = 'ins_' + (++joImages.counter) + '.' + ext;
             info.localName = localName;
+            // K6: a new image binding exists only in this
+            // editor's image table; the journal must fold the
+            // document into a new seed at the insert's flush
+            // or a crash loses the binding (see joJournalRecord).
+            joJournal.imageStaged = true;
             joImages.byName[localName] = info;
             console.log('[jOffice] LocalFileGetImageUrl staged ' + localName + ' for ' + info.name);
             bridge('stageImage', { handle: url, name: localName }).catch(function (e) {
@@ -1300,7 +2009,7 @@
         },
 
         convertFile: function (filePath, targetFormat, callback) {
-            bridge('convertFile', { path: filePath, targetFormat: targetFormat || 0 })
+            joBridgeOpen('convertFile', { path: filePath, targetFormat: targetFormat || 0 }, joOpenWellFormed)
                 .then(function (res) {
                     if (!res || !res.data) {
                         if (callback) callback(null);
@@ -1325,7 +2034,7 @@
         // Compare / merge: decode base64 to raw bytes, pass BYTE length.
         // Passing base64 length / base64 string is wrong.
         CompareDocumentFile: function (file, oOptions) {
-            bridge('convertFile', { path: file }).then(function (res) {
+            joBridgeOpen('convertFile', { path: file }, joOpenWellFormed).then(function (res) {
                 var ref = getEditor();
                 if (ref.ew && ref.ew.onDocumentCompare && res && res.data) {
                     var bytes = _b64ToBytes(res.data);
@@ -1337,7 +2046,7 @@
         },
 
         MergeDocumentFile: function (file, oOptions) {
-            bridge('convertFile', { path: file }).then(function (res) {
+            joBridgeOpen('convertFile', { path: file }, joOpenWellFormed).then(function (res) {
                 var ref = getEditor();
                 if (ref.ew && ref.ew.onDocumentMerge && res && res.data) {
                     var bytes = _b64ToBytes(res.data);
@@ -1348,6 +2057,343 @@
             });
         }
     };
+
+    // -----------------------------------------------------------
+    // Journal wrap (marathon 2 cycle 4, mode J; KAO round 2 §C
+    // is the design authority, read against the pinned 9.3.8
+    // sources).
+    //
+    // CDocsCoApi.prototype.saveChanges receives the RAW change
+    // array before the Local override joins it into a string
+    // for AscDesktopEditor.LocalFileSaveChanges. The wrap:
+    //   * asserts the wire format of every element
+    //     (<len>;<base64>) — a mismatch means the format
+    //     changed under us, so the record is NOT journaled and
+    //     an epoch checkpoint (a full getFile3 snapshot) takes
+    //     its place;
+    //   * assigns epoch + seq synchronously, in call order;
+    //   * takes epoch checkpoints on the four correctness
+    //     triggers (format / history_cleared / undo_then_type /
+    //     below_base) — the checkpoint snapshot is taken
+    //     synchronously HERE, while the document equals every
+    //     point being sent, and the triggering record is
+    //     absorbed into the new seed, never journaled;
+    //   * NEVER throws, and never lets the original throw
+    //     either: Send_Changes calls saveChanges BEFORE
+    //     Reset_SavedIndex and onUnSaveLock, so an escaping
+    //     exception wedges canSave false and silently kills
+    //     every later save (round 2 §B; test T1).
+    // -----------------------------------------------------------
+    var JO_WIRE_RE = /^\d+;[A-Za-z0-9+\/=]*$/;
+
+    // Chunked upload to the session endpoint (round 2 §E):
+    // 8 MiB slices via XHR POST (Uint8Array.slice copies —
+    // NEVER a Blob body; WebKitGTK's get_http_body SIGSEGVs on
+    // Blob bodies), then a commit POST with the slice count
+    // and exact length. Rust assembles, verifies, and answers
+    // with the SHA-256. done(ok, sha256).
+    function joUpload(kind, key, bytes, done) {
+        var SLICE = 8 * 1024 * 1024;
+        // Zero-length upload: commit directly with of=0. (An
+        // XHR with a 0-length Uint8Array body over the custom
+        // scheme never reaches the handler in WebKitGTK —
+        // U0 caught it.)
+        if (bytes.length === 0) {
+            var cxhr = new XMLHttpRequest();
+            var cbase = 'joffice:///session/' + joJournal.sid + '/upload/' + kind + '/' + key;
+            cxhr.open('POST', cbase + '/commit', true);
+            try {
+                cxhr.setRequestHeader('X-JOffice-Secret', window.__joSecret || '');
+                cxhr.setRequestHeader('Content-Type', 'application/json');
+            } catch (e) { /* as below */ }
+            cxhr.onload = function () {
+                if (cxhr.status !== 200) { done(false, null); return; }
+                var sha = null;
+                try { sha = JSON.parse(cxhr.responseText).sha256; } catch (e) { /* evidence only */ }
+                done(true, sha);
+            };
+            cxhr.onerror = function () { done(false, null); };
+            cxhr.send(JSON.stringify({ of: 0, len: 0 }));
+            return;
+        }
+        var n = Math.max(1, Math.ceil(bytes.length / SLICE));
+        var base = 'joffice:///session/' + joJournal.sid + '/upload/' + kind + '/' + key;
+        var i = 0;
+        function postSlice() {
+            if (i >= n) { commit(); return; }
+            var part = bytes.slice(i * SLICE, Math.min(bytes.length, (i + 1) * SLICE));
+            var xhr = new XMLHttpRequest();
+            xhr.open('POST', base + '/' + i, true);
+            try { xhr.setRequestHeader('X-JOffice-Secret', window.__joSecret || ''); } catch (e) { /* header is defense in depth */ }
+            xhr.onload = function () {
+                if (xhr.status !== 200) { done(false, null); return; }
+                i++;
+                postSlice();
+            };
+            xhr.onerror = function () { done(false, null); };
+            xhr.send(part);
+        }
+        function commit() {
+            var xhr = new XMLHttpRequest();
+            xhr.open('POST', base + '/commit', true);
+            try {
+                xhr.setRequestHeader('X-JOffice-Secret', window.__joSecret || '');
+                xhr.setRequestHeader('Content-Type', 'application/json');
+            } catch (e) { /* as above */ }
+            xhr.onload = function () {
+                if (xhr.status !== 200) { done(false, null); return; }
+                var sha = null;
+                try { sha = JSON.parse(xhr.responseText).sha256; } catch (e) { /* sha is evidence, not control flow */ }
+                done(true, sha);
+            };
+            xhr.onerror = function () { done(false, null); };
+            xhr.send(JSON.stringify({ of: n, len: bytes.length }));
+        }
+        postSlice();
+    }
+    window.__joUpload = joUpload;
+
+    function joJournalSend(record) {
+        // Records under 1 MB ride the bridge; larger ones go
+        // through the session upload endpoint first and the
+        // bridge call references the uploaded payload (round 1
+        // §2c — the bridge's reply channel is not the limit
+        // here, but a multi-MB postMessage per flush is a stall
+        // risk on the editor's main thread).
+        var payload = JSON.stringify(record.changes);
+        if (payload.length < 1000000) {
+            bridge('journalAppend', {
+                sid: joJournal.sid, epoch: record.epoch, seq: record.seq,
+                deleteIndex: record.deleteIndex, changes: record.changes,
+                excel: record.excel || null
+            }).catch(function (e) {
+                joLedger('JOURNAL_APPEND_FAIL', null, {
+                    seq: record.seq, err: String(e && e.message || e)
+                });
+            });
+            return;
+        }
+        joUpload('journal', String(record.seq),
+            new TextEncoder().encode(payload),
+            function (ok) {
+                if (!ok) {
+                    joLedger('JOURNAL_UPLOAD_FAIL', null, { seq: record.seq });
+                    return;
+                }
+                bridge('journalAppend', {
+                    sid: joJournal.sid, epoch: record.epoch, seq: record.seq,
+                    deleteIndex: record.deleteIndex, uploadRef: record.seq,
+                    excel: record.excel || null
+                }).catch(function (e) {
+                    joLedger('JOURNAL_APPEND_FAIL', null, {
+                        seq: record.seq, err: String(e && e.message || e)
+                    });
+                });
+            });
+    }
+
+    function joJournalCheckpoint(trigger, histLenAfter) {
+        // The CAPTURE is synchronous and exact (asc_native-
+        // GetFile3 runs inside the saveChanges call, so the
+        // serialized state is the state the triggering record
+        // describes). The base64 decode and the commit are
+        // async; records arriving while either is in flight
+        // queue in JS and flush into the NEW epoch when the
+        // commit lands — Rust commits seed-<epoch>.bin by
+        // rename BEFORE any record of that epoch is appended
+        // (round 2 §C). The decode went async in cycle 4 after
+        // the synchronous atob + char loop tripped WebKit's
+        // 10 s IPC watchdog at 109.5 MB (B3-109/S0-109).
+        if (joJournal.checkpointBusy) {
+            joLedger('JOURNAL_CHECKPOINT_BUSY', null, { trigger: trigger });
+            return;
+        }
+        joJournal.checkpointBusy = true;
+        joGetFile3SnapshotAsync('checkpoint:' + trigger, function (snap) {
+        if (!snap) {
+            joJournal.checkpointBusy = false;
+            joLedger('JOURNAL_CHECKPOINT_FAIL', null, { trigger: trigger, why: 'snapshot' });
+            // Records queued during the decode belong to the
+            // OLD epoch (no new seed exists); send them there,
+            // exactly as the commit-failure branch below does.
+            var stuck = joJournal.pendingRecords || [];
+            joJournal.pendingRecords = [];
+            for (var s = 0; s < stuck.length; s++) joJournalSend(stuck[s]);
+            return;
+        }
+        var bin = joAssembleBin(snap);
+        var newEpoch = joJournal.epoch + 1;
+        var finish = function (ok) {
+            joJournal.checkpointBusy = false;
+            if (ok) {
+                joJournal.epoch = newEpoch;
+                joJournal.base = histLenAfter;
+                joJournal.seq = 0;
+                joJournal.openChanges = joJournal.unsavedFloor || 0;
+                joLedger('JOURNAL_CHECKPOINT', null, {
+                    trigger: trigger, epoch: newEpoch, base: histLenAfter, binBytes: bin.length
+                });
+                var queued = joJournal.pendingRecords || [];
+                joJournal.pendingRecords = [];
+                for (var i = 0; i < queued.length; i++) joJournalSend(queued[i]);
+            } else {
+                joLedger('JOURNAL_CHECKPOINT_FAIL', null, { trigger: trigger, why: 'commit' });
+                // Queued records stay in the OLD epoch: their
+                // deleteIndex values are still valid there, and
+                // the Rust fold's reset/BeyondEnd rules keep a
+                // later recovery honest (prefix + banner).
+                var queued2 = joJournal.pendingRecords || [];
+                joJournal.pendingRecords = [];
+                for (var j = 0; j < queued2.length; j++) joJournalSend(queued2[j]);
+            }
+        };
+        var args = {
+            secret: window.__joSecret || '',
+            sid: joJournal.sid, epoch: newEpoch, trigger: trigger,
+            base: histLenAfter
+        };
+        if (bin.length <= 4194304) {
+            args.data = _bytesToB64(bin);
+            bridge('journalCheckpoint', args).then(function (res) {
+                finish(!!(res && res.ok));
+            }).catch(function () { finish(false); });
+        } else {
+            joUpload('ckpt', String(newEpoch), bin, function (ok) {
+                if (!ok) { finish(false); return; }
+                args.uploadRef = newEpoch;
+                bridge('journalCheckpoint', args).then(function (res) {
+                    finish(!!(res && res.ok));
+                }).catch(function () { finish(false); });
+            });
+        }
+        });
+    }
+
+    function joJournalRecord(arrayChanges, deleteIndex, excel) {
+        if (!joJournalMode() || !joJournal.enabled || !joJournal.sid) return;
+        if (joJournal.replaying) return;
+        var changes = arrayChanges || [];
+        // One-time sample of the real wire form (E0b evidence).
+        if (!joJournal.sampleLogged) {
+            joJournal.sampleLogged = true;
+            joLedger('JOURNAL_SAMPLE', null, {
+                first: changes.length ? String(changes[0]).slice(0, 48) : '(empty)',
+                n: changes.length, deleteIndex: deleteIndex
+            });
+        }
+        var formatOk = true;
+        for (var i = 0; i < changes.length; i++) {
+            if (typeof changes[i] !== 'string' || !JO_WIRE_RE.test(changes[i])) {
+                formatOk = false;
+                break;
+            }
+        }
+        var histLenAfter = (deleteIndex === null || deleteIndex === undefined)
+            ? changes.length : deleteIndex + changes.length;
+        var trigger = null;
+        if (!formatOk) trigger = 'format';
+        else if ((deleteIndex === null || deleteIndex === undefined) && joJournal.seq > 0) {
+            trigger = 'history_cleared';
+        } else if (joJournal.anomaly) {
+            trigger = 'undo_then_type';
+            joJournal.anomaly = null;
+        } else if (deleteIndex !== null && deleteIndex !== undefined
+            && deleteIndex < joJournal.base) {
+            trigger = 'below_base';
+        }
+        // Cycle 4 K6: an image inserted since the last
+        // checkpoint binds its staged name only in the live
+        // editor's image table — the journal's change records
+        // carry local-user ids, not names, so a replay from
+        // the pre-insert seed loses the binding and the
+        // recovered document serializes a nameless image
+        // (x2t then writes a dangling media reference; the
+        // SAVE_MEDIA_MISSING guard refuses that save). Fold
+        // the document into a new seed at the insert's own
+        // flush: the snapshot carries the name.
+        if (!trigger && joJournal.imageStaged) {
+            trigger = 'image_staged';
+        }
+        if (trigger) {
+            joJournal.imageStaged = false;
+            joJournal.histLen = histLenAfter;
+            joJournalCheckpoint(trigger, histLenAfter);
+            return;
+        }
+        joJournal.seq += 1;
+        joJournal.histLen = histLenAfter;
+        joJournal.openChanges = Math.max(0, histLenAfter - joJournal.base,
+            joJournal.unsavedFloor || 0);
+        var record = {
+            epoch: joJournal.epoch, seq: joJournal.seq,
+            deleteIndex: (deleteIndex === undefined ? null : deleteIndex),
+            changes: changes.slice(), excel: excel || null
+        };
+        if (joJournal.checkpointBusy) {
+            (joJournal.pendingRecords = joJournal.pendingRecords || []).push(record);
+            joLedger('JOURNAL_QUEUED', null, { seq: record.seq, epoch: record.epoch });
+            return;
+        }
+        joJournalSend(record);
+    }
+
+    (function installJournalWrap() {
+        setInterval(function () {
+            var A = window.AscCommon;
+            if (!A) return;
+            if (A.CDocsCoApi && A.CDocsCoApi.prototype
+                && typeof A.CDocsCoApi.prototype.saveChanges === 'function'
+                && !A.CDocsCoApi.prototype.saveChanges.__joWrapped) {
+                var orig = A.CDocsCoApi.prototype.saveChanges;
+                var wrapped = function (arrayChanges, deleteIndex, excelAdditionalInfo) {
+                    try {
+                        joJournalRecord(arrayChanges, deleteIndex, excelAdditionalInfo);
+                    } catch (e) {
+                        joLedger('JOURNAL_WRAP_THROW', null, { err: String(e) });
+                    }
+                    try {
+                        return orig.apply(this, arguments);
+                    } catch (e) {
+                        // Swallowed on purpose (round 2 §B): the
+                        // caller is Send_Changes, and it still
+                        // owes the editor Reset_SavedIndex +
+                        // onUnSaveLock. A host-side failure must
+                        // not wedge canSave.
+                        joLedger('SAVECHANGES_THROW', null, { err: String(e) });
+                    }
+                };
+                wrapped.__joWrapped = true;
+                A.CDocsCoApi.prototype.saveChanges = wrapped;
+                console.log('[jOffice][save-ledger] saveChanges journal wrap asserted');
+            }
+            // Create_NewPoint anomaly watch (round 2 §C): a new
+            // point created BELOW the saved index is the
+            // undo-then-type shape. The pinned 9.3.8 editors
+            // already rescue SavedIndex inside Create_NewPoint;
+            // this wrap is the never-cut safety net for every
+            // other path that can move it.
+            if (A.CHistory && A.CHistory.prototype
+                && typeof A.CHistory.prototype.Create_NewPoint === 'function'
+                && !A.CHistory.prototype.Create_NewPoint.__joWrapped) {
+                var origCnp = A.CHistory.prototype.Create_NewPoint;
+                var wrappedCnp = function () {
+                    try {
+                        if (this.SavedIndex !== null && this.SavedIndex !== undefined
+                            && this.Index < this.SavedIndex) {
+                            joJournal.anomaly = 'undo_then_type';
+                            joLedger('CREATE_POINT_BELOW_SAVED', null, {
+                                index: this.Index, savedIndex: this.SavedIndex
+                            });
+                        }
+                    } catch (e) { /* watch only */ }
+                    return origCnp.apply(this, arguments);
+                };
+                wrappedCnp.__joWrapped = true;
+                A.CHistory.prototype.Create_NewPoint = wrappedCnp;
+                console.log('[jOffice][save-ledger] Create_NewPoint anomaly wrap asserted');
+            }
+        }, 25);
+    })();
 
     // -----------------------------------------------------------
     // Font-load survivability + ledger (marathon 2 cycle 1;
@@ -1554,6 +2600,40 @@
         var bytes = new Uint8Array(raw.length);
         for (var i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
         return bytes;
+    }
+
+    // Sliced base64 decode for very large payloads: the naive
+    // form above (one atob over the whole string + a per-char
+    // loop) blocked the page main thread for minutes at
+    // 109.5 MB and tripped WebKit's crashAfter10Seconds IPC
+    // watchdog (cycle 4, B3-109/S0-109). Decoding in 4 MiB
+    // slices inside setTimeout keeps the main thread
+    // servicing IPC between slices. Slice boundaries are
+    // multiples of 4 chars, so no base64 quartet is ever
+    // split (padding can only appear in the final slice).
+    // done(Uint8Array) on success, done(null) on a decode
+    // error. (The pattern is the Bp harness's, promoted into
+    // the product after it proved itself at 219 MB.)
+    function _b64ToBytesSliced(b64, done) {
+        var est = Math.floor(b64.length / 4) * 3;
+        var out = new Uint8Array(est);
+        var off = 0, pos = 0;
+        var CH = 4194304;
+        (function step() {
+            var end = Math.min(b64.length, pos + CH);
+            var bin;
+            try {
+                bin = atob(b64.substring(pos, end));
+            } catch (e) {
+                done(null);
+                return;
+            }
+            for (var i = 0; i < bin.length; i++) out[off + i] = bin.charCodeAt(i);
+            off += bin.length;
+            pos = end;
+            if (pos < b64.length) setTimeout(step, 0);
+            else done(out.subarray(0, off));
+        })();
     }
 
     function _bytesToB64(bytes) {

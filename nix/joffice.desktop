@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=jOffice
+Comment=Documents, spreadsheets and presentations (Euro-Office editors, native shell)
+Exec=joffice-shell --file %f
+Icon=joffice
+Terminal=false
+Type=Application
+Categories=Office;WordProcessor;Spreadsheet;Presentation;
+MimeType=application/vnd.openxmlformats-officedocument.wordprocessingml.document;application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;application/vnd.openxmlformats-officedocument.presentationml.presentation;application/msword;application/vnd.ms-excel;application/vnd.ms-powerpoint;application/vnd.oasis.opendocument.text;application/vnd.oasis.opendocument.spreadsheet;application/vnd.oasis.opendocument.presentation;application/pdf;
+StartupWMClass=io.nowlin.jOffice
