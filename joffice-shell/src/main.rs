@@ -6945,7 +6945,31 @@ fn handle_protected_dialog_completion(
 /// arm and the action-bar Print button — the gate must not
 /// depend on which door the print came through. Err carries
 /// the user-facing reason (already bannered/ledgered here).
+thread_local! {
+    /// Single-flight for the protected print gate: the
+    /// action-bar Print button and the editor's printRequest
+    /// bridge arm BOTH call protected_pdf_print_source, and
+    /// the disclosure confirm pumps the main context — a
+    /// second door arriving while the first is parked in its
+    /// confirm stacked a second disclosure dialog on top of
+    /// it (p3 drive, protected cycle). The second door now
+    /// refuses quietly instead of stacking.
+    static PRINT_GATE_ACTIVE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 fn protected_pdf_print_source(shell: &Rc<Shell>) -> Result<PathBuf, String> {
+    if PRINT_GATE_ACTIVE.with(|a| a.get()) {
+        eprintln!("joffice: PDF_PRINT_GATE busy (second print door refused)");
+        return Err("a print is already in progress".to_string());
+    }
+    PRINT_GATE_ACTIVE.with(|a| a.set(true));
+    let r = protected_pdf_print_source_inner(shell);
+    PRINT_GATE_ACTIVE.with(|a| a.set(false));
+    r
+}
+
+fn protected_pdf_print_source_inner(shell: &Rc<Shell>) -> Result<PathBuf, String> {
     let (info, src) = {
         let doc = shell.doc.borrow();
         let d = doc.as_ref().ok_or("no document open")?;
