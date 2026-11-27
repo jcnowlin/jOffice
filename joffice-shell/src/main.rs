@@ -5717,39 +5717,28 @@ fn modal_parent(shell: &Rc<Shell>) -> Option<gtk4::Window> {
         .map(|w| w.upcast::<gtk4::Window>())
 }
 
-fn run_nested_modal(win: &gtk4::Window) {
+fn run_nested_modal(win: &gtk4::Window, decided: &Rc<RefCell<bool>>) {
+    // The pump (protected cycle drive finding, reproduced
+    // in a 150-line minimal app): on this GTK 4.18 + labwc
+    // stack, GtkWidget::destroy() called from a button
+    // handler unmaps the window but the destroy signal
+    // NEVER fires — final destruction is deferred to a
+    // frame tick the dead surface never receives — so a
+    // nested MainLoop keyed on destroy (or close-request)
+    // spins forever with the dialog already gone from the
+    // screen. gtk_dialog_run never made that mistake: it
+    // pumped the main context until a RESPONSE FLAG was
+    // set. Same pattern here: the handlers set `decided`,
+    // this loop pumps the default context until it flips,
+    // and destroy() at the end is fire-and-forget cleanup
+    // whose completion nothing waits on.
     eprintln!("joffice: MODAL enter thread={:?}", std::thread::current().id());
-    let loop_ = gtk4::glib::MainLoop::new(None, false);
-    // Drive finding (protected cycle): GtkWindow::close() on
-    // this stack HIDES the window — it leaves the screen and
-    // the compositor's toplevel list, but destroy never
-    // fires. A loop keyed only on destroy therefore spins
-    // forever with the dialog invisible. Quit on
-    // close-request as well, and destroy explicitly once
-    // the loop is out.
-    let destroyed = Rc::new(std::cell::Cell::new(false));
-    {
-        let quit = loop_.clone();
-        let destroyed = destroyed.clone();
-        win.connect_destroy(move |_| {
-            destroyed.set(true);
-            eprintln!("joffice: MODAL destroy seen");
-            quit.quit()
-        });
-    }
-    {
-        let quit = loop_.clone();
-        win.connect_close_request(move |_| {
-            eprintln!("joffice: MODAL close-request seen");
-            quit.quit();
-            gtk4::glib::Propagation::Proceed
-        });
-    }
     win.present();
-    loop_.run();
-    if !destroyed.get() {
-        win.destroy();
+    let ctx = gtk4::glib::MainContext::default();
+    while !*decided.borrow() {
+        ctx.iteration(true);
     }
+    win.destroy();
     eprintln!("joffice: MODAL exit");
 }
 
@@ -5837,10 +5826,21 @@ fn prompt_password_sync(
     }
     {
         let win_c = win.clone();
-        cancel.connect_clicked(move |_| win_c.destroy());
+        let decided_c = decided.clone();
+        cancel.connect_clicked(move |_| {
+            *decided_c.borrow_mut() = true;
+            win_c.destroy();
+        });
+    }
+    {
+        let decided = decided.clone();
+        win.connect_close_request(move |_| {
+            *decided.borrow_mut() = true;
+            gtk4::glib::Propagation::Proceed
+        });
     }
     entry.grab_focus();
-    run_nested_modal(&win);
+    run_nested_modal(&win, &decided);
     let out = result.borrow().clone();
     eprintln!("joffice: PW_PROMPT exit answered={}", out.is_some());
     out
@@ -5924,10 +5924,21 @@ fn prompt_new_password_sync(
     }
     {
         let win_c = win.clone();
-        cancel.connect_clicked(move |_| win_c.destroy());
+        let decided_c = decided.clone();
+        cancel.connect_clicked(move |_| {
+            *decided_c.borrow_mut() = true;
+            win_c.destroy();
+        });
+    }
+    {
+        let decided = decided.clone();
+        win.connect_close_request(move |_| {
+            *decided.borrow_mut() = true;
+            gtk4::glib::Propagation::Proceed
+        });
     }
     e1.grab_focus();
-    run_nested_modal(&win);
+    run_nested_modal(&win, &decided);
     let out = result.borrow().clone();
     eprintln!("joffice: PW_PROMPT exit answered={}", out.is_some());
     out
@@ -5990,19 +6001,33 @@ fn confirm_sync(shell: &Rc<Shell>, title: &str, body: &str, ok_label: &str) -> b
     vbox.append(&hbox);
     win.set_child(Some(&vbox));
     let result: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+    let decided: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
     {
         let result = result.clone();
+        let decided = decided.clone();
         let win_c = win.clone();
         ok.connect_clicked(move |_| {
             *result.borrow_mut() = true;
+            *decided.borrow_mut() = true;
             win_c.destroy();
         });
     }
     {
+        let decided = decided.clone();
         let win_c = win.clone();
-        cancel.connect_clicked(move |_| win_c.destroy());
+        cancel.connect_clicked(move |_| {
+            *decided.borrow_mut() = true;
+            win_c.destroy();
+        });
     }
-    run_nested_modal(&win);
+    {
+        let decided = decided.clone();
+        win.connect_close_request(move |_| {
+            *decided.borrow_mut() = true;
+            gtk4::glib::Propagation::Proceed
+        });
+    }
+    run_nested_modal(&win, &decided);
     let out = *result.borrow();
     out
 }
