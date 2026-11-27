@@ -1465,6 +1465,11 @@ struct PendingSave {
     /// bound file; a Download-As (fileType 513) is an export
     /// and does not rebind.
     pdf_adopt: bool,
+    /// The capture's stream kind (delta/full/unknown) as
+    /// computed by the shim from the history's delete index
+    /// (cycle 5 continuation, X5) — carried to the merge's
+    /// target gate for its ledger.
+    pdf_stream_kind: Option<String>,
 }
 
 /// A print-intent export parked on the native print dialog
@@ -1672,6 +1677,17 @@ struct Shell {
     /// (cycle 4): consumed by write_save_checked to record
     /// last_bound_save_index in the session manifest.
     pending_hist_index: RefCell<Option<i64>>,
+    /// Cycle 5 continuation (KAO round 3, X1): the immutable
+    /// merge origin for this window's annotate-mode PDF — a
+    /// private copy of the exact bytes the editor opened
+    /// (the session seed, or a temp fallback copy when no
+    /// session exists). viewer.Save() describes state
+    /// relative to THOSE bytes, so every merge in the
+    /// session targets them — never the bound file, which
+    /// our own saves replace (the repeat-save duplication:
+    /// merging save 2 into save 1's output appended the
+    /// compiled stream onto annotations it already carried).
+    pdf_origin: RefCell<Option<PathBuf>>,
     /// The ViewOnly "Save a Copy…" button (cycle 4 step 4).
     copy_btn: RefCell<Option<gtk4::Button>>,
     /// The "Read-only" badge shown on ViewOnly windows.
@@ -1817,6 +1833,7 @@ impl Shell {
             secret: new_secret(),
             sdk_hash,
             session: RefCell::new(None),
+            pdf_origin: RefCell::new(None),
             recovery_arm: RefCell::new(None),
             session_discard: RefCell::new(false),
             pending_hist_index: RefCell::new(None),
@@ -2003,6 +2020,10 @@ impl Shell {
     /// previous file). A session with unsaved journal work is
     /// KEPT as a recovery candidate; a clean one is deleted.
     fn session_rotate_out(&self) {
+        // A new document owns the window: the old PDF's
+        // merge origin (often a path INSIDE the retired
+        // session's dir) must not leak into the next one.
+        *self.pdf_origin.borrow_mut() = None;
         let old = self.session.borrow_mut().take();
         if let Some(st) = old {
             let keep = st.unsaved() > 0 || st.recovered_unsaved;
@@ -5172,23 +5193,152 @@ fn x2t_merge_pdf_sync(
     Ok(out_pdf)
 }
 
-/// Stage + run the A1 merge on a worker thread, verify with
+/// What a PDF merge feeds x2t (cycle 5 continuation):
+/// the compiled viewer.Save() stream (route A1), or the
+/// session journal's folded wire records written as
+/// changes0.json (route A2 — stock's own route; framing
+/// parity with stock's recover file verified against the
+/// preserved DE__ppl0W9 artifact: every record is
+/// "<len>;<base64>" with len == the decoded byte count,
+/// in both files).
+enum PdfMergeInput {
+    Compiled(Vec<u8>),
+    Wire(Vec<String>),
+}
+
+/// The registered immutable merge origin for this window's
+/// annotate-mode PDF (X1), if one was registered at open.
+fn pdf_registered_origin(shell: &Rc<Shell>) -> Option<PathBuf> {
+    shell.pdf_origin.borrow().clone()
+}
+
+/// Diagnostic (X5 experiment): force the merge base back
+/// to the bound file — the pre-X1 behavior. Env value "1"
+/// forces always; any other value is a path and forces
+/// while that file exists (a drive can toggle it mid-
+/// session). The target gate in pdf_merge_and_write must
+/// refuse every such merge.
+fn pdf_force_bound_target() -> bool {
+    match std::env::var("JOFFICE_PDF_FORCE_BOUND_TARGET") {
+        Ok(v) if v == "1" => true,
+        Ok(v) if !v.is_empty() => Path::new(&v).exists(),
+        _ => false,
+    }
+}
+
+/// Choose the merge input for a PDF save. Route A2 (the
+/// journal's folded wire records) is the default whenever
+/// the session holds a non-empty fold — it is stock's
+/// route and replays deletions as deletions. Route A1
+/// (the compiled stream) remains for journal-less windows
+/// and as the forced comparison arm. JOFFICE_PDF_MERGE_
+/// ROUTE=a1|a2 pins the choice for the X2 experiment.
+fn pdf_merge_input(shell: &Rc<Shell>, compiled: Vec<u8>) -> (PdfMergeInput, &'static str) {
+    let fold: Vec<String> = {
+        let sess = shell.session.borrow();
+        match sess.as_ref() {
+            Some(st) if st.origin_code == fmt::PDF => st.folded.clone(),
+            _ => Vec::new(),
+        }
+    };
+    let forced = std::env::var("JOFFICE_PDF_MERGE_ROUTE")
+        .map(|v| v.to_ascii_lowercase())
+        .unwrap_or_default();
+    match forced.as_str() {
+        "a1" => (PdfMergeInput::Compiled(compiled), "a1"),
+        "a2" => {
+            if fold.is_empty() {
+                eprintln!(
+                    "joffice: PDF-MERGE-ROUTE route=a1 forced=a2 fold empty; compiled stream used"
+                );
+                (PdfMergeInput::Compiled(compiled), "a1")
+            } else {
+                (PdfMergeInput::Wire(fold), "a2")
+            }
+        }
+        _ => {
+            if fold.is_empty() {
+                (PdfMergeInput::Compiled(compiled), "a1")
+            } else {
+                (PdfMergeInput::Wire(fold), "a2")
+            }
+        }
+    }
+}
+
+/// Stage + run the merge on a worker thread, verify with
 /// independent readers, enforce the count gate, and land the
 /// result through write_save_checked (external-change check +
 /// atomic replace + session bookkeeping). `after` mirrors
 /// convert_and_write's completion semantics.
+///
+/// X1/X5 (KAO round 3): the merge base MUST be the window's
+/// registered immutable origin — the bytes the editor
+/// opened. A merge aimed anywhere else (the bound file
+/// after a previous save, i.e. the last save's output) is
+/// refused before x2t runs: AddToPdfFromBinary appends and
+/// removes nothing, so a state stream merged into a file
+/// that already carries it duplicates annotations and
+/// resurrects deletions. The count gate remains as the
+/// second net; this gate is the first.
 fn pdf_merge_and_write(
     shell: &Rc<Shell>,
     reply: ScriptMessageReply,
     ctx: Context,
     origin_pdf: PathBuf,
     dest: PathBuf,
-    changes: Vec<u8>,
+    input: PdfMergeInput,
     annot_count: Option<i64>,
     seq: u64,
     origin: String,
     after: AfterWrite,
+    stream_kind: Option<String>,
 ) {
+    // The target gate (X5): refuse any merge whose base is
+    // not the registered origin. A delta-kind stream makes
+    // the refusal doubly mandatory (it describes changes
+    // since the last flush, relative to the opened file),
+    // so it gets its own ledger line.
+    let kind = stream_kind.as_deref().unwrap_or("unknown");
+    match pdf_registered_origin(shell) {
+        Some(expected) if expected == origin_pdf => {}
+        Some(expected) => {
+            eprintln!(
+                "joffice: PDF-TARGET-GATE refuse base={} expected_origin={} kind={kind}",
+                origin_pdf.display(),
+                expected.display()
+            );
+            if kind == "delta" {
+                eprintln!(
+                    "joffice: PDF-DELTA-GATE refuse: delta stream aimed at a non-origin target"
+                );
+            }
+            save_fail(
+                shell,
+                &reply,
+                "PDF save refused: the merge target is not the file this window opened \
+                 (merging there would duplicate annotations); your file was not touched"
+                    .to_string(),
+                &origin,
+            );
+            return;
+        }
+        None => {
+            eprintln!(
+                "joffice: PDF-ORIGIN-MISSING refuse base={} kind={kind}",
+                origin_pdf.display()
+            );
+            save_fail(
+                shell,
+                &reply,
+                "PDF save refused: no immutable origin is registered for this window; \
+                 reopen the file to annotate it. Your file was not touched"
+                    .to_string(),
+                &origin,
+            );
+            return;
+        }
+    }
     let x2t = match shell.x2t.clone() {
         Some(x) => x,
         None => {
@@ -5204,11 +5354,37 @@ fn pdf_merge_and_write(
     let font_dir = shell.fonts_src_dir.clone();
     let allfonts = shell.x2t_allfonts.clone();
     let dest_log = dest.display().to_string();
+    let route = match &input {
+        PdfMergeInput::Compiled(_) => "a1",
+        PdfMergeInput::Wire(records) => {
+            eprintln!(
+                "joffice: PDF-MERGE route=a2 records={} kind={kind}",
+                records.len()
+            );
+            "a2"
+        }
+    };
+    if route == "a1" {
+        eprintln!("joffice: PDF-MERGE route=a1 kind={kind}");
+    }
+    // Media sources for the merge's in/media (image stamps
+    // resolve there on the A2 replay; the compiled stream
+    // embeds its own). Session media first, then the shell's
+    // staging dir; first writer wins per name.
+    let media_sources: Vec<PathBuf> = {
+        let mut v = Vec::new();
+        if let Some(st) = shell.session.borrow().as_ref() {
+            v.push(st.dir.join("media"));
+        }
+        v.push(shell.media_dir.clone());
+        v
+    };
     // The channel carries (merged bytes, annotations_deleted):
-    // a count DROP means the merge was an incremental update
-    // over a deletion — the deleted content stays readable in
-    // the file's earlier revisions, and the user is told so
-    // (cycle-5 round 1 privacy disclosure).
+    // a count DROP vs the opened file means this save deleted
+    // annotations. (Cycle-5 continuation forensics: the merge
+    // rewrite retains no deleted annotation, so this is a
+    // ledger fact, not a user disclosure — see the landing
+    // arm.)
     let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<u8>, bool), String>>();
     std::thread::spawn(move || {
         let work = std::env::temp_dir().join(temp_stem("pdfsave"));
@@ -5220,15 +5396,58 @@ fn pdf_merge_and_write(
                 .map_err(|e| format!("stage merge media: {e}"))?;
             std::fs::copy(&origin_pdf, in_dir.join("origin.pdf"))
                 .map_err(|e| format!("stage origin pdf: {e}"))?;
-            if changes.len() < 4 || &changes[..4] != b"%PDF" {
-                return Err(format!(
-                    "compiled changes refused: bad prefix (first bytes {:?}); \
-                     the merge would fall back to a silent doctrenderer replay",
-                    String::from_utf8_lossy(&changes[..changes.len().min(4)])
-                ));
+            match &input {
+                PdfMergeInput::Compiled(changes) => {
+                    if changes.len() < 4 || &changes[..4] != b"%PDF" {
+                        return Err(format!(
+                            "compiled changes refused: bad prefix (first bytes {:?}); \
+                             the merge would fall back to a silent doctrenderer replay",
+                            String::from_utf8_lossy(&changes[..changes.len().min(4)])
+                        ));
+                    }
+                    std::fs::write(in_dir.join("changes").join("0.bin"), changes)
+                        .map_err(|e| format!("stage changes: {e}"))?;
+                }
+                PdfMergeInput::Wire(records) => {
+                    // Stock's framing (DumpChanges in the
+                    // pinned native code): each record
+                    // appended as "<record>", — no brackets,
+                    // trailing comma. x2t's CChangesWorker
+                    // parses exactly this. The file must be
+                    // the ONLY one in changes/ (arChanges[0]
+                    // is the compiled-check candidate).
+                    let mut content = String::new();
+                    for r in records {
+                        content.push('"');
+                        content.push_str(r);
+                        content.push_str("\",");
+                    }
+                    std::fs::write(
+                        in_dir.join("changes").join("changes0.json"),
+                        content,
+                    )
+                    .map_err(|e| format!("stage wire changes: {e}"))?;
+                    // Stage any session/staged media for the
+                    // replay's image resolution.
+                    let media_dir = in_dir.join("media");
+                    let mut staged = 0usize;
+                    for src_dir in &media_sources {
+                        if let Ok(rd) = std::fs::read_dir(src_dir) {
+                            for ent in rd.flatten() {
+                                let dest_f = media_dir.join(ent.file_name());
+                                if !dest_f.exists()
+                                    && std::fs::copy(ent.path(), &dest_f).is_ok()
+                                {
+                                    staged += 1;
+                                }
+                            }
+                        }
+                    }
+                    if staged > 0 {
+                        eprintln!("joffice: PDF-MERGE-MEDIA staged={staged}");
+                    }
+                }
             }
-            std::fs::write(in_dir.join("changes").join("0.bin"), &changes)
-                .map_err(|e| format!("stage changes: {e}"))?;
             let out_pdf = x2t_merge_pdf_sync(
                 &x2t,
                 font_dir.as_deref(),
@@ -5248,6 +5467,10 @@ fn pdf_merge_and_write(
                 let _ = std::fs::copy(
                     work.join("in").join("changes").join("0.bin"),
                     keep.join("0.bin"),
+                );
+                let _ = std::fs::copy(
+                    work.join("in").join("changes").join("changes0.json"),
+                    keep.join("changes0.json"),
                 );
                 let _ = std::fs::copy(&out_pdf, keep.join("merged.pdf"));
                 eprintln!("joffice: PDF-KEEP work preserved at {}", keep.display());
@@ -5308,16 +5531,25 @@ fn pdf_merge_and_write(
                             Ok(_) => {
                                 note_save_success(&shell_t);
                                 if annots_deleted {
-                                    // Privacy disclosure (cycle
-                                    // 5, round 1): an
-                                    // incremental update keeps
-                                    // earlier revisions readable.
-                                    show_save_banner(
-                                        &shell_t,
-                                        "Saved. Note: deleted comments stay recoverable in this file's earlier revisions (incremental update).",
-                                    );
+                                    // Cycle 5 continuation:
+                                    // the round-1 privacy
+                                    // disclosure (deleted
+                                    // comments stay recoverable
+                                    // in earlier revisions) was
+                                    // DISPROVEN for this
+                                    // pipeline by object-pool
+                                    // forensics on both routes:
+                                    // the merge rewrites the
+                                    // file and a deleted
+                                    // annotation's object is
+                                    // absent from the output
+                                    // entirely — a true delete.
+                                    // The banner asserted a
+                                    // falsehood, so it is gone;
+                                    // the count drop is logged
+                                    // here instead.
                                     eprintln!(
-                                        "joffice: PDF-DISCLOSURE shown (annotation count dropped; incremental update)"
+                                        "joffice: PDF-DELETE-LANDED (annotation count dropped vs the opened file; merge rewrite retains no deleted annotation)"
                                     );
                                 }
                                 match after {
@@ -6335,6 +6567,41 @@ fn handle_bridge(
                                 fmt::PDF,
                                 &bytes,
                             );
+                            // X1 (KAO round 3): register the
+                            // immutable merge origin for this
+                            // window's PDF — the session seed
+                            // IS the opened bytes; without a
+                            // session, keep a private temp copy.
+                            // Every merge this session targets
+                            // it, never the bound file.
+                            {
+                                let origin_copy = match &sid {
+                                    Some(s) => Some(
+                                        sessions_root().join(s).join("seed.bin"),
+                                    ),
+                                    None => {
+                                        let p = std::env::temp_dir()
+                                            .join(temp_stem("pdforigin"));
+                                        match std::fs::write(&p, &bytes) {
+                                            Ok(()) => Some(p),
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "joffice: PDF-ORIGIN-FALLBACK-WRITE-FAIL {e}"
+                                                );
+                                                None
+                                            }
+                                        }
+                                    }
+                                };
+                                if let Some(oc) = &origin_copy {
+                                    eprintln!(
+                                        "joffice: PDF-ORIGIN path={} session_seed={}",
+                                        oc.display(),
+                                        sid.is_some()
+                                    );
+                                }
+                                *shell.pdf_origin.borrow_mut() = origin_copy;
+                            }
                             let journal_on = journal_mode(&shell.flush_mode);
                             let payload = serde_json::json!({
                                 "data": b64, "images": {}, "name": name,
@@ -7079,6 +7346,11 @@ fn handle_bridge(
                         pdf_merge: true,
                         pdf_annot_count: annot_count,
                         pdf_adopt: save_as && file_type == 0,
+                        pdf_stream_kind: msg
+                            .args
+                            .get("streamKind")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
                     });
                     show_save_dialog(shell);
                     return;
@@ -7100,17 +7372,38 @@ fn handle_bridge(
                     save_done(shell, true);
                     return;
                 }
+                // X1: the merge base is the registered
+                // immutable origin (the opened bytes), NOT
+                // src — src is the bound file, which our own
+                // previous save may have replaced. The force
+                // diagnostic restores the old base so the
+                // target gate can be seen refusing it (X5).
+                let merge_base = if pdf_force_bound_target() {
+                    src.clone()
+                } else {
+                    pdf_registered_origin(shell).unwrap_or_else(|| src.clone())
+                };
+                let (input, route) = pdf_merge_input(shell, bin);
+                eprintln!(
+                    "joffice: PDF-SAVE base={} dest={} route={route}",
+                    merge_base.display(),
+                    src.display()
+                );
                 pdf_merge_and_write(
                     shell,
                     reply.clone(),
                     ctx.clone(),
-                    src.clone(),
+                    merge_base,
                     src,
-                    bin,
+                    input,
                     annot_count,
                     seq,
                     origin,
                     AfterWrite::Bound,
+                    msg.args
+                        .get("streamKind")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
                 );
                 return;
             }
@@ -7342,6 +7635,7 @@ fn handle_bridge(
                         pdf_merge: false,
                         pdf_annot_count: None,
                         pdf_adopt: false,
+                        pdf_stream_kind: None,
                     });
                     if is_askonce {
                         show_askonce(shell);
@@ -7983,16 +8277,23 @@ fn show_save_dialog(shell: &Rc<Shell>) {
         // holds the compiled changes. A CLEAN document saved
         // as its own format byte-copies instead (§6a — never
         // merged), and adopts the path like a converted
-        // Save As. A dirty one runs the A1 merge into the
+        // Save As. A dirty one runs the merge into the
         // chosen path behind the count gate; adoption follows
         // pdf_adopt (plain Save As rebinds, Download-As is an
         // export). Saving onto the bound path itself is a
-        // bound merge.
+        // bound merge. The merge BASE is the registered
+        // immutable origin (X1) — doc_path is only the clean
+        // copy's source (the current bound bytes).
         if p.pdf_merge {
             let origin_pdf = p
                 .doc_path
                 .clone()
                 .expect("pdf merge pending has a doc path");
+            let merge_base = if pdf_force_bound_target() {
+                origin_pdf.clone()
+            } else {
+                pdf_registered_origin(&shell_c).unwrap_or_else(|| origin_pdf.clone())
+            };
             let clean_copy = p.unmodified
                 && format == p.origin_code
                 && !journal_pending(&shell_c)
@@ -8056,22 +8357,24 @@ fn show_save_dialog(shell: &Rc<Shell>) {
             } else {
                 AfterWrite::Export
             };
+            let (input, route) = pdf_merge_input(&shell_c, changes);
             eprintln!(
-                "joffice: PDF-SAVE-MERGE {} -> {}",
-                origin_pdf.display(),
+                "joffice: PDF-SAVE-MERGE base={} -> {} route={route}",
+                merge_base.display(),
                 path.display()
             );
             pdf_merge_and_write(
                 &shell_c,
                 p.reply.clone(),
                 p.ctx.clone(),
-                origin_pdf,
+                merge_base,
                 path,
-                changes,
+                input,
                 p.pdf_annot_count,
                 p.seq,
                 p.origin.clone(),
                 after,
+                p.pdf_stream_kind.clone(),
             );
             return;
         }

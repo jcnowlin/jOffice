@@ -298,6 +298,48 @@
         } catch (e) { return null; }
     }
 
+    // Stream-kind detection (cycle 5 continuation, KAO
+    // round 3 §X5): viewer.Save() describes state relative
+    // to the file the window OPENED. A capture taken inside
+    // a save cycle is a DELTA against that base (the
+    // history's delete index still sits at the last flush);
+    // a capture outside one is the FULL state. KAO's
+    // formula needs base = changes[0..deleteIndex] and
+    // delta = changes[deleteIndex..] — but the pinned PDF
+    // History (AscPDF.History) exposes GetDeleteIndex()
+    // and NO GetChanges() (probed live, battery D: the
+    // method is undefined; Points is the storage). The
+    // journal wrap tracks the same total the delete index
+    // counts (joJournal.histLen, in wire records — the
+    // units agree: one note flush = 16 records and
+    // GetDeleteIndex() = 16 right after it), so base =
+    // deleteIndex and delta = histLen - deleteIndex.
+    // Delta-kind iff both are non-empty. A delta may only
+    // ever be merged into the opened file — Rust enforces
+    // the target (PDF-TARGET-GATE); this tag is the
+    // second, descriptive net.
+    function joPdfStreamKind(doc) {
+        var out = { kind: 'unknown', base: -1, delta: -1 };
+        try {
+            var h = doc && doc.History;
+            if (!h || typeof h.GetDeleteIndex !== 'function') return out;
+            var di = h.GetDeleteIndex();
+            var total = (typeof joJournal !== 'undefined' && joJournal)
+                ? joJournal.histLen : null;
+            if (typeof di !== 'number' || typeof total !== 'number'
+                || !(total > 0)) return out;
+            out.base = Math.min(di, total);
+            out.delta = Math.max(0, total - di);
+            out.kind = (out.base > 0 && out.delta > 0)
+                ? 'delta' : 'full';
+        } catch (e) { /* leave unknown */ }
+        return out;
+    }
+    window.__joPdfStreamKind = function () {
+        var d = joPdfDoc();
+        return d ? joPdfStreamKind(d) : null;
+    };
+
     // Normalize a capture result to bytes: Uint8Array /
     // ArrayBuffer pass through; a string is tried as base64
     // (the compiled-changes channel in the desktop contract
@@ -349,6 +391,7 @@
             joLedger('PDF_BLUR', null, { ok: 0, why: String(e) });
         }
         var annotCount = joPdfAnnotCount();
+        var streamKind = joPdfStreamKind(doc);
         var tries = [];
         function attempt(name, fn) {
             try {
@@ -361,7 +404,12 @@
                     joLedger('PDF_CAPTURE_PROBE', null, {
                         via: name, tries: tries.join(' ')
                     });
-                    cb({ bytes: b, annotCount: annotCount, via: name });
+                    cb({
+                        bytes: b, annotCount: annotCount, via: name,
+                        streamKind: streamKind.kind,
+                        streamBase: streamKind.base,
+                        streamDelta: streamKind.delta
+                    });
                     return true;
                 }
             } catch (e) {
@@ -427,7 +475,10 @@
             pdfa: false,
             pdfChanges: true,
             annotCount: cap.annotCount,
-            captureVia: cap.via
+            captureVia: cap.via,
+            streamKind: cap.streamKind || 'unknown',
+            streamBase: (cap.streamBase === undefined ? -1 : cap.streamBase),
+            streamDelta: (cap.streamDelta === undefined ? -1 : cap.streamDelta)
         };
         var sendSave = function () {
             bridge('saveFile', saveArgs)
@@ -2148,7 +2199,10 @@
                         bytes: cap.bytes.length,
                         head: joPdfHead(cap.bytes),
                         annotCount: cap.annotCount,
-                        via: cap.via
+                        via: cap.via,
+                        streamKind: cap.streamKind || 'unknown',
+                        streamBase: cap.streamBase,
+                        streamDelta: cap.streamDelta
                     });
                     joPdfSendSave(seq, {
                         isSaveAs: isSaveAs, fileType: fileType || 0,
