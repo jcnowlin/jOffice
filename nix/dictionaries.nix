@@ -25,7 +25,7 @@ let
     owner = "Euro-Office";
     repo = "dictionaries";
     rev = "0020f5ed5174e2a213171c4c7da9ec06ca140869";
-    hash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    hash = "sha256-SjnwicmDXW2J/PvmZlLQW+Qt2MeE1mMDetdOx5uasfA=";
   };
 
   english = [ "en_AU" "en_CA" "en_GB" "en_US" "en_ZA" ];
