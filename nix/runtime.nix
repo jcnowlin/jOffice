@@ -31,16 +31,25 @@
 # design — the same code path serves the staged runtime and
 # the Nix one).
 #
-# Fonts note: the deb's converter/AllFonts.js is the
-# editor-facing map; the trees its paths name ship below.
-# Regenerating the map for exactly this font set (the x2t
-# side) still needs allfontsgen — see allfontsgen.nix; that
-# remains the follow-up's debt, graded in the regression's
-# PDF-export leg.
+# Fonts note (rewritten cycle 9): two maps ship, for two
+# consumers. The EDITOR-facing map stays the deb's
+# converter/AllFonts.js (path-keyed; the trees its paths
+# name ship below) in sdkjs/common. The CONVERTER-facing
+# map — converter/AllFonts.js, sdkjs-deploy/common/
+# AllFonts.js (the file DoctRenderer.config names),
+# fonts/AllFonts.js + font_selection.bin, and
+# converter/font_selection.bin + fonts.log — is the
+# GENERATED map from nix/converter.nix: produced by the
+# pinned core's own allfontsgen over the exact shipped
+# font set and proven by a real conversion inside that
+# build. The deb ships no generator and its converter map
+# names a vendor layout we do not run; that stale map was
+# the print/PDF-export disease (KAO cycle-9 rounds 1+2).
 { pkgs, lib }:
 
 let
   fonts = pkgs.callPackage ./fonts.nix { };
+  converter = pkgs.callPackage ./converter.nix { };
   spellDicts = pkgs.callPackage ./dictionaries.nix { };
   deb = pkgs.fetchurl {
     url = "https://github.com/Euro-Office/DesktopEditors/releases/download/v9.3.8/euro-office-euro-office_9.3.8-0_amd64.deb";
@@ -185,12 +194,19 @@ pkgs.stdenv.mkDerivation {
     # with; a face a document actually lays out with resolves
     # to a null face and the text shaper dies (m_pFaceInfo) —
     # the trees below are what make the named faces
-    # resolvable. Regeneration of the map for this exact set
-    # is the allfontsgen follow-up.
+    # resolvable. This copy serves sdkjs/common ONLY.
     cp $APP/converter/AllFonts.js $RT/sdkjs/common/AllFonts.js
-    cp $APP/converter/AllFonts.js $RT/sdkjs-deploy/common/AllFonts.js
-    cp $APP/converter/AllFonts.js $RT/fonts/AllFonts.js
-    cp $APP/converter/font_selection.bin $RT/fonts/font_selection.bin
+    # The converter-facing map is the GENERATED one (cycle
+    # 9, nix/converter.nix): sdkjs-deploy/common (the file
+    # DoctRenderer.config names), the converter dir itself
+    # (x2t's own selection + log beside the binary), and
+    # the fonts dir's copies.
+    cp ${converter}/AllFonts.js $RT/sdkjs-deploy/common/AllFonts.js
+    cp ${converter}/AllFonts.js $RT/converter/AllFonts.js
+    cp ${converter}/font_selection.bin $RT/converter/font_selection.bin
+    cp ${converter}/fonts.log $RT/converter/fonts.log
+    cp ${converter}/AllFonts.js $RT/fonts/AllFonts.js
+    cp ${converter}/font_selection.bin $RT/fonts/font_selection.bin
 
     # DoctRenderer.config, pre-generated with store paths:
     # the shell generates this beside x2t at run time, which

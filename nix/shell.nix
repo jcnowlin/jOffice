@@ -7,6 +7,7 @@
 
 let
   runtime = pkgs.callPackage ./runtime.nix { };
+  converter = pkgs.callPackage ./converter.nix { };
   rtDir = "${runtime}/share/joffice/runtime";
 in
 pkgs.rustPlatform.buildRustPackage {
@@ -63,8 +64,8 @@ pkgs.rustPlatform.buildRustPackage {
   postFixup = ''
     wrapProgram $out/bin/joffice-shell \
       --set-default JOFFICE_RUNTIME_DIR "${rtDir}" \
-      --set-default JOFFICE_FONTSDIR "${rtDir}/fonts" \
-      --set-default JOFFICE_ALLFONTS "${rtDir}/fonts/AllFonts.js" \
+      --set-default JOFFICE_FONTSDIR "${converter}/fonts" \
+      --set-default JOFFICE_ALLFONTS "${converter}/AllFonts.js" \
       --set-default JOFFICE_FONTSROOT "${rtDir}/fonts" \
       --set-default JOFFICE_DICT_DIR "${rtDir}/spell-dictionaries" \
       --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ pkgs.hunspell ]} \

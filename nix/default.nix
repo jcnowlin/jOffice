@@ -11,4 +11,5 @@
   joffice = pkgs.callPackage ./shell.nix { };
   joffice-runtime = pkgs.callPackage ./runtime.nix { };
   joffice-fonts = pkgs.callPackage ./fonts.nix { };
+  joffice-converter = pkgs.callPackage ./converter.nix { };
 }

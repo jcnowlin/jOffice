@@ -574,8 +574,44 @@
     // -----------------------------------------------------------
     var joPdf = {
         active: false, mode: null, degradedLogged: false,
-        protected: false, perms: null
+        protected: false, perms: null,
+        // Cycle 9 (PD1): the history mirror's continuity
+        // baseline — the History object identity and Points
+        // length at the last observation. A mirror verdict
+        // of "clean" is trusted only while the same object
+        // has been observed without a truncation or an
+        // impossible index state (KAO cycle-9 round 1 §7:
+        // a gap means Unknown, and Unknown saves).
+        mirrorObj: null, mirrorPoints: null, mirrorSeen: false
     };
+
+    // The PD1 mirror verdict: 'clean' | 'dirty' | 'unknown'.
+    // Reads the PDF document's own History (Index vs
+    // SavedIndex) and judges whether the mirror has seen
+    // every event since the last observation. Every call is
+    // an observation and moves the baseline.
+    function joPdfMirrorVerdict() {
+        var doc = joPdfDoc();
+        var h = doc && doc.History;
+        if (!h || h.Index === null || h.Index === undefined
+            || h.SavedIndex === null || h.SavedIndex === undefined) {
+            return 'unknown';
+        }
+        var points = (h.Points && typeof h.Points.length === 'number')
+            ? h.Points.length : null;
+        var reset = false;
+        if (joPdf.mirrorSeen) {
+            if (joPdf.mirrorObj !== h) reset = true;
+            if (points !== null && joPdf.mirrorPoints !== null
+                && points < joPdf.mirrorPoints) reset = true;
+            if (h.SavedIndex > h.Index) reset = true;
+        }
+        joPdf.mirrorObj = h;
+        joPdf.mirrorPoints = points;
+        joPdf.mirrorSeen = true;
+        if (reset) return 'unknown';
+        return h.Index === h.SavedIndex ? 'clean' : 'dirty';
+    }
     // Protected cycle: true while this window's document is
     // password-protected (any format — set from the open
     // reply's `protected` flag).
@@ -972,6 +1008,7 @@
             printPages: ctx.printPages,
             pdfa: false,
             pdfChanges: true,
+            pdfMirror: ctx.pdfMirror || null,
             annotCount: cap.annotCount,
             captureVia: cap.via,
             streamKind: cap.streamKind || 'unknown',
@@ -1582,6 +1619,9 @@
             // saved point. A mirror that disagrees with the
             // direct query is a PD1 finding, logged with the
             // same MODIFIED_DISAGREE prefix the drives count.
+            // Cycle 9: the observation also feeds the PD1
+            // verdict's continuity baseline (joPdfMirrorVerdict
+            // is the reader; this stays the telemetry).
             var doc = joPdfDoc();
             var h = doc && doc.History;
             if (h && h.Index !== null && h.Index !== undefined
@@ -1594,6 +1634,7 @@
                         + ' userSavedIdx=' + h.UserSavedIndex);
                 }
             }
+            joPdfMirrorVerdict();
         }
     }
 
@@ -2499,6 +2540,18 @@
                 v = true;
                 overlay = true;
             }
+            // PD1 (cycle 9): a PDF window's push follows the
+            // history mirror, not the editor's broken
+            // modified flag — a clean PDF must read clean to
+            // the shell, or every close prompts and every
+            // print refuses. 'unknown' leaves the delivered
+            // value alone (it errs toward dirty, the safe
+            // side for a close prompt).
+            if (joPdf.active) {
+                var mv = joPdfMirrorVerdict();
+                if (mv === 'clean') v = false;
+                else if (mv === 'dirty') v = true;
+            }
             joSave.lastPushedModified = v;
             joSave.overlayForced = overlay;
             joLedger('modified', null, { pushed: v, overlay: overlay });
@@ -2818,6 +2871,26 @@
                 unmodified = false;
                 joLedger('UNMOD_FORCED', seq, { reason: 'protected' });
             }
+            // PD1 (cycle 9): for PDF windows the direct
+            // isDocumentModified() verdict is broken in the
+            // pinned editor (true at open, true after save —
+            // cycle 5's 28 MODIFIED_DISAGREE lines). The
+            // history mirror decides instead: 'clean' is
+            // trusted only with continuity (same History
+            // object, no truncation, no impossible state);
+            // 'unknown' keeps the direct verdict, which errs
+            // toward saving. Rust no-ops a bound Ctrl+S only
+            // on mirror-clean (SAVE_NOOP_PDF_CLEAN).
+            var pdfMirror = null;
+            if (joPdf.active) {
+                pdfMirror = joPdfMirrorVerdict();
+                if (pdfMirror === 'clean') {
+                    unmodified = true;
+                } else if (pdfMirror === 'dirty') {
+                    unmodified = false;
+                }
+                joLedger('PDF_MIRROR', seq, { verdict: pdfMirror });
+            }
             joLedger('localfilesave', seq, {
                 saveAs: isSaveAs, fileType: fileType || 0, origin: origin,
                 isPrint: !!opts.isPrint, unmodified: unmodified
@@ -2854,6 +2927,7 @@
                     joPdfSendSave(seq, {
                         isSaveAs: isSaveAs, fileType: fileType || 0,
                         origin: origin, unmodified: unmodified,
+                        pdfMirror: pdfMirror,
                         printIntent: !!opts.isPrint, printPages: printPages
                     }, cap);
                 });
@@ -3009,6 +3083,20 @@
                     .then(function (res) {
                         console.log('[jOffice][measure] SAVE_STAGE bridge_done seq=' + seq + ' t=' + Date.now());
                         console.log('[jOffice][save-ledger] saveFile reply seq=' + seq + ' res=' + JSON.stringify(res));
+                        // Cycle 9 (round 2 (c)): the ack pair
+                        // — length + hash of the reply as
+                        // received, ledgered against Rust's
+                        // REPLY_ACK for the same seq. A garbled
+                        // deferred reply shows as a mismatched
+                        // pair; the ack itself carries no
+                        // content. (Replies are ASCII JSON, so
+                        // the code-unit FNV here and Rust's
+                        // byte FNV agree.)
+                        if (res && typeof res.ok !== 'undefined') {
+                            var ackStr = JSON.stringify(res);
+                            console.log('[jOffice][save-ledger] REPLY_ACK_RX seq=' + seq
+                                + ' len=' + ackStr.length + ' hash=' + joFnv(ackStr));
+                        }
                         if (res && res.failed) {
                             joEndSave(seq, 'failed');
                             return;

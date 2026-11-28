@@ -56,6 +56,7 @@ const FONT_SCHEME: &str = "ascdesktop";
 /// Defines window.AscDesktopEditor on top of the Rust bridge.
 const SHIM_JS: &str = include_str!("shim.js");
 
+mod exportlog;
 mod notices;
 mod retention;
 mod settings;
@@ -609,6 +610,10 @@ fn ensure_spell_pump(shell: &Rc<Shell>) {
             // Cycle 8: the autosave gate evaluates on the
             // same ~1 s cadence.
             autosave_tick(&shell_p);
+            // Cycle 9: the export watchdog — a track parked
+            // in a pipeline stage past its budget gets named
+            // here, once per stage.
+            exportlog::scan();
         }
         gtk4::glib::ControlFlow::Continue
     });
@@ -2211,6 +2216,19 @@ struct Shell {
     /// an arrival while this is set is ledgered, never
     /// silently queued.
     save_phase: RefCell<Option<String>>,
+    /// Cycle 9: the correlation id (the shim's save seq) of
+    /// the export-class save currently in flight, if any —
+    /// the export stage ledger's active track (exportlog).
+    /// Set at the saveFile handler's export gate, cleared by
+    /// the save_done hook that closes the track. Save
+    /// serialization guarantees at most one.
+    export_corr: RefCell<Option<i64>>,
+    /// Cycle 9 (FM6): the launch-time font-map check's
+    /// verdict — Some(reason) when the generated map does
+    /// not match the fonts tree this shell points x2t at.
+    /// While set, print and PDF export refuse with the
+    /// reason instead of dying inside x2t's renderer.
+    fontmap_stale: RefCell<Option<String>>,
     /// Cycle 8: SAVE_DROPPED after the retry also failed —
     /// a safety notice (window-scoped, never suppressible).
     save_dropped: RefCell<bool>,
@@ -2422,6 +2440,8 @@ impl Shell {
             session_discard: RefCell::new(false),
             close_disposition: RefCell::new(None),
             save_phase: RefCell::new(None),
+            export_corr: RefCell::new(None),
+            fontmap_stale: RefCell::new(None),
             save_dropped: RefCell::new(false),
             settings_drift: RefCell::new(None),
             autosave_rt: RefCell::new(AutosaveRuntime::default()),
@@ -2488,6 +2508,76 @@ impl Shell {
             self.font_index.cjk_fallback,
             self.font_index.latin_fallback
         );
+        self.check_fontmap();
+    }
+
+    /// FM6 (cycle 9): the launch-time font-map safety net.
+    /// The generated fonts.log (beside x2t, or in the fonts
+    /// root) is checked against the fonts tree this shell
+    /// points x2t at: version line, listed files exist,
+    /// counts agree. A mismatch sets `fontmap_stale`, and
+    /// print / PDF export then refuse with the reason rather
+    /// than dying inside the renderer. Inside the store this
+    /// cannot happen by construction (the map derivation
+    /// takes the fonts derivation as an input); the net is
+    /// for a shell pointed at a tree the map was not
+    /// generated from. JOFFICE_FONTMAP_CHECK=off disables
+    /// the refusal (the ledger line still prints).
+    fn check_fontmap(&self) {
+        if std::env::var("JOFFICE_FONTMAP_CHECK").as_deref() == Ok("off") {
+            eprintln!("joffice: FONTMAP_CHECK_OFF (JOFFICE_FONTMAP_CHECK=off)");
+            return;
+        }
+        let Some(fonts_dir) = self.fonts_src_dir.clone() else {
+            eprintln!("joffice: FONTMAP_STALE no fonts dir configured");
+            *self.fontmap_stale.borrow_mut() =
+                Some("no fonts directory is configured".to_string());
+            return;
+        };
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(x) = &self.x2t {
+            if let Some(d) = x.parent() {
+                // Staged layout (cycle 1): the generated log
+                // lives in fonts-gen/x2t beside the runtime
+                // root; the packaged layout generates it into
+                // the converter dir itself.
+                if let Some(root) = d.parent() {
+                    candidates.push(root.join("fonts-gen/x2t/fonts.log"));
+                }
+                candidates.push(d.join("fonts.log"));
+            }
+        }
+        candidates.push(fonts_dir.join("fonts.log"));
+        let Some(log_path) = candidates.iter().find(|p| p.is_file()) else {
+            eprintln!(
+                "joffice: FONTMAP_STALE no fonts.log beside x2t or in {}",
+                fonts_dir.display()
+            );
+            *self.fontmap_stale.borrow_mut() = Some(format!(
+                "no fonts.log found beside x2t or in {}",
+                fonts_dir.display()
+            ));
+            return;
+        };
+        match std::fs::read_to_string(log_path) {
+            Ok(text) => match exportlog::fontmap_check(&text, &fonts_dir) {
+                Ok(n) => {
+                    eprintln!(
+                        "joffice: FONTMAP_OK fonts={n} log={}",
+                        log_path.display()
+                    );
+                }
+                Err(reason) => {
+                    eprintln!("joffice: FONTMAP_STALE {reason}");
+                    *self.fontmap_stale.borrow_mut() = Some(reason);
+                }
+            },
+            Err(e) => {
+                let reason = format!("cannot read {}: {e}", log_path.display());
+                eprintln!("joffice: FONTMAP_STALE {reason}");
+                *self.fontmap_stale.borrow_mut() = Some(reason);
+            }
+        }
     }
 
     /// Record that `path` is the open document and stamp it
@@ -4128,7 +4218,24 @@ fn run_x2t(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let child = cmd.spawn().map_err(|e| format!("run x2t: {e}"))?;
+    // Cycle 9 stage ledger: the spawn boundary is where the
+    // three stall classes separate (never tried / tried and
+    // died / spawned and lost). Lines appear only inside an
+    // export track (the worker thread's correlation id).
+    exportlog::stage_here(exportlog::STAGE_SPAWN_TRY, &format!("x2t={}", x2t.display()));
+    let child = match cmd.spawn() {
+        Ok(c) => {
+            exportlog::stage_here(
+                exportlog::STAGE_SPAWN_OK,
+                &format!("pid={}", c.id()),
+            );
+            c
+        }
+        Err(e) => {
+            exportlog::stage_here(exportlog::STAGE_SPAWN_ERR, &format!("{e}"));
+            return Err(format!("run x2t: {e}"));
+        }
+    };
     let pid = child.id();
     // Ledger: what we MEANT to pass, plus the child's real
     // /proc state sampled immediately (best effort — a fast
@@ -4152,6 +4259,10 @@ fn run_x2t(
     let out = child
         .wait_with_output()
         .map_err(|e| format!("wait for x2t: {e}"))?;
+    exportlog::stage_here(
+        exportlog::STAGE_EXIT,
+        &format!("rc={:?}", out.status.code()),
+    );
     let stderr_text = String::from_utf8_lossy(&out.stderr);
     for code in parse_render_errors(&stderr_text) {
         eprintln!("joffice: X2T_RENDER_ERROR code={code}");
@@ -4377,6 +4488,10 @@ fn x2t_convert_sync_opts(
     if let Err(e) = std::fs::write(&params_path, params) {
         return (Err(format!("write x2t params: {e}")), None);
     }
+    exportlog::stage_here(
+        exportlog::STAGE_PARAMS,
+        &format!("to={format_to} params={}", params_path.display()),
+    );
     if opts.pw_open.is_some() || opts.pw_save.is_some() {
         // The params file now carries a password: owner-only.
         use std::os::unix::fs::PermissionsExt;
@@ -4509,7 +4624,14 @@ fn x2t_convert_async_opts(
         })
         .collect();
     let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
+    // Cycle 9: the export track's correlation id rides into
+    // the worker thread (thread-local) so the params writer
+    // and the spawn path ledger their stages against it.
+    // None outside an export-class save — ordinary
+    // conversions stay out of the export ledger.
+    let export_corr = *shell.export_corr.borrow();
     std::thread::spawn(move || {
+        exportlog::set_corr(export_corr);
         let result = x2t_convert_sync_opts(
             &x2t,
             &from,
@@ -9152,6 +9274,10 @@ fn begin_print(
         origin: origin.clone().unwrap_or_else(|| "print".to_string()),
         from_save: origin.is_some(),
     });
+    // Cycle 9: the print dialog is a user wait — the export
+    // track parks watchdog-exempt until finish_print closes
+    // it through save_done.
+    xstage(shell, exportlog::STAGE_GATE, "print-dialog-parked", true);
     *shell.print_editor_spec.borrow_mut() = editor_spec;
     show_print_dialog(shell);
 }
@@ -10605,6 +10731,33 @@ fn handle_bridge(
                 .get("pdfa")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            // Cycle 9: export-class saves (a print intent, or
+            // a PDF target — Download-As PDF and the PDF print
+            // path) enter the stage ledger here. The track
+            // closes in save_done, which every completion of
+            // this save funnels through. FM6: a stale font
+            // map refuses the export BEFORE any work, with
+            // the reason, instead of dying as a renderer
+            // TypeError inside x2t (or stalling unnamed).
+            let export_class = print_intent || file_type == fmt::PDF;
+            if export_class {
+                exportlog::begin(
+                    js_seq,
+                    &format!("fileType={file_type} print={print_intent} origin={origin}"),
+                );
+                *shell.export_corr.borrow_mut() = Some(js_seq);
+                if let Some(reason) = shell.fontmap_stale.borrow().clone() {
+                    save_fail(
+                        shell,
+                        reply,
+                        format!(
+                            "font map is stale: {reason} — print and PDF export are refused until jOffice is rebuilt"
+                        ),
+                        &origin,
+                    );
+                    return;
+                }
+            }
             // Absorbed flush (cycle 3, S1′ mechanism): the
             // shim held this gesture's changes-flush and ran
             // it as a full saveFile so the editor gets its
@@ -10678,6 +10831,12 @@ fn handle_bridge(
                 t_dec.elapsed().as_millis(),
                 bin.len()
             );
+            xstage(
+                shell,
+                exportlog::STAGE_DECODED,
+                &format!("bin_bytes={}", bin.len()),
+                false,
+            );
             // Protected windows stage the snapshot bin on
             // tmpfs (registry: TempWrite) — it is decrypted
             // document content and never touches shared or
@@ -10702,6 +10861,12 @@ fn handle_bridge(
                 );
                 return;
             }
+            xstage(
+                shell,
+                exportlog::STAGE_TMP_WRITTEN,
+                &format!("tmp={}", tmp_bin.display()),
+                false,
+            );
             // Registry, JournalFlush: a protected window has
             // no journal (mode (a)); a flush claiming a full
             // save cycle is refused, never written. (The shim
@@ -10880,13 +11045,35 @@ fn handle_bridge(
                     return;
                 }
                 // Bound save. §6a: an unedited PDF is a no-op
-                // success, never a merge.
-                if unmodified
+                // success, never a merge. Cycle 9 (PD1): the
+                // no-op trusts the shim's history-mirror
+                // verdict, not the editor's isDocumentModified
+                // (stuck true in the pinned PDF editor). The
+                // mirror is trusted only when it reports
+                // 'clean' with continuity; 'unknown' (a gap in
+                // the mirror's observations) saves, per the
+                // round-1 rule — when in doubt, save. A shim
+                // too old to send the verdict falls back to
+                // the unmodified flag it computed.
+                let pdf_mirror = msg
+                    .args
+                    .get("pdfMirror")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let mirror_clean = match pdf_mirror.as_deref() {
+                    Some("clean") => true,
+                    Some(_) => false,
+                    None => unmodified,
+                };
+                if mirror_clean
                     && !*shell.save_failed_outstanding.borrow()
                     && !journal_pending(shell)
                 {
                     let _ = std::fs::remove_file(&tmp_bin);
-                    eprintln!("joffice: SAVE-UNEDITED no-op (pdf, origin={origin})");
+                    eprintln!(
+                        "joffice: SAVE_NOOP_PDF_CLEAN origin={origin} mirror={}",
+                        pdf_mirror.as_deref().unwrap_or("absent")
+                    );
                     reply_save(
                         shell,
                         reply,
@@ -10953,6 +11140,12 @@ fn handle_bridge(
                         return;
                     }
                 }
+                xstage(
+                    shell,
+                    exportlog::STAGE_GATE,
+                    "decision=print-export",
+                    false,
+                );
                 begin_print_export(
                     shell,
                     reply.clone(),
@@ -11613,6 +11806,17 @@ fn save_fail(shell: &Rc<Shell>, reply: &ScriptMessageReply, msg: String, origin:
 /// A save's bookkeeping tail: exactly one decrement of the
 /// in-flight count, then the close decision if one is waiting.
 fn save_done(shell: &Rc<Shell>, success: bool) {
+    // Cycle 9: EVERY save completion funnels through here
+    // (save_fail included), so this is where an export track
+    // closes: EXPORT_DONE / EXPORT_FAILED is the terminal
+    // ledger state EX5 requires every export to reach.
+    if let Some(corr) = shell.export_corr.borrow_mut().take() {
+        exportlog::terminal(
+            corr,
+            success,
+            if success { "save completed" } else { "save failed" },
+        );
+    }
     {
         let mut n = shell.saves_active.borrow_mut();
         *n = n.saturating_sub(1);
@@ -11645,8 +11849,35 @@ fn reply_save(
     ctx: &Context,
     v: &serde_json::Value,
 ) {
+    // Cycle 9 (round 2 (c)): the completion ack carries a
+    // length and a hash, never content — the shim ledgers
+    // the pair it received (REPLY_ACK_RX) and a garbled
+    // deferred reply shows up as a mismatched pair instead
+    // of a phantom success. A reply carrying document bytes
+    // would break the rule the ack exists for; ledger it
+    // loudly if one ever appears (bytes move by upload
+    // reference or URL, never in a reply).
+    if v.get("data").is_some() {
+        eprintln!(
+            "joffice: REPLY_CONTENT_GUARD a save reply carried a data field — acks carry len+hash only"
+        );
+    }
+    let (len, hash) = exportlog::reply_ack(&v.to_string());
+    eprintln!(
+        "joffice: REPLY_ACK seq={:?} len={len} hash={hash}",
+        shell.save_reply_seq.borrow()
+    );
     reply_json(reply, ctx, v);
     deliver_save_reply_js(shell, v);
+}
+
+/// Cycle 9: advance the active export track, if this save
+/// is export-class. No track → no line (ordinary saves stay
+/// out of the export ledger).
+fn xstage(shell: &Rc<Shell>, stage: &'static str, detail: &str, user_wait: bool) {
+    if let Some(corr) = *shell.export_corr.borrow() {
+        exportlog::stage(corr, stage, detail, user_wait);
+    }
 }
 
 /// Dual-channel open-reply delivery (cycle 4): the deferred-
@@ -11870,9 +12101,11 @@ fn show_save_dialog(shell: &Rc<Shell>) {
         p.filters = filter_objs;
     }
     *shell.active_dialog.borrow_mut() = Some(dialog.clone());
+    xstage(shell, exportlog::STAGE_GATE, "dialog-parked", true);
     let shell_c = shell.clone();
     dialog.connect_response(move |d, resp| {
         *shell_c.active_dialog.borrow_mut() = None;
+        xstage(&shell_c, exportlog::STAGE_GATE, "dialog-answered", false);
         eprintln!(
             "joffice: SAVE-DIALOG response={resp:?} file={:?} filter={:?}",
             d.file().and_then(|f| f.path()),
@@ -12255,6 +12488,9 @@ fn show_reject_window(shell: &Rc<Shell>, typed_path: PathBuf, filter_code: i32) 
 /// formats allowed a permanent preference. TXT/CSV get stronger
 /// wording and NO checkbox (no permanent opt-out).
 fn show_askonce(shell: &Rc<Shell>) {
+    // Cycle 9: an export parked on the AskOnce prompt is a
+    // user wait, like the Save As dialog.
+    xstage(shell, exportlog::STAGE_GATE, "askonce-parked", true);
     let Some(parent) = shell.window.borrow().clone() else {
         cancel_pending_save(shell);
         return;
@@ -13715,6 +13951,43 @@ fn run_settings_selftest_cli(scratch: &Path) -> i32 {
     failures
 }
 
+/// The `--export-selftest` runner (cycle 9, ST1a): drive
+/// the real x2t spawn path with a binary that does not
+/// exist, inside an export track, and assert the ledger
+/// names the fault — SPAWN_TRY then SPAWN_ERR, no SPAWN_OK,
+/// no silent stall. Returns the failure count.
+fn run_export_selftest_cli() -> i32 {
+    let corr: i64 = 991_001;
+    let mut failures = 0i32;
+    let params = std::env::temp_dir().join(format!("jo-st1a-{}.xml", std::process::id()));
+    let _ = std::fs::write(&params, "<TaskQueueDataConvert/>");
+    exportlog::begin(corr, "st1a selftest");
+    exportlog::stage(corr, exportlog::STAGE_GATE, "decision=bound", false);
+    exportlog::set_corr(Some(corr));
+    let result = run_x2t(
+        Path::new("/nonexistent/joffice-st1a/x2t"),
+        &params,
+        &[],
+    );
+    exportlog::set_corr(None);
+    let hist = exportlog::history(corr);
+    let ok = result.is_err()
+        && hist.contains(&exportlog::STAGE_SPAWN_TRY)
+        && hist.contains(&exportlog::STAGE_SPAWN_ERR)
+        && !hist.contains(&exportlog::STAGE_SPAWN_OK);
+    eprintln!(
+        "SELFTEST export ST1a: {} (history={hist:?} result_is_err={})",
+        if ok { "PASS" } else { "FAIL" },
+        result.is_err()
+    );
+    if !ok {
+        failures += 1;
+    }
+    exportlog::terminal(corr, false, "st1a selftest complete");
+    let _ = std::fs::remove_file(&params);
+    failures
+}
+
 fn main() {
     eprintln!("joffice: MAIN_THREAD id={:?}", std::thread::current().id());
     // Protected-documents cycle, build order step 1 (KAO
@@ -13866,6 +14139,15 @@ fn main() {
     // count. No GTK is started.
     if args.len() >= 3 && args[1] == "--settings-selftest" {
         std::process::exit(run_settings_selftest_cli(&PathBuf::from(&args[2])));
+    }
+    // Hidden export-ledger self-test (marathon 2 cycle 9,
+    // ST1a): the stage ledger's spawn-failure leg against
+    // the REAL spawn path — a nonexistent x2t must be named
+    // SPAWN_TRY → SPAWN_ERR, never a stall. (ST1b/ST1c, the
+    // lost-reply and never-spawns namings, are unit tests in
+    // exportlog.rs.) No GTK is started.
+    if args.len() >= 2 && args[1] == "--export-selftest" {
+        std::process::exit(run_export_selftest_cli());
     }
     let mut pending_file: Option<PathBuf> = None;
     let mut i = 1;

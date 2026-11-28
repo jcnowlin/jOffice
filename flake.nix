@@ -11,8 +11,13 @@
     in
     {
       packages.${system} = {
-        inherit (pkgSet) joffice joffice-runtime joffice-fonts;
+        inherit (pkgSet) joffice joffice-runtime joffice-fonts joffice-converter;
         default = pkgSet.joffice;
       };
+
+      # Marathon 2 cycle 9: exactly three options (enable,
+      # package, makeDefault). Adoption is the user's own
+      # step; see nix/home-module.nix.
+      homeManagerModules.default = import ./nix/home-module.nix { inherit self; };
     };
 }
