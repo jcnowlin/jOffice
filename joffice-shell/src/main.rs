@@ -12267,6 +12267,9 @@ fn show_save_fallback_dialog(shell: &Rc<Shell>) {
     let shell_c = shell.clone();
     dialog.connect_response(move |d, resp| {
         *shell_c.fallback_dialog.borrow_mut() = None;
+        // A widget dialog does not close itself on
+        // response the way the native one does.
+        d.hide();
         xstage(&shell_c, exportlog::STAGE_GATE, "dialog-answered", false);
         eprintln!(
             "joffice: SAVE-DIALOG-FALLBACK response={resp:?} file={:?}",
