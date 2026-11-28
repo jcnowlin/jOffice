@@ -11636,6 +11636,17 @@ fn handle_bridge(
             // what a direct query said at load + the EndSave
             // build identity for the SDK_DRIFT check.
             *shell.handshake_done.borrow_mut() = true;
+            // Cycle 9 (A10 steer): the housekeeping pump
+            // (autosave tick, export watchdog, dialog
+            // watchdog) historically started on the first
+            // spellTask — a word-editor-only trigger, so
+            // cell windows (whose pinned editor has no
+            // spellchecker at all, cycle-7 E7) never ran
+            // any of it: spreadsheet autosave was silently
+            // dead and a wedged save dialog there had no
+            // rescue. The handshake every editor window
+            // sends is the universal start point.
+            ensure_spell_pump(shell);
             let value = msg.args.get("value").and_then(|v| v.as_bool());
             if let Some(v) = value {
                 if shell.modified.borrow().is_none() {
@@ -12069,6 +12080,9 @@ fn show_save_dialog(shell: &Rc<Shell>) {
     if shell.active_dialog.borrow().is_some() {
         return;
     }
+    // The dialog watchdog rides the housekeeping pump;
+    // a save dialog must never be up without it running.
+    ensure_spell_pump(shell);
     let (preset_dir, preset_name, kind) = {
         let p = shell.pending_save.borrow();
         let Some(p) = p.as_ref() else { return };
