@@ -11981,6 +11981,17 @@ fn convert_and_write(
         None
     };
     let shell_c = shell.clone();
+    // The staged bin is editor content (for a protected
+    // document taking the downgrade arm, DECRYPTED content
+    // on tmpfs); the conversion copies it into its own
+    // private dir, and THIS path owns the original — remove
+    // it the moment the conversion completes, success or
+    // failure. convert_and_write_protected has always done
+    // this; the plain writer relied on the startup sweep,
+    // which left decrypted bins on /dev/shm after protected
+    // exports (cycle 9 EX6 catch, the PW-T1 lesson applied
+    // to the one arm that missed it).
+    let tmp_bin_cleanup = tmp_bin.clone();
     x2t_convert_async(
         shell,
         tmp_bin,
@@ -11988,6 +11999,7 @@ fn convert_and_write(
         Some(kind.canvas_code()),
         pdfa,
         move |result| {
+            let _ = std::fs::remove_file(&tmp_bin_cleanup);
             match result {
                 Ok(bytes) => {
                     if let Some(orig_path) = &macro_original {
