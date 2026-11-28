@@ -594,7 +594,8 @@
         // has been observed without a truncation or an
         // impossible index state (KAO cycle-9 round 1 §7:
         // a gap means Unknown, and Unknown saves).
-        mirrorObj: null, mirrorPoints: null, mirrorSeen: false
+        mirrorObj: null, mirrorPoints: null, mirrorSeen: false,
+        lastIndex: null, witnessIndex: null, pendingWitness: null
     };
 
     // The PD1 mirror verdict: 'clean' | 'dirty' | 'unknown'.
@@ -625,6 +626,7 @@
         joPdf.mirrorObj = h;
         joPdf.mirrorPoints = points;
         joPdf.mirrorSeen = true;
+        joPdf.lastIndex = h.Index;
         if (reset) return 'unknown';
         // Zero points: no changes exist in this session, so
         // nothing can be unsaved — clean by construction.
@@ -633,7 +635,19 @@
         // 'unknown', so idle Ctrl+S rewrote the file
         // (cycle 9 PD1a catch).
         if (h.Index < 0) return 'clean';
-        return h.Index === saved ? 'clean' : 'dirty';
+        // Index >= 0: the engine's own SavedIndex does NOT
+        // prove the bound file is current — the pinned
+        // viewer advances SavedIndex when it serializes an
+        // annotation into its working stream, before the
+        // shell has written anything (cycle 9 PD1b catch:
+        // mirror-clean on an annotation the file never
+        // received; a no-op there loses work). Clean
+        // requires the shell-side witness: a bound save
+        // THIS shell completed at exactly this Index.
+        if (joPdf.witnessIndex !== null
+            && joPdf.witnessIndex !== undefined
+            && h.Index === joPdf.witnessIndex) return 'clean';
+        return 'dirty';
     }
     // Protected cycle: true while this window's document is
     // password-protected (any format — set from the open
@@ -1102,6 +1116,13 @@
                     return;
                 }
                 joSave.boundSaved = true;
+                // PD1 witness: the bound file now holds the
+                // state at the Index this save started from.
+                if (joPdf.pendingWitness !== null
+                    && joPdf.pendingWitness !== undefined) {
+                    joPdf.witnessIndex = joPdf.pendingWitness;
+                }
+                joPdf.pendingWitness = null;
                 joEndSave(seq, 'bound_ok');
             })
             .catch(function (e) {
@@ -2907,6 +2928,10 @@
             var pdfMirror = null;
             if (joPdf.active) {
                 pdfMirror = joPdfMirrorVerdict();
+                // The Index this save would make current on
+                // disk; promoted to the clean-witness only if
+                // the save completes as a bound save.
+                joPdf.pendingWitness = joPdf.lastIndex;
                 if (pdfMirror === 'clean') {
                     unmodified = true;
                 } else if (pdfMirror === 'dirty') {
