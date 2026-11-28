@@ -47,11 +47,24 @@ APPS_DIR="$HOME/.local/share/applications"
 fail() { echo "PROMOTE REFUSED: $*" >&2; exit 1; }
 
 # --- 1. clean tree -------------------------------------
+# Tracked modifications refuse outright. Untracked files
+# refuse too, EXCEPT nix build result links: a symlink
+# pointing into /nix/store is a build output, not a
+# worktree change.
 cd "$REPO"
-DIRTY="$(git status --porcelain --untracked-files=all \
-  | grep -v -E '^\?\? result(-[0-9]+)?$' || true)"
-[ -z "$DIRTY" ] || fail "dirty tree:
-$DIRTY
+DIRTY=""
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  if [ "${line:0:2}" = "??" ]; then
+    p="${line:3}"
+    if [ -L "$p" ] && case "$(readlink "$p")" in /nix/store/*) true;; *) false;; esac; then
+      continue
+    fi
+  fi
+  DIRTY="$DIRTY
+$line"
+done < <(git status --porcelain --untracked-files=all)
+[ -z "$DIRTY" ] || fail "dirty tree:$DIRTY
 Commit first; a promotion is a commit, not a worktree."
 HEAD_REV="$(git rev-parse HEAD)"
 echo "promote: tree clean at $HEAD_REV"
