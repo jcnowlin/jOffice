@@ -605,24 +605,35 @@
     function joPdfMirrorVerdict() {
         var doc = joPdfDoc();
         var h = doc && doc.History;
-        if (!h || h.Index === null || h.Index === undefined
-            || h.SavedIndex === null || h.SavedIndex === undefined) {
+        if (!h || h.Index === null || h.Index === undefined) {
             return 'unknown';
         }
         var points = (h.Points && typeof h.Points.length === 'number')
             ? h.Points.length : null;
+        // A never-saved-in-session History carries
+        // SavedIndex=null; normalize it to -1 ("nothing
+        // saved") instead of reading it as unprovable.
+        var saved = (h.SavedIndex === null || h.SavedIndex === undefined)
+            ? -1 : h.SavedIndex;
         var reset = false;
+        if (saved > h.Index) reset = true;
         if (joPdf.mirrorSeen) {
             if (joPdf.mirrorObj !== h) reset = true;
             if (points !== null && joPdf.mirrorPoints !== null
                 && points < joPdf.mirrorPoints) reset = true;
-            if (h.SavedIndex > h.Index) reset = true;
         }
         joPdf.mirrorObj = h;
         joPdf.mirrorPoints = points;
         joPdf.mirrorSeen = true;
         if (reset) return 'unknown';
-        return h.Index === h.SavedIndex ? 'clean' : 'dirty';
+        // Zero points: no changes exist in this session, so
+        // nothing can be unsaved — clean by construction.
+        // The first version of this function demanded a
+        // numeric SavedIndex and read a pristine PDF as
+        // 'unknown', so idle Ctrl+S rewrote the file
+        // (cycle 9 PD1a catch).
+        if (h.Index < 0) return 'clean';
+        return h.Index === saved ? 'clean' : 'dirty';
     }
     // Protected cycle: true while this window's document is
     // password-protected (any format — set from the open
