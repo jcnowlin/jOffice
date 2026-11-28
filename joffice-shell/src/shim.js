@@ -286,6 +286,241 @@
     }
 
     // -----------------------------------------------------------
+    // Settings (marathon 2 cycle 8; KAO round 2 governs).
+    // The shell owns the settings; the editor's own stores
+    // are either locked (features.spellcheck), clamped
+    // (autorecover gap — it feeds the journal), or deleted
+    // (stale localStorage spellcheck keys). Everything the
+    // editor actually loaded is READ BACK and reported to
+    // Rust (settingsEvent); disagreement with the configured
+    // values is drift — shown in the dialog, never silently
+    // adopted into the settings file.
+    // -----------------------------------------------------------
+
+    // The DocEditor trap: the desktop page builds
+    // editorConfig itself with a fixed customization literal
+    // (no features), so the features.spellcheck lock and the
+    // single-producer lang are injected here, at construct
+    // time, in the top frame.
+    (function installDocEditorTrap() {
+        var iv = setInterval(function () {
+            var DA = window.DocsAPI;
+            if (!DA || typeof DA.DocEditor !== 'function' || DA.DocEditor.__joWrapped) return;
+            var Orig = DA.DocEditor;
+            var Wrapped = function (id, config) {
+                try {
+                    var s = window.__joSettings || {};
+                    if (config && config.editorConfig) {
+                        var ec = config.editorConfig;
+                        if (s.lang) ec.lang = s.lang;
+                        if (!ec.customization) ec.customization = {};
+                        if (!ec.customization.features) ec.customization.features = {};
+                        ec.customization.features.spellcheck = {
+                            mode: !!s.spellEnabled,
+                            change: false
+                        };
+                        window.__joLoadedConfig = config;
+                        joLedger('SETTINGS_FEATURES', null, {
+                            spell: s.spellEnabled ? 'on' : 'off',
+                            lang: ec.lang || ''
+                        });
+                        bridge('settingsEvent', {
+                            kind: 'localeReport',
+                            lang: ec.lang || ''
+                        }).catch(function () {});
+                    }
+                } catch (e) { /* injection must never break the construct */ }
+                return Reflect.construct(Orig, [id, config]);
+            };
+            Wrapped.__joWrapped = true;
+            Wrapped.prototype = Orig.prototype;
+            try {
+                DA.DocEditor = Wrapped;
+                console.log('[jOffice][settings] DocEditor trap asserted');
+                clearInterval(iv);
+            } catch (e) { /* retry next tick */ }
+        }, 25);
+    })();
+
+    // Startup localStorage pass (every frame; idempotent):
+    //   - force <prefix>settings-autosave to "1" (seconds):
+    //     a stored 0 would call asc_setAutoSaveGap(0) at
+    //     editor load and starve the journal, which is fed
+    //     by the _autoSave flush (LocalFileSaveChanges).
+    //     Report the clamp when the stored value was "0".
+    //   - delete the stale spellcheck keys under all three
+    //     prefixes: with the features lock the editor never
+    //     reads them again, and a leftover "off" must not
+    //     outlive the lock. Report what was found; Rust owns
+    //     the one-time notice (its marker file decides).
+    (function settingsStartupPass() {
+        var prefixes = ['de-', 'pe-', 'sse-'];
+        var spellKeys = [
+            'settings-spellcheck',
+            'spellcheck-ignore-uppercase-words',
+            'spellcheck-ignore-numbers-words'
+        ];
+        try {
+            prefixes.forEach(function (p) {
+                var ak = p + 'settings-autosave';
+                var av = null;
+                try { av = window.localStorage.getItem(ak); } catch (e) { /* no storage */ }
+                if (av === '0') {
+                    joLedger('AUTORECOVER_CLAMP', null, { key: ak, from: '0', to: '1' });
+                    bridge('settingsEvent', { kind: 'autorecoverClamped', key: ak })
+                        .catch(function () {});
+                }
+                try { window.localStorage.setItem(ak, '1'); } catch (e) { /* ignore */ }
+                spellKeys.forEach(function (suffix) {
+                    var k = p + suffix;
+                    var v = null;
+                    try { v = window.localStorage.getItem(k); } catch (e) { /* ignore */ }
+                    if (v !== null) {
+                        joLedger('SETTINGS_STALE_KEY', null, { key: k, value: v });
+                        bridge('settingsEvent', { kind: 'staleKey', key: k, value: v })
+                            .catch(function () {});
+                        try { window.localStorage.removeItem(k); } catch (e) { /* ignore */ }
+                    }
+                });
+            });
+        } catch (e) { /* storage unavailable in this frame */ }
+    })();
+
+    // The autorecover clamp, second layer: any direct
+    // asc_setAutoSaveGap(0) call is forced to 1 second. The
+    // journal's flush path is not a user setting.
+    function joWrapAutoSaveGap(api) {
+        if (!api || api.__joGapWrap || typeof api.asc_setAutoSaveGap !== 'function') return;
+        api.__joGapWrap = true;
+        var orig = api.asc_setAutoSaveGap.bind(api);
+        api.asc_setAutoSaveGap = function (gap) {
+            if (gap === 0 || gap === '0') {
+                joLedger('AUTORECOVER_CLAMP', null, { from: 'api-0', to: '1' });
+                bridge('settingsEvent', { kind: 'autorecoverClamped', key: 'api' })
+                    .catch(function () {});
+                gap = 1;
+            }
+            return orig(gap);
+        };
+    }
+
+    // Push the ignore rules into the editor (the features
+    // lock stops Main.js from reading them out of
+    // localStorage, so the shim is the only source). Word
+    // editor only — the settings object exists in
+    // AscCommon for all, but asc_setSpellCheckSettings is a
+    // word-api surface; other editors are guarded off.
+    function joPushSpellSettings() {
+        var ref = getEditor();
+        var ed = ref.editor;
+        var s = window.__joSettings || {};
+        if (!ed || typeof ed.asc_setSpellCheckSettings !== 'function') return false;
+        var AC = (ref.ew && ref.ew.AscCommon) || window.AscCommon;
+        if (!AC || typeof AC.CSpellCheckSettings !== 'function') return false;
+        try {
+            var o = new AC.CSpellCheckSettings();
+            o.put_IgnoreWordsInUppercase(!!s.ignoreUppercase);
+            o.put_IgnoreWordsWithNumbers(!!s.ignoreNumbers);
+            ed.asc_setSpellCheckSettings(o);
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    // Effective-value read-back: what the editor ACTUALLY
+    // holds (enabled via the logic document's Spelling.IsOn
+    // where reachable; ignore rules via
+    // asc_getSpellCheckSettings). Reported to Rust, which
+    // compares against the configured values — drift is a
+    // dialog fact, never an adoption.
+    function joReportSpellSettings(why) {
+        var ref = getEditor();
+        var ed = ref.editor;
+        if (!ed) return;
+        var rep = { kind: 'spellReport', why: why || '' };
+        try {
+            var sp = ed.WordControl && ed.WordControl.m_oLogicDocument
+                && ed.WordControl.m_oLogicDocument.Spelling;
+            if (sp && typeof sp.IsOn === 'function') rep.enabled = !!sp.IsOn();
+        } catch (e) { /* not a word editor */ }
+        try {
+            if (typeof ed.asc_getSpellCheckSettings === 'function') {
+                var cur = ed.asc_getSpellCheckSettings();
+                if (cur) {
+                    rep.ignoreUppercase = !!cur.get_IgnoreWordsInUppercase();
+                    rep.ignoreNumbers = !!cur.get_IgnoreWordsWithNumbers();
+                }
+            }
+        } catch (e) { /* ignore */ }
+        if (rep.enabled === undefined && rep.ignoreUppercase === undefined) return;
+        bridge('settingsEvent', rep).catch(function () {});
+    }
+
+    // Apply at load (once the logic document exists the push
+    // lands; SetSettings restarts checking when it changes
+    // anything) and keep reporting on change.
+    var joSpellSettingsApplied = false;
+    setInterval(function () {
+        if (!joSpellSettingsApplied) {
+            if (joPushSpellSettings()) {
+                joSpellSettingsApplied = true;
+                joReportSpellSettings('load');
+            }
+        }
+    }, 500);
+
+    // Live changes from the settings dialog (Rust evaluates
+    // these on the top frame; they reach the editor frame
+    // through getEditor()).
+    window.__joApplySpellSettings = function (json) {
+        try {
+            var s = JSON.parse(json);
+            if (!window.__joSettings) window.__joSettings = {};
+            if (typeof s.enabled === 'boolean') window.__joSettings.spellEnabled = s.enabled;
+            if (typeof s.ignoreUppercase === 'boolean') window.__joSettings.ignoreUppercase = s.ignoreUppercase;
+            if (typeof s.ignoreNumbers === 'boolean') window.__joSettings.ignoreNumbers = s.ignoreNumbers;
+            joPushSpellSettings();
+            joReportSpellSettings('apply');
+            return true;
+        } catch (e) {
+            return false;
+        }
+    };
+    // "Off" is effected ONLY through the editor's own
+    // Spelling.Use path (asc_setSpellCheck — the same call
+    // the editor UI makes; the cycle-7 wrap mirrors it to
+    // the liveness machine). The spell service is never told
+    // to pretend words are correct.
+    window.__joSetSpellEnabled = function (on) {
+        var ref = getEditor();
+        var ed = ref.editor;
+        if (!ed || typeof ed.asc_setSpellCheck !== 'function') return false;
+        if (!window.__joSettings) window.__joSettings = {};
+        window.__joSettings.spellEnabled = !!on;
+        ed.asc_setSpellCheck(!!on);
+        setTimeout(function () { joReportSpellSettings('toggle'); }, 300);
+        return true;
+    };
+
+    // Autosave trigger (cycle 8): Rust's gate decided; the
+    // save itself is an ordinary asc_Save whose LocalFileSave
+    // carries origin 'autosave' — the same serialization,
+    // ledger, and EndSave contract as a user save.
+    window.__joAutosaveSave = function () {
+        var ref = getEditor();
+        if (!ref.editor) return false;
+        var ew = ref.ew || window;
+        if (ew.__joSave) ew.__joSave.nextOrigin = 'autosave';
+        try {
+            ref.editor.asc_Save();
+        } catch (e) {
+            return false;
+        }
+        return true;
+    };
+
+    // -----------------------------------------------------------
     // Cycle 4: flush mode + journal state. The mode is injected
     // by Rust (window.__joFlushMode, from JOFFICE_FLUSH_MODE):
     //   'journal' — mode J (production): saveChanges is journaled
@@ -1637,9 +1872,9 @@
     }
     var JO_SAVE_RANK = { flush: 0, user: 1, saveas: 2 };
 
-    function joSerializedSave(ed, orig, args) {
+    function joSerializedSave(ed, orig, args, retried) {
         var kind = joSaveKind(args);
-        var req = { ed: ed, orig: orig, args: args, kind: kind, rank: JO_SAVE_RANK[kind] };
+        var req = { ed: ed, orig: orig, args: args, kind: kind, rank: JO_SAVE_RANK[kind], retried: !!retried };
         if (joSave.cycle) {
             if (!joSave.deferred || req.rank >= joSave.deferred.rank) {
                 joSave.deferred = req;
@@ -1682,7 +1917,57 @@
                     joSave.gestureTimer = null;
                     joSave.gesture = false;
                 }, 15000);
+                // Cycle 8 dropped-save detector (round 2,
+                // directive 7): a user/saveas request on a
+                // MODIFIED document whose asc_Save returns
+                // without StartSave firing synchronously was
+                // dropped inside the editor (the canSave gate
+                // is the known shape) — the user believes
+                // they saved and nothing is coming. The
+                // synchrony assumption is the close path's
+                // own (StartSave is called from inside
+                // asc_Save). One retry through the serializer,
+                // then SAVE_DROPPED to Rust for the persistent
+                // banner (a safety notice — never suppressible).
+                var dropWatch = null;
+                if (best.kind === 'user' || best.kind === 'saveas') {
+                    var dirtyBefore = true;
+                    try {
+                        if (typeof best.ed.Have_Changes === 'function') dirtyBefore = !!best.ed.Have_Changes();
+                        else if (typeof best.ed.isDocumentModified === 'function') dirtyBefore = !!best.ed.isDocumentModified();
+                    } catch (e) { /* keep the permissive default */ }
+                    var ewNow = (getEditor().ew) || window;
+                    if (ewNow.__joSave) ewNow.__joSave.started = false;
+                    if (dirtyBefore) {
+                        dropWatch = { kind: best.kind, retried: !!best.retried, ew: ewNow };
+                    }
+                }
                 best.orig.apply(best.ed, best.args);
+                if (dropWatch) {
+                    var startedNow = dropWatch.ew.__joSave
+                        ? !!dropWatch.ew.__joSave.started : false;
+                    if (!startedNow) {
+                        joLedger('SAVE_DROPPED_DETECTED', null, {
+                            kind: dropWatch.kind,
+                            retried: dropWatch.retried ? 'yes' : 'no'
+                        });
+                        if (!dropWatch.retried) {
+                            bridge('settingsEvent', { kind: 'saveDropped', state: 'detected' })
+                                .catch(function () {});
+                            var rEd = best.ed, rOrig = best.orig, rArgs = best.args;
+                            setTimeout(function () {
+                                joSerializedSave(rEd, rOrig, rArgs, true);
+                            }, 50);
+                        } else {
+                            bridge('settingsEvent', { kind: 'saveDropped', state: 'failed' })
+                                .catch(function () {});
+                        }
+                    } else if (dropWatch.retried) {
+                        joLedger('SAVE_DROPPED_RECOVERED', null, { kind: dropWatch.kind });
+                        bridge('settingsEvent', { kind: 'saveDropped', state: 'recovered' })
+                            .catch(function () {});
+                    }
+                }
             }, 0);
         }
     }
@@ -2266,6 +2551,10 @@
             // EndLoad, which calls DesktopAfterOpen).
             joInstallSpellFilter(editorApi);
             joWrapSpellToggle(editorApi);
+            // Cycle 8: the autorecover clamp wraps the gap
+            // setter before Main.js's load-time call can land
+            // a journal-starving 0.
+            joWrapAutoSaveGap(editorApi);
         },
 
         // Called by DesktopOfflineUpdateLocalName during load.

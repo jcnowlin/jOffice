@@ -569,6 +569,26 @@ impl PersonalStore {
         Ok(true)
     }
 
+    /// Remove one word (cycle 8 dialog, D1). Same write
+    /// discipline as add: the locked rewrite re-reads the
+    /// file and merges, so a remove can never resurrect a
+    /// word another writer deleted, nor drop one it added.
+    /// Ok(false) = the word was not there.
+    pub fn remove(&mut self, raw: &str) -> Result<bool, String> {
+        let word = validate_word(raw)?;
+        if self.readonly {
+            return Err("personal dictionary is read-only".into());
+        }
+        if !self.words.contains(&word) {
+            return Ok(false);
+        }
+        let w2 = word.clone();
+        self.rewrite(&|set| {
+            set.remove(&w2);
+        })?;
+        Ok(true)
+    }
+
     /// {"type":"clear"}: wipe the dictionary (stock semantics:
     /// CreateUserDictionary_All(true) re-seeds empty).
     pub fn clear(&mut self) -> Result<(), String> {
@@ -641,6 +661,13 @@ pub struct SpellJob {
 /// JSON or the bare string "clear"): the window behind this
 /// token closed; drop its per-token state.
 const CONTROL_UNREGISTER: &str = "jo-control:unregister";
+
+/// Cycle 8 settings dialog: the personal dictionary list /
+/// remove / clear controls ride the same queue, so the
+/// service thread stays the store's only writer.
+const CONTROL_PERSONAL_LIST: &str = "jo-control:personal-list";
+const CONTROL_PERSONAL_REMOVE_PREFIX: &str = "jo-control:personal-remove:";
+const CONTROL_PERSONAL_CLEAR: &str = "jo-control:personal-clear";
 
 struct TokenState {
     /// Protected windows' memory-only adds (PD7): consulted
@@ -757,6 +784,49 @@ impl Service {
     fn process(&mut self, job: SpellJob) {
         if job.task == CONTROL_UNREGISTER {
             self.tokens.remove(&job.token);
+            return;
+        }
+        // Cycle 8 dialog controls (D1/D2). Replies are plain
+        // JSON payloads on the job's own channel.
+        if job.task == CONTROL_PERSONAL_LIST {
+            let words: Vec<String> = self.personal.words().iter().cloned().collect();
+            let _ = job.reply.send(SpellReply {
+                seq: job.seq,
+                payload: Some(serde_json::json!({ "words": words }).to_string()),
+                event: None,
+            });
+            return;
+        }
+        if job.task == CONTROL_PERSONAL_CLEAR {
+            let payload = match self.personal.clear() {
+                Ok(()) => {
+                    self.rebuild_user_handle();
+                    self.cache.clear();
+                    "{\"ok\":true}".to_string()
+                }
+                Err(e) => serde_json::json!({ "error": e }).to_string(),
+            };
+            let _ = job.reply.send(SpellReply {
+                seq: job.seq,
+                payload: Some(payload),
+                event: None,
+            });
+            return;
+        }
+        if let Some(word) = job.task.strip_prefix(CONTROL_PERSONAL_REMOVE_PREFIX) {
+            let payload = match self.personal.remove(word) {
+                Ok(_) => {
+                    self.rebuild_user_handle();
+                    self.cache.clear();
+                    "{\"ok\":true}".to_string()
+                }
+                Err(e) => serde_json::json!({ "error": e }).to_string(),
+            };
+            let _ = job.reply.send(SpellReply {
+                seq: job.seq,
+                payload: Some(payload),
+                event: None,
+            });
             return;
         }
         let token = job.token;
@@ -1188,6 +1258,83 @@ pub fn unregister(token: u64) {
     }
 }
 
+/// One control round-trip for the settings dialog. Blocks
+/// the caller (a dialog worker thread, never the GTK main
+/// thread) for at most 3 s.
+fn control_roundtrip(task: &str) -> Result<String, String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    let handle = SERVICE.get().ok_or("spell service not started")?;
+    if handle.refused {
+        return Err("spell service refused to start".into());
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<SpellReply>();
+    let job = SpellJob {
+        token: 0,
+        seq: SEQ.fetch_add(1, Ordering::Relaxed),
+        protected: false,
+        task: task.to_string(),
+        reply: tx,
+    };
+    handle
+        .tx
+        .send(job)
+        .map_err(|_| "spell service is gone".to_string())?;
+    let reply = rx
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .map_err(|_| "spell service did not answer".to_string())?;
+    reply.payload.ok_or_else(|| "empty control reply".to_string())
+}
+
+/// The persistent personal dictionary's words, for the
+/// settings dialog's Spellcheck page (D1). Empty when the
+/// service is unavailable; the dialog says so separately
+/// via the liveness row.
+pub fn personal_list() -> Vec<String> {
+    match control_roundtrip(CONTROL_PERSONAL_LIST) {
+        Ok(payload) => serde_json::from_str::<serde_json::Value>(&payload)
+            .ok()
+            .and_then(|v| {
+                v.get("words").and_then(|w| w.as_array()).map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+            })
+            .unwrap_or_default(),
+        Err(e) => {
+            eprintln!("joffice: SPELL_PERSONAL_LIST_FAILED {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// Remove one word from the personal dictionary (D1).
+pub fn personal_remove(word: &str) -> Result<(), String> {
+    let payload = control_roundtrip(&format!("{CONTROL_PERSONAL_REMOVE_PREFIX}{word}"))?;
+    control_ok(&payload)
+}
+
+/// Remove every word from the personal dictionary (D2).
+pub fn personal_clear_all() -> Result<(), String> {
+    let payload = control_roundtrip(CONTROL_PERSONAL_CLEAR)?;
+    control_ok(&payload)
+}
+
+fn control_ok(payload: &str) -> Result<(), String> {
+    let v: serde_json::Value =
+        serde_json::from_str(payload).map_err(|e| format!("bad control reply: {e}"))?;
+    if v.get("ok").and_then(|b| b.as_bool()) == Some(true) {
+        Ok(())
+    } else {
+        Err(v
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("control task failed")
+            .to_string())
+    }
+}
+
 /// The all-correct fallback reply for a task (service
 /// refused/dead): echo + silence, stock's unknown-LCID shape.
 fn fallback_reply(task: &str, seq: u64) -> SpellReply {
@@ -1369,6 +1516,45 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str("{\"usrWords\":[\"a\",\"b\"],\"usrLang\":[1033]}").unwrap();
         assert_eq!(parse_langs(&v, 2), vec![1033, 0]);
+    }
+
+    #[test]
+    fn personal_remove_discipline() {
+        // Cycle 8 D1: remove goes through the same locked
+        // rewrite as add; the file on disk is the truth.
+        let dir = std::env::temp_dir().join(format!(
+            "joffice-personal-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The store refuses group/world-writable dirs; the
+        // test process's umask may grant group write, so pin
+        // the mode the production data dir carries.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // PersonalStore::load reads JOFFICE_PERSONAL_DIR via
+        // data_dir(); construct the store directly instead
+        // to keep the test hermetic.
+        let mut store = PersonalStore {
+            dir: dir.clone(),
+            words: BTreeSet::new(),
+            readonly: false,
+            add_times: VecDeque::new(),
+        };
+        store.add("alpha").unwrap();
+        store.add("beta").unwrap();
+        assert!(store.remove("alpha").unwrap());
+        assert!(!store.remove("alpha").unwrap(), "second remove is a no-op Ok(false)");
+        assert!(store.remove("two words").is_err(), "invalid word refused");
+        let on_disk = std::fs::read_to_string(dir.join("personal.txt")).unwrap();
+        assert_eq!(on_disk, "beta\n", "disk holds exactly the surviving word");
+        assert_eq!(
+            store.words().iter().cloned().collect::<Vec<_>>(),
+            vec!["beta".to_string()]
+        );
     }
 
     #[test]

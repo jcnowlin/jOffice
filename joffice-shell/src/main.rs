@@ -56,6 +56,9 @@ const FONT_SCHEME: &str = "ascdesktop";
 /// Defines window.AscDesktopEditor on top of the Rust bridge.
 const SHIM_JS: &str = include_str!("shim.js");
 
+mod notices;
+mod retention;
+mod settings;
 mod spell;
 
 /// Minimal bootstrap: error collector + the Rust bridge entry point.
@@ -142,6 +145,34 @@ fn reply_save_err(shell: &Rc<Shell>, reply: &ScriptMessageReply, msg: String, or
 /// minutes, and a pause after three identical failures (the
 /// close prompt then says the autosave is paused).
 fn present_save_error(shell: &Rc<Shell>, msg: &str, origin: &str) {
+    if origin == "autosave" {
+        // Cycle 8: an autosave failure is never a modal and
+        // never a toast. A conflict or ENOSPC pauses autosave
+        // behind a persistent banner (a safety notice); any
+        // other failure just ledgers — the gate re-evaluates
+        // every second and the journal holds the work.
+        let conflict = msg.contains("changed on disk");
+        let enospc = msg.contains("No space left");
+        if conflict || enospc {
+            let reason = if conflict {
+                "the file changed on disk"
+            } else {
+                "no space left on the device"
+            };
+            shell.autosave_rt.borrow_mut().gate =
+                AutosaveGate::Paused(reason.to_string());
+            show_save_banner(
+                shell,
+                &format!(
+                    "Autosave paused — {reason}. Your changes are safe in the recovery journal; save manually to resume."
+                ),
+            );
+            eprintln!("joffice: AUTOSAVE_PAUSED reason={reason} msg={msg}");
+        } else {
+            eprintln!("joffice: AUTOSAVE_FAILED msg={msg} (gate re-evaluates on tick)");
+        }
+        return;
+    }
     if origin == "changes" {
         let mut a = shell.autosave.borrow_mut();
         if a.last_msg == msg {
@@ -575,14 +606,25 @@ fn ensure_spell_pump(shell: &Rc<Shell>) {
                 eprintln!("joffice: SPELL_DEAD_PROBE edits seen, no task within 5 s");
                 spell_refresh_indicator(&shell_p);
             }
+            // Cycle 8: the autosave gate evaluates on the
+            // same ~1 s cadence.
+            autosave_tick(&shell_p);
         }
         gtk4::glib::ControlFlow::Continue
     });
 }
 
-/// A spell.js/spell.wasm scheme request means sdkjs fell to
-/// the WASM worker in some frame — the shim missed that frame
-/// (round 2 §2, SPELL_WRONG_ROUTE).
+/// A spell.wasm scheme request means sdkjs fell to the
+/// WASM worker in some frame — the shim missed that frame
+/// (round 2 §2, SPELL_WRONG_ROUTE). Cycle 8 correction
+/// (cycle-7 drive finding): a plain in-page request for
+/// common/spell/spell.js is NOT the wrong route — the
+/// DESKTOP route itself loads that module in the page (it
+/// carries spellcheckGetLanguages); the detector originally
+/// fired on it ~1 s after every launch, pinning the
+/// liveness display at WrongRoute and masking Live forever.
+/// The WASM binary fetch is the wrong route's unambiguous
+/// signature: the worker cannot run without it.
 fn spell_wrong_route(shell: &Rc<Shell>, rel: &str) {
     let first = {
         let mut st = shell.spell.borrow_mut();
@@ -951,6 +993,11 @@ struct SessionState {
     /// length and the §6a unedited no-op ate the recovered
     /// save). Cleared only by session_on_bound_save.
     recovered_unsaved: bool,
+    /// Cycle 8 retention: how the window closed, written
+    /// into the manifest at finalize ("saved" / "dontsave";
+    /// absent = the window died undecided = crash class).
+    closed: Option<&'static str>,
+    closed_unix: Option<u64>,
 }
 
 impl SessionState {
@@ -993,6 +1040,10 @@ impl SessionState {
             // design (append-only journal, no replay — the
             // scan below never offers them).
             "recovery_degraded": self.origin_code == fmt::PDF,
+            // Cycle 8: close markers for the retention
+            // planner (absent while the window lives).
+            "closed": self.closed,
+            "closed_unix": self.closed_unix,
         });
         let tmp = self.dir.join("manifest.json.tmp");
         if std::fs::write(&tmp, manifest.to_string()).is_ok() {
@@ -1244,6 +1295,8 @@ fn load_recovery_session(
             .unwrap_or(0),
         recovered: true,
         recovered_unsaved: true,
+        closed: None,
+        closed_unix: None,
     };
     st.write_manifest();
     Some((st, folded, gap))
@@ -1939,6 +1992,56 @@ struct AutosaveState {
     retry_pending: bool,
 }
 
+/// Cycle 8 autosave gate verdict for one window (round 2:
+/// Off / Paused / Deferred are states, not events — the
+/// indicator shows the current one).
+#[derive(Clone, PartialEq, Debug)]
+enum AutosaveGate {
+    /// The setting is off, or this window can never autosave
+    /// (protected / PDF / non-native / untitled / unconfirmed
+    /// recovery / would-prompt). Carries the reason for the
+    /// dialog's display row.
+    Off(String),
+    /// Armed: idle + dirty will trigger a save.
+    Armed,
+    /// A conflict or ENOSPC stopped autosave; persistent
+    /// per-window indicator until a manual save succeeds.
+    Paused(String),
+}
+
+/// Cycle 8 autosave runtime for one window. Deliberately
+/// separate from AutosaveState above (that one is the
+/// cycle-2 'changes'-origin failure presenter).
+struct AutosaveRuntime {
+    gate: AutosaveGate,
+    /// The revert copy exists in the session dir.
+    revert_ready: bool,
+    /// At least one autosave write landed for this window
+    /// (the close prompt then offers Revert).
+    wrote: bool,
+    /// When the bound file was opened (for the Revert
+    /// button's "version opened at HH:MM" label).
+    opened_unix: u64,
+    /// Last journal activity (the 30 s idle rule).
+    last_edit: Option<Instant>,
+    /// The user confirmed a recovered session's binding
+    /// through a successful manual bound save.
+    binding_confirmed: bool,
+}
+
+impl Default for AutosaveRuntime {
+    fn default() -> Self {
+        AutosaveRuntime {
+            gate: AutosaveGate::Off("not evaluated".to_string()),
+            revert_ready: false,
+            wrote: false,
+            opened_unix: 0,
+            last_edit: None,
+            binding_confirmed: false,
+        }
+    }
+}
+
 /// A staged inserted image: the copy state for docmedia holds.
 enum ImageStage {
     Copying,
@@ -2096,6 +2199,33 @@ struct Shell {
     /// clean-but-undecided close look the same from here, and
     /// keeping is the safe side.
     session_discard: RefCell<bool>,
+    /// Cycle 8: WHY the window is closing, for the session
+    /// manifest's close marker — Some("dontsave") when the
+    /// user chose Don't Save / Close Without Saving. A clean
+    /// save needs no marker here: finalize derives "saved"
+    /// from the session's unsaved count.
+    close_disposition: RefCell<Option<&'static str>>,
+    /// Cycle 8 save state machine: the origin of the save
+    /// currently inside the saveFile handler, if any. Every
+    /// save (user or auto) passes through the one handler;
+    /// an arrival while this is set is ledgered, never
+    /// silently queued.
+    save_phase: RefCell<Option<String>>,
+    /// Cycle 8: SAVE_DROPPED after the retry also failed —
+    /// a safety notice (window-scoped, never suppressible).
+    save_dropped: RefCell<bool>,
+    /// Cycle 8: settings drift facts from the shim's
+    /// effective-value read-backs. Some(text) while the
+    /// editor's loaded values disagree with the configured
+    /// ones; rendered in the settings dialog.
+    settings_drift: RefCell<Option<String>>,
+    /// Cycle 8 autosave runtime (gate, revert copy, idle).
+    autosave_rt: RefCell<AutosaveRuntime>,
+    /// Cycle 8: the fingerprint the bound file must still
+    /// carry immediately before a write renames over it
+    /// while autosave is armed. Moves only on our own bound
+    /// writes (note_save_completed) and at arm time.
+    autosave_expect_fp: RefCell<Option<Fingerprint>>,
     /// The shim-reported History.Index of the in-flight save
     /// (cycle 4): consumed by write_save_checked to record
     /// last_bound_save_index in the session manifest.
@@ -2290,6 +2420,12 @@ impl Shell {
             print_disclosed: RefCell::new(false),
             recovery_arm: RefCell::new(None),
             session_discard: RefCell::new(false),
+            close_disposition: RefCell::new(None),
+            save_phase: RefCell::new(None),
+            save_dropped: RefCell::new(false),
+            settings_drift: RefCell::new(None),
+            autosave_rt: RefCell::new(AutosaveRuntime::default()),
+            autosave_expect_fp: RefCell::new(None),
             pending_hist_index: RefCell::new(None),
             copy_btn: RefCell::new(None),
             pw_btn: RefCell::new(None),
@@ -2462,6 +2598,8 @@ impl Shell {
                 .unwrap_or(0),
             recovered: false,
             recovered_unsaved: false,
+            closed: None,
+            closed_unix: None,
         };
         st.write_manifest();
         eprintln!(
@@ -2513,6 +2651,18 @@ impl Shell {
             st.recovered_unsaved = false;
             st.bound_items = st.base + st.folded.len() as i64;
             st.write_manifest();
+            // Cycle 8: a bound save confirms a recovered
+            // session's binding (the user's manual save IS
+            // the confirmation the autosave gate waits for),
+            // and an autosave-origin bound save arms the
+            // close prompt's Revert offer.
+            {
+                let mut rt = self.autosave_rt.borrow_mut();
+                rt.binding_confirmed = true;
+                if self.save_phase.borrow().as_deref() == Some("autosave") {
+                    rt.wrote = true;
+                }
+            }
             eprintln!(
                 "joffice: SESSION_BOUND_SAVE sid={} dest={} hist_index={:?}",
                 st.sid,
@@ -2522,24 +2672,45 @@ impl Shell {
         }
     }
 
-    /// Window destroy: delete the session only when the close
-    /// paths marked it discardable (saved / Don't Save) or the
-    /// document is clean; otherwise keep it for recovery.
+    /// Window destroy: delete the session only when it is
+    /// provably clean (saved). Cycle 8 retention split:
+    ///   - clean save  -> manifest marked "saved", dir
+    ///     deleted (the pre-cycle-8 behaviour);
+    ///   - Don't Save  -> manifest marked "dontsave" with
+    ///     the close time, dir KEPT: the retention planner
+    ///     lists it past its floor and only the user's
+    ///     explicit action deletes it (round 2 §c — nothing
+    ///     holding unsaved work is deleted except by the
+    ///     user's explicit action);
+    ///   - anything else (crash, undecided) -> kept unmarked
+    ///     for the recovery offer, as before.
     fn session_finalize_destroy(&self) {
         // Protected cycle: the password and tmpfs dir die
         // with the window, whatever the session does.
         clear_protected_state(self);
         let old = self.session.borrow_mut().take();
-        if let Some(st) = old {
-            let discard = *self.session_discard.borrow()
-                || (st.unsaved() <= 0 && !st.recovered_unsaved);
+        if let Some(mut st) = old {
+            let dontsave = *self.close_disposition.borrow() == Some("dontsave");
+            let clean = st.unsaved() <= 0 && !st.recovered_unsaved;
             eprintln!(
-                "joffice: SESSION_FINALIZE sid={} discard={} unsaved={}",
+                "joffice: SESSION_FINALIZE sid={} dontsave={} clean={} unsaved={}",
                 st.sid,
-                discard,
+                dontsave,
+                clean,
                 st.unsaved()
             );
-            if discard {
+            if dontsave {
+                st.closed = Some("dontsave");
+                st.closed_unix = Some(unix_now());
+                st.write_manifest();
+                eprintln!(
+                    "joffice: SESSION_CLOSED_DONTSAVE sid={} (kept for retention)",
+                    st.sid
+                );
+            } else if clean || *self.session_discard.borrow() {
+                st.closed = Some("saved");
+                st.closed_unix = Some(unix_now());
+                st.write_manifest();
                 let _ = std::fs::remove_dir_all(&st.dir);
             }
         }
@@ -2565,6 +2736,20 @@ impl Shell {
     /// show the once-per-session substitution reminder (§5).
     fn note_save_completed(&self, dest: &Path) {
         *self.doc_stamp.borrow_mut() = file_stamp(dest).map(|s| (dest.to_path_buf(), s));
+        // Cycle 8: our own bound write moves the autosave
+        // baseline fingerprint, and a successful save
+        // un-pauses autosave (the baseline the user has seen
+        // is now this write).
+        if self.autosave_expect_fp.borrow().is_some() {
+            *self.autosave_expect_fp.borrow_mut() = fingerprint(dest);
+        }
+        {
+            let mut rt = self.autosave_rt.borrow_mut();
+            if matches!(rt.gate, AutosaveGate::Paused(_)) {
+                rt.gate = AutosaveGate::Armed;
+                eprintln!("joffice: AUTOSAVE_RESUMED (successful save re-baselined)");
+            }
+        }
         let subs = self.substitutions.borrow();
         if !subs.is_empty() && !*self.save_toasted.borrow() {
             *self.save_toasted.borrow_mut() = true;
@@ -4427,13 +4612,20 @@ fn editor_entry_url(pending: Option<&PathBuf>, cfg: &JofficeConfig) -> String {
     // is the pdfeditor's annotate mode (Main.js:1449 feeds
     // mode into asc_setPdfViewer); a Russian UI language
     // forces the viewer regardless (isXpsViewer trap).
+    // Cycle 8: ONE producer for the language —
+    // settings::editor_lang() (ui.locale validated against
+    // the installed dictionaries) feeds this URL parameter
+    // AND the shim's editorConfig.lang. The locale set is
+    // English-only (the shipped dictionaries), so the PDF
+    // viewer's Russian-language trap cannot engage; the
+    // JOFFICE_PDF_LANG dev override still wins when set.
     let (mode, lang) = if doctype == "pdf" {
         let m = if pdf_annotate_enabled() {
             "edit"
         } else {
             "view"
         };
-        let l = pdf_lang_override().unwrap_or_else(|| "en".to_string());
+        let l = pdf_lang_override().unwrap_or_else(settings::editor_lang);
         eprintln!(
             "joffice: PDF-MODE mode={} lang={} annotate={}",
             m,
@@ -4442,14 +4634,19 @@ fn editor_entry_url(pending: Option<&PathBuf>, cfg: &JofficeConfig) -> String {
         );
         (m, l)
     } else {
-        ("edit", "en".to_string())
+        ("edit", settings::editor_lang())
     };
+    // Identity is owned by settings.toml (cycle 8; imported
+    // from config.toml on first load). cfg keeps format
+    // preferences only.
+    let identity = settings::current();
+    let _ = cfg;
     format!(
         "joffice:///apps/api/documents/index.html?type=desktop&doctype={doctype}&key=joffice-{hash:016x}&url=_offline_&title={}&filetype={}&mode={mode}&lang={lang}&userid={}&username={}",
         query_escape(&title),
         query_escape(&ext),
-        query_escape(&cfg.user_id),
-        query_escape(&cfg.user_name),
+        query_escape(&identity.uuid),
+        query_escape(&settings::effective_username()),
     )
 }
 
@@ -4509,11 +4706,11 @@ fn handle_uri_scheme(shell: &Rc<Shell>, req: &URISchemeRequest) {
         .unwrap_or_else(|| path_part.to_string());
     let rel = decoded.trim_start_matches('/');
 
-    // Cycle 7 WrongRoute detection: a request for the WASM
-    // spellchecker's script or binary means sdkjs fell to the
-    // browser route in some frame — the shim (which installs
-    // AscDesktopEditor in every frame) missed that frame.
-    if rel.contains("common/spell/spell") && (rel.ends_with(".js") || rel.ends_with(".wasm")) {
+    // Cycle 7 WrongRoute detection, narrowed in cycle 8:
+    // only the spell.wasm fetch proves the WASM route (see
+    // spell_wrong_route's comment — spell.js in-page is the
+    // desktop route's own module).
+    if rel.contains("common/spell/") && rel.ends_with(".wasm") {
         spell_wrong_route(shell, rel);
     }
 
@@ -5264,6 +5461,16 @@ fn evaluate_close(shell: &Rc<Shell>) {
         return;
     }
     if !shell_is_dirty(shell) && !shell_dirty_unknown(shell) {
+        // Cycle 8: a clean close after autosave writes still
+        // owes the user the Keep / Revert choice — the file
+        // on disk is NOT the version they opened, even
+        // though nothing is unsaved.
+        let rt = shell.autosave_rt.borrow();
+        if rt.wrote && rt.revert_ready {
+            drop(rt);
+            show_close_prompt(shell, false);
+            return;
+        }
         destroy_window(shell);
         return;
     }
@@ -5341,7 +5548,19 @@ fn show_close_prompt(shell: &Rc<Shell>, unknown: bool) {
     vbox.set_margin_bottom(16);
     vbox.set_margin_start(16);
     vbox.set_margin_end(16);
-    let text = if unknown {
+    // Cycle 8: the autosave Revert offer. revert_only = the
+    // document is clean BECAUSE autosave saved it — the
+    // prompt exists solely to offer the opened version back.
+    let revert_offer = {
+        let rt = shell.autosave_rt.borrow();
+        rt.wrote && rt.revert_ready
+    };
+    let revert_only = revert_offer && !unknown && !shell_is_dirty(shell);
+    let text = if revert_only {
+        format!(
+            "Autosave saved changes to “{name}” while you worked. Keep the autosaved version, or revert to the version you opened?"
+        )
+    } else if unknown {
         format!(
             "Couldn’t confirm whether “{name}” has unsaved changes (the editor did not answer). Save before closing?"
         )
@@ -5399,6 +5618,7 @@ fn show_close_prompt(shell: &Rc<Shell>, unknown: bool) {
         discard_btn.connect_clicked(move |_| {
             cp(&shell_c);
             *shell_c.session_discard.borrow_mut() = true;
+            *shell_c.close_disposition.borrow_mut() = Some("dontsave");
             destroy_window(&shell_c);
         });
         buttons.append(&discard_btn);
@@ -5411,6 +5631,74 @@ fn show_close_prompt(shell: &Rc<Shell>, unknown: bool) {
             request_page_save(&shell_c, "saveas");
         });
         buttons.append(&save_btn);
+    } else if revert_only {
+        // Clean because autosave saved: Keep is a plain
+        // close (the finalize marks the session saved);
+        // Revert restores the opened bytes, then closes with
+        // the dontsave disposition (the journal keeps the
+        // abandoned edits under retention).
+        let (revert_path, bound_path, opened_unix) = {
+            let sess = shell.session.borrow();
+            (
+                sess.as_ref().map(|st| st.dir.join("revert.bin")),
+                sess.as_ref().and_then(|st| st.bound_path.clone()),
+                shell.autosave_rt.borrow().opened_unix,
+            )
+        };
+        let keep_btn = gtk4::Button::with_label("Keep autosaved version");
+        {
+            let shell_c = shell.clone();
+            let cp = close_prompt.clone();
+            keep_btn.connect_clicked(move |_| {
+                cp(&shell_c);
+                destroy_window(&shell_c);
+            });
+        }
+        buttons.append(&keep_btn);
+        if let (Some(revert_path), Some(bound_path)) = (revert_path, bound_path) {
+            let when = gtk4::glib::DateTime::from_unix_local(opened_unix as i64)
+                .and_then(|d| d.format("%H:%M"))
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let revert_btn = gtk4::Button::with_label(&format!(
+                "Revert to the version opened ({when})"
+            ));
+            let shell_c = shell.clone();
+            let cp = close_prompt.clone();
+            revert_btn.connect_clicked(move |_| {
+                match std::fs::read(&revert_path)
+                    .map_err(|e| format!("read revert copy: {e}"))
+                    .and_then(|bytes| {
+                        write_atomic(&bound_path, &bytes)
+                            .map_err(|e| format!("restore write: {e}"))
+                    }) {
+                    Ok(()) => {
+                        eprintln!(
+                            "joffice: AUTOSAVE_REVERT dest={} (opened version restored)",
+                            bound_path.display()
+                        );
+                        cp(&shell_c);
+                        *shell_c.session_discard.borrow_mut() = true;
+                        *shell_c.close_disposition.borrow_mut() = Some("dontsave");
+                        destroy_window(&shell_c);
+                    }
+                    Err(e) => {
+                        eprintln!("joffice: AUTOSAVE_REVERT_FAILED {e}");
+                        show_save_banner(&shell_c, &format!("Revert failed: {e}"));
+                    }
+                }
+            });
+            buttons.append(&revert_btn);
+        }
+        let cancel_btn = gtk4::Button::with_label("Cancel");
+        {
+            let shell_c = shell.clone();
+            let cp = close_prompt.clone();
+            cancel_btn.connect_clicked(move |_| {
+                cp(&shell_c);
+            });
+        }
+        buttons.append(&cancel_btn);
     } else {
         let discard_btn = gtk4::Button::with_label("Don’t Save");
         let shell_c = shell.clone();
@@ -5418,9 +5706,70 @@ fn show_close_prompt(shell: &Rc<Shell>, unknown: bool) {
         discard_btn.connect_clicked(move |_| {
             cp(&shell_c);
             *shell_c.session_discard.borrow_mut() = true;
+            *shell_c.close_disposition.borrow_mut() = Some("dontsave");
             destroy_window(&shell_c);
         });
         buttons.append(&discard_btn);
+        // Cycle 8: closing after autosave writes offers the
+        // version that was opened (the revert copy made
+        // before the session's first autosave write), with
+        // its time. Keep = the autosaved file stays as-is
+        // (the ordinary Save / Don't Save choices above and
+        // below); Revert restores the opened bytes and
+        // closes — the abandoned edits stay in the session
+        // journal under the dontsave disposition.
+        {
+            let (wrote, revert_path, bound_path, opened_unix) = {
+                let rt = shell.autosave_rt.borrow();
+                let sess = shell.session.borrow();
+                (
+                    rt.wrote && rt.revert_ready,
+                    sess.as_ref().map(|st| st.dir.join("revert.bin")),
+                    sess.as_ref().and_then(|st| st.bound_path.clone()),
+                    rt.opened_unix,
+                )
+            };
+            if wrote {
+                if let (Some(revert_path), Some(bound_path)) = (revert_path, bound_path) {
+                    let when = gtk4::glib::DateTime::from_unix_local(opened_unix as i64)
+                        .and_then(|d| d.format("%H:%M"))
+                        .map(|s| s.to_string())
+                        .unwrap_or_default();
+                    let revert_btn = gtk4::Button::with_label(&format!(
+                        "Revert to the version opened ({when})"
+                    ));
+                    let shell_c = shell.clone();
+                    let cp = close_prompt.clone();
+                    revert_btn.connect_clicked(move |_| {
+                        match std::fs::read(&revert_path)
+                            .map_err(|e| format!("read revert copy: {e}"))
+                            .and_then(|bytes| {
+                                write_atomic(&bound_path, &bytes)
+                                    .map_err(|e| format!("restore write: {e}"))
+                            }) {
+                            Ok(()) => {
+                                eprintln!(
+                                    "joffice: AUTOSAVE_REVERT dest={} (opened version restored)",
+                                    bound_path.display()
+                                );
+                                cp(&shell_c);
+                                *shell_c.session_discard.borrow_mut() = true;
+                                *shell_c.close_disposition.borrow_mut() = Some("dontsave");
+                                destroy_window(&shell_c);
+                            }
+                            Err(e) => {
+                                eprintln!("joffice: AUTOSAVE_REVERT_FAILED {e}");
+                                show_save_banner(
+                                    &shell_c,
+                                    &format!("Revert failed: {e}"),
+                                );
+                            }
+                        }
+                    });
+                    buttons.append(&revert_btn);
+                }
+            }
+        }
         let cancel_btn = gtk4::Button::with_label("Cancel");
         let shell_c = shell.clone();
         let cp = close_prompt.clone();
@@ -9062,6 +9411,38 @@ fn write_save_checked(
         }
     }
     shell.check_unchanged(dest)?;
+    // Cycle 8 autosave re-check: while autosave is armed,
+    // the bound file must STILL carry the fingerprint from
+    // arm time (or from our last own bound write) at the
+    // moment before the rename — the wall sentence's
+    // "against a baseline the user has seen", enforced at
+    // the last possible instant. An external touch between
+    // the arm and here refuses the write as a conflict.
+    {
+        let is_bound = shell
+            .session
+            .borrow()
+            .as_ref()
+            .map(|st| st.bound_path.as_deref() == Some(dest))
+            .unwrap_or(false);
+        if is_bound {
+            if let Some(expected) = *shell.autosave_expect_fp.borrow() {
+                match fingerprint(dest) {
+                    Some(now) if now == expected => {}
+                    other => {
+                        eprintln!(
+                            "joffice: AUTOSAVE_FINGERPRINT_REFUSAL dest={} expected={expected:?} found={other:?}",
+                            dest.display()
+                        );
+                        return Err(format!(
+                            "save refused: {} changed on disk since the autosave baseline (another app or a sync client touched it). Autosave is paused; save manually to re-baseline.",
+                            dest.display()
+                        ));
+                    }
+                }
+            }
+        }
+    }
     if seq <= *shell.save_written_seq.borrow() {
         eprintln!(
             "joffice: save seq={seq} superseded by seq={} — skipped",
@@ -9181,6 +9562,119 @@ fn handle_bridge(
                 "probe" => {
                     let detail = msg.args.get("detail").and_then(|v| v.as_str()).unwrap_or("");
                     eprintln!("joffice: SPELL_PROBE {detail}");
+                }
+                _ => {}
+            }
+            reply_json(reply, ctx, &serde_json::json!({ "accepted": true }));
+        }
+
+        "settingsEvent" => {
+            // Cycle 8: shim-side settings facts — the
+            // autorecover clamp, stale localStorage keys, the
+            // effective-value read-backs (spell + locale), and
+            // the dropped-save detector. Rust owns every
+            // decision these feed (notices, drift); the shim
+            // only reports.
+            let kind = msg.args.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            match kind {
+                "autorecoverClamped" => {
+                    let key = msg.args.get("key").and_then(|v| v.as_str()).unwrap_or("");
+                    eprintln!(
+                        "joffice: AUTORECOVER_CLAMP key={key} (journal flush gap forced to 1s)"
+                    );
+                }
+                "staleKey" => {
+                    let key = msg.args.get("key").and_then(|v| v.as_str()).unwrap_or("");
+                    let value = msg.args.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                    eprintln!("joffice: SETTINGS_STALE_KEY key={key} value={value} (deleted)");
+                    // The one-time notice: a stale key that
+                    // said spellcheck was OFF, shown exactly
+                    // once ever (marker in the state dir).
+                    if key.ends_with("settings-spellcheck") && value == "false" {
+                        let marker = settings::state_dir().join("spell-stale-notice-shown");
+                        if !marker.exists() {
+                            let _ = std::fs::write(&marker, b"shown");
+                            show_save_banner(
+                                shell,
+                                "Spelling was off in the editor's old settings; it is now on.",
+                            );
+                            eprintln!("joffice: SETTINGS_NOTICE stale-spellcheck-off (one-time)");
+                        }
+                    }
+                }
+                "spellReport" => {
+                    // Effective values vs configured values:
+                    // disagreement is drift — recorded for the
+                    // dialog, never adopted into the file.
+                    let cfg = settings::current();
+                    let mut drift: Vec<String> = Vec::new();
+                    if let Some(en) = msg.args.get("enabled").and_then(|v| v.as_bool()) {
+                        if en != cfg.spell_enabled {
+                            drift.push(format!(
+                                "spellcheck is {} in the editor, {} in Settings",
+                                if en { "on" } else { "off" },
+                                if cfg.spell_enabled { "on" } else { "off" }
+                            ));
+                        }
+                    }
+                    if let Some(v) = msg.args.get("ignoreUppercase").and_then(|v| v.as_bool()) {
+                        if v != cfg.spell_ignore_uppercase {
+                            drift.push("ignore-uppercase differs from Settings".to_string());
+                        }
+                    }
+                    if let Some(v) = msg.args.get("ignoreNumbers").and_then(|v| v.as_bool()) {
+                        if v != cfg.spell_ignore_numbers {
+                            drift.push("ignore-numbers differs from Settings".to_string());
+                        }
+                    }
+                    if drift.is_empty() {
+                        if shell.settings_drift.borrow().is_some() {
+                            eprintln!("joffice: SETTINGS_DRIFT cleared (spell read-back agrees)");
+                        }
+                        *shell.settings_drift.borrow_mut() = None;
+                    } else {
+                        let text = drift.join("; ");
+                        eprintln!("joffice: SETTINGS_DRIFT {text}");
+                        *shell.settings_drift.borrow_mut() = Some(text);
+                    }
+                }
+                "localeReport" => {
+                    let loaded = msg.args.get("lang").and_then(|v| v.as_str()).unwrap_or("");
+                    let want = settings::editor_lang();
+                    if !loaded.is_empty() && loaded != want {
+                        let text = format!(
+                            "editor loaded language {loaded}, Settings say {want}"
+                        );
+                        eprintln!("joffice: SETTINGS_DRIFT {text}");
+                        *shell.settings_drift.borrow_mut() = Some(text);
+                    } else {
+                        eprintln!("joffice: SETTINGS_LOCALE loaded={loaded} (agrees)");
+                    }
+                }
+                "saveDropped" => {
+                    let state = msg.args.get("state").and_then(|v| v.as_str()).unwrap_or("");
+                    match state {
+                        "detected" => {
+                            eprintln!("joffice: SAVE_DROPPED detected (shim retrying once)");
+                            show_save_banner(
+                                shell,
+                                "A save didn't start — retrying…",
+                            );
+                        }
+                        "recovered" => {
+                            eprintln!("joffice: SAVE_DROPPED recovered on retry");
+                            hide_save_banner(shell);
+                        }
+                        "failed" => {
+                            *shell.save_dropped.borrow_mut() = true;
+                            eprintln!("joffice: SAVE_DROPPED failed after retry (persistent banner)");
+                            show_save_banner(
+                                shell,
+                                "A save was dropped by the editor and the retry failed — your latest changes are NOT on disk. Save again.",
+                            );
+                        }
+                        _ => {}
+                    }
                 }
                 _ => {}
             }
@@ -9776,6 +10270,9 @@ fn handle_bridge(
                 reply_err(reply, "journalAppend: secret".to_string());
                 return;
             }
+            // Cycle 8: journal activity is the autosave
+            // idle clock's edit signal.
+            shell.autosave_rt.borrow_mut().last_edit = Some(Instant::now());
             let sid = msg.args.get("sid").and_then(|v| v.as_str()).unwrap_or("");
             let epoch = msg.args.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let seq = msg.args.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -10046,6 +10543,22 @@ fn handle_bridge(
                 .and_then(|v| v.as_str())
                 .unwrap_or("user")
                 .to_string();
+            // Cycle 8 save state machine: one save inside the
+            // handler at a time. The shim serializes editor-
+            // side, so an overlap here means two producers
+            // raced (e.g. an autosave trigger against a user
+            // save) — ledgered as SAVE_STATE, and the
+            // autosave gate treats InFlight as Deferred, so
+            // its trigger never queues behind a user save.
+            {
+                let mut phase = shell.save_phase.borrow_mut();
+                if let Some(cur) = phase.as_ref() {
+                    eprintln!(
+                        "joffice: SAVE_STATE overlap in-flight={cur} arriving={origin} (shim serialization should prevent this)"
+                    );
+                }
+                *phase = Some(origin.clone());
+            }
             let js_seq = msg.args.get("seq").and_then(|v| v.as_i64()).unwrap_or(-1);
             *shell.save_reply_seq.borrow_mut() = Some(js_seq);
             eprintln!(
@@ -11105,6 +11618,8 @@ fn save_done(shell: &Rc<Shell>, success: bool) {
         *n = n.saturating_sub(1);
     }
     *shell.save_reply_seq.borrow_mut() = None;
+    // Cycle 8: the save state machine returns to Idle.
+    *shell.save_phase.borrow_mut() = None;
     maybe_finish_close(shell, success);
 }
 
@@ -12040,6 +12555,496 @@ fn make_new_document(shell: &Shell, ext: &str) -> Option<(PathBuf, String)> {
 /// the converter's blank templates, and recents from
 /// GtkRecentManager. Every path funnels into open_document,
 /// which loads the editor entry URL for the chosen file.
+/// Apply one settings mutation through the global store
+/// (immediate persist — the dialog has no apply-on-close).
+fn settings_apply(f: impl FnOnce(&mut settings::Settings)) {
+    let mut store = settings::global();
+    if let Err(e) = store.update(f) {
+        eprintln!("joffice: SETTINGS_WRITE_FAILED {e}");
+    }
+}
+
+/// The current autosave gate as one display line.
+fn autosave_gate_text(shell: &Rc<Shell>) -> String {
+    let rt = shell.autosave_rt.borrow();
+    match &rt.gate {
+        AutosaveGate::Off(reason) => format!("Autosave: off ({reason})"),
+        AutosaveGate::Armed => {
+            if rt.wrote {
+                "Autosave: on — has saved this session".to_string()
+            } else {
+                "Autosave: on — armed".to_string()
+            }
+        }
+        AutosaveGate::Paused(reason) => format!("Autosave: PAUSED ({reason})"),
+    }
+}
+
+/// The settings dialog (cycle 8, round 2 §b): native GTK,
+/// reachable from the launcher and every document window.
+/// Every control writes through the settings API the
+/// moment it changes; there is no Apply button because
+/// there is nothing to apply later.
+fn show_settings_dialog(shell: &Rc<Shell>, parent: &ApplicationWindow) {
+    let store_status = settings::global().status.clone();
+    let read_only = store_status.read_only();
+    let cur = settings::current();
+
+    let win = gtk4::Window::builder()
+        .title("jOffice Settings")
+        .transient_for(parent)
+        .modal(false)
+        .default_width(580)
+        .default_height(540)
+        .build();
+    let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
+    outer.set_margin_top(14);
+    outer.set_margin_bottom(14);
+    outer.set_margin_start(16);
+    outer.set_margin_end(16);
+    if let Some(banner) = store_status.banner() {
+        let b = gtk4::Label::new(Some(&banner));
+        b.set_wrap(true);
+        b.set_xalign(0.0);
+        outer.append(&b);
+    }
+    let notebook = gtk4::Notebook::new();
+    notebook.set_hexpand(true);
+    notebook.set_vexpand(true);
+    outer.append(&notebook);
+    win.set_child(Some(&outer));
+
+    let page = |title: &str| -> gtk4::Box {
+        let bx = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
+        bx.set_margin_top(12);
+        bx.set_margin_bottom(12);
+        bx.set_margin_start(12);
+        bx.set_margin_end(12);
+        notebook.append_page(&bx, Some(&gtk4::Label::new(Some(title))));
+        bx
+    };
+    let note = |bx: &gtk4::Box, text: &str| {
+        let l = gtk4::Label::new(Some(text));
+        l.set_wrap(true);
+        l.set_xalign(0.0);
+        bx.append(&l);
+    };
+
+    // ---- Identity -------------------------------------------
+    let id_page = page("Identity");
+    note(
+        &id_page,
+        "The name and ID stamped into comments and tracked changes you author.",
+    );
+    let name_entry = gtk4::Entry::new();
+    name_entry.set_text(&cur.username);
+    name_entry.set_placeholder_text(Some("Your name"));
+    id_page.append(&name_entry);
+    let attrib_label = gtk4::Label::new(None);
+    attrib_label.set_wrap(true);
+    attrib_label.set_xalign(0.0);
+    id_page.append(&attrib_label);
+    let refresh_attrib = {
+        let attrib_label = attrib_label.clone();
+        Rc::new(move |stored: &str| {
+            if stored.trim().is_empty() {
+                attrib_label.set_text(&format!(
+                    "Empty — documents will name “{}” (generated from your system account). The editor's built-in default name is never used.",
+                    crate::settings::effective_username()
+                ));
+            } else {
+                attrib_label.set_text(&format!("Documents will name “{stored}”."));
+            }
+        })
+    };
+    refresh_attrib(&cur.username);
+    {
+        // Write on a short debounce: every keystroke is a
+        // settings write (the file is small and the write is
+        // atomic), but 400 ms of quiet keeps typing smooth.
+        let pending: Rc<RefCell<Option<gtk4::glib::SourceId>>> = Rc::new(RefCell::new(None));
+        let refresh_c = refresh_attrib.clone();
+        name_entry.connect_changed(move |entry| {
+            let text = entry.text().to_string();
+            if let Some(id) = pending.borrow_mut().take() {
+                id.remove();
+            }
+            let pending_c = pending.clone();
+            let refresh_c2 = refresh_c.clone();
+            let id = gtk4::glib::timeout_add_local_once(
+                std::time::Duration::from_millis(400),
+                move || {
+                    *pending_c.borrow_mut() = None;
+                    let t = text.clone();
+                    settings_apply(move |s| s.username = t);
+                    refresh_c2(&text);
+                },
+            );
+            *pending.borrow_mut() = Some(id);
+        });
+    }
+    let uuid_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    let uuid_caption = gtk4::Label::new(Some("Your ID (fixed):"));
+    uuid_row.append(&uuid_caption);
+    let uuid_entry = gtk4::Entry::new();
+    uuid_entry.set_text(&cur.uuid);
+    uuid_entry.set_editable(false);
+    uuid_entry.set_hexpand(true);
+    uuid_row.append(&uuid_entry);
+    id_page.append(&uuid_row);
+
+    // ---- Spellcheck -----------------------------------------
+    let sp_page = page("Spellcheck");
+    let enabled_chk = gtk4::CheckButton::with_label("Check spelling as you type");
+    enabled_chk.set_active(cur.spell_enabled);
+    sp_page.append(&enabled_chk);
+    let upper_chk = gtk4::CheckButton::with_label("Ignore words in UPPERCASE");
+    upper_chk.set_active(cur.spell_ignore_uppercase);
+    sp_page.append(&upper_chk);
+    let numbers_chk = gtk4::CheckButton::with_label("Ignore words with numbers");
+    numbers_chk.set_active(cur.spell_ignore_numbers);
+    sp_page.append(&numbers_chk);
+    {
+        let shell_c = shell.clone();
+        enabled_chk.connect_toggled(move |chk| {
+            let on = chk.is_active();
+            settings_apply(move |s| s.spell_enabled = on);
+            // "Off" goes through the editor's own
+            // Spelling.Use path (the shim's asc_setSpellCheck
+            // call), never through the spell service.
+            eval_in_view(
+                &shell_c,
+                &format!("window.__joSetSpellEnabled && window.__joSetSpellEnabled({on})"),
+            );
+        });
+    }
+    {
+        let push: Rc<dyn Fn(&Rc<Shell>)> = Rc::new(move |shell_c: &Rc<Shell>| {
+            let s = settings::current();
+            let json = serde_json::json!({
+                "enabled": s.spell_enabled,
+                "ignoreUppercase": s.spell_ignore_uppercase,
+                "ignoreNumbers": s.spell_ignore_numbers,
+            });
+            eval_in_view(
+                shell_c,
+                &format!(
+                    "window.__joApplySpellSettings && window.__joApplySpellSettings({})",
+                    serde_json::to_string(&json.to_string()).unwrap_or_default()
+                ),
+            );
+        });
+        let shell_u = shell.clone();
+        let push_u = push.clone();
+        upper_chk.connect_toggled(move |chk| {
+            let v = chk.is_active();
+            settings_apply(move |s| s.spell_ignore_uppercase = v);
+            push_u(&shell_u);
+        });
+        let shell_n = shell.clone();
+        numbers_chk.connect_toggled(move |chk| {
+            let v = chk.is_active();
+            settings_apply(move |s| s.spell_ignore_numbers = v);
+            push(&shell_n);
+        });
+    }
+    let (_, liveness_text) = spell_display(shell);
+    let live_label = gtk4::Label::new(Some(&format!("Status: {liveness_text}")));
+    live_label.set_wrap(true);
+    live_label.set_xalign(0.0);
+    sp_page.append(&live_label);
+    let drift_label = gtk4::Label::new(None);
+    drift_label.set_wrap(true);
+    drift_label.set_xalign(0.0);
+    match shell.settings_drift.borrow().as_ref() {
+        Some(d) => drift_label.set_text(&format!("Drift: {d}")),
+        None => drift_label.set_text("The editor's loaded values agree with these settings."),
+    }
+    sp_page.append(&drift_label);
+    let pd_title = gtk4::Label::new(None);
+    pd_title.set_markup("<b>Personal dictionary</b>");
+    pd_title.set_halign(gtk4::Align::Start);
+    pd_title.set_margin_top(8);
+    sp_page.append(&pd_title);
+    let pd_scroll = gtk4::ScrolledWindow::new();
+    pd_scroll.set_min_content_height(140);
+    pd_scroll.set_vexpand(true);
+    let pd_list = gtk4::ListBox::new();
+    pd_list.set_selection_mode(gtk4::SelectionMode::None);
+    pd_scroll.set_child(Some(&pd_list));
+    sp_page.append(&pd_scroll);
+    let pd_status = gtk4::Label::new(Some("Loading…"));
+    pd_status.set_xalign(0.0);
+    sp_page.append(&pd_status);
+    fill_personal_list(&pd_list, &pd_status, None);
+    let pd_buttons = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    pd_buttons.set_halign(gtk4::Align::End);
+    let pd_clear = gtk4::Button::with_label("Remove all");
+    {
+        let list_c = pd_list.clone();
+        let status_c = pd_status.clone();
+        pd_clear.connect_clicked(move |_| {
+            fill_personal_list(&list_c, &status_c, Some(PersonalAction::ClearAll));
+        });
+    }
+    pd_buttons.append(&pd_clear);
+    sp_page.append(&pd_buttons);
+    note(
+        &sp_page,
+        "Words added from a password-protected document are kept in memory only and dropped when it closes.",
+    );
+
+    // ---- Saving & recovery ----------------------------------
+    let sv_page = page("Saving & recovery");
+    let as_chk = gtk4::CheckButton::with_label("Autosave documents");
+    as_chk.set_active(cur.autosave_enabled);
+    sv_page.append(&as_chk);
+    {
+        as_chk.connect_toggled(move |chk| {
+            let on = chk.is_active();
+            settings_apply(move |s| s.autosave_enabled = on);
+        });
+    }
+    note(
+        &sv_page,
+        "Autosave writes the open document after 30 seconds idle — only when Ctrl+S would save without asking (never for PDFs, protected, legacy, or not-yet-saved documents). A revert copy of the version you opened is kept in the recovery session, and closing after an autosave offers it back.",
+    );
+    let gate_label = gtk4::Label::new(Some(&autosave_gate_text(shell)));
+    gate_label.set_wrap(true);
+    gate_label.set_xalign(0.0);
+    sv_page.append(&gate_label);
+    let ret_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    let ret_caption = gtk4::Label::new(Some("Keep recovery sessions for (days):"));
+    ret_row.append(&ret_caption);
+    let adj = gtk4::Adjustment::new(cur.retention_days as f64, 1.0, 3650.0, 1.0, 30.0, 0.0);
+    let ret_spin = gtk4::SpinButton::new(Some(&adj), 1.0, 0);
+    ret_row.append(&ret_spin);
+    sv_page.append(&ret_row);
+    {
+        ret_spin.connect_value_changed(move |spin| {
+            let v = spin.value() as i64;
+            settings_apply(move |s| s.retention_days = v);
+        });
+    }
+    note(
+        &sv_page,
+        "Sessions that still hold unsaved work are listed in the launcher after this window and deleted only when you choose — never automatically. Cleanly saved sessions are cleaned up at launch.",
+    );
+
+    // ---- Language -------------------------------------------
+    let lang_page = page("Language");
+    note(
+        &lang_page,
+        "Language for new documents and the editor interface. Only languages with an installed dictionary are offered — a language without one would silently never spellcheck.",
+    );
+    let offered = settings::offered_languages();
+    let current_lang = settings::editor_lang();
+    let lang_list = gtk4::StringList::new(&offered.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+    let lang_drop = gtk4::DropDown::new(Some(lang_list), None::<gtk4::Expression>);
+    if let Some(pos) = offered.iter().position(|t| t == &current_lang) {
+        lang_drop.set_selected(pos as u32);
+    }
+    lang_page.append(&lang_drop);
+    {
+        let offered_c = offered.clone();
+        lang_drop.connect_selected_notify(move |dd| {
+            let idx = dd.selected() as usize;
+            if let Some(tag) = offered_c.get(idx) {
+                let t = tag.clone();
+                settings_apply(move |s| s.ui_locale = t);
+            }
+        });
+    }
+    note(&lang_page, "Applies at the next document open.");
+    let fixed_title = gtk4::Label::new(None);
+    fixed_title.set_markup("<b>Fixed in this build</b>");
+    fixed_title.set_halign(gtk4::Align::Start);
+    fixed_title.set_margin_top(8);
+    lang_page.append(&fixed_title);
+    note(
+        &lang_page,
+        if pdf_annotate_enabled() {
+            "PDF annotation: On (experimental flag JOFFICE_PDF_ANNOTATE=experimental is set)"
+        } else {
+            "PDF annotation: Off — enable with JOFFICE_PDF_ANNOTATE=experimental"
+        },
+    );
+
+    // ---- Diagnostics ----------------------------------------
+    let dg_page = page("Diagnostics");
+    let font_title = gtk4::Label::new(None);
+    font_title.set_markup("<b>Font substitutions (this window)</b>");
+    font_title.set_halign(gtk4::Align::Start);
+    dg_page.append(&font_title);
+    {
+        let subs = shell.substitutions.borrow();
+        if subs.is_empty() {
+            note(&dg_page, "No fonts were substituted at open time.");
+        } else {
+            for (real, fb) in subs.iter() {
+                note(&dg_page, &format!("{real} — shown as {fb}"));
+            }
+        }
+    }
+    note(
+        &dg_page,
+        "This report lists the fonts substituted when the document opened. It cannot say whether the layout changed.",
+    );
+    // NoDict informational notices: quietable per LCID
+    // (notice policy — informational only; safety notices
+    // have no such control anywhere).
+    {
+        let state_dir = settings::state_dir();
+        let mut nstate = notices::NoticeState::load(&state_dir);
+        let nodict: Vec<u32> = shell.spell.borrow().nodict.iter().copied().collect();
+        for lcid in nodict {
+            if nstate.is_quieted("nodict", Some(lcid)) {
+                continue;
+            }
+            let tag = settings::lcid_tag(lcid)
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| format!("LCID {lcid}"));
+            let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+            let l = gtk4::Label::new(Some(&format!("No dictionary installed for {tag}")));
+            l.set_hexpand(true);
+            l.set_xalign(0.0);
+            row.append(&l);
+            let quiet_btn = gtk4::Button::with_label("Don't show again");
+            {
+                let row_c = row.clone();
+                quiet_btn.connect_clicked(move |_| {
+                    let sd = settings::state_dir();
+                    let mut ns = notices::NoticeState::load(&sd);
+                    if ns.quiet("nodict", Some(lcid)) {
+                        ns.save(&sd);
+                        eprintln!("joffice: NOTICE_QUIET kind=nodict lcid={lcid}");
+                    }
+                    row_c.set_visible(false);
+                });
+            }
+            row.append(&quiet_btn);
+            dg_page.append(&row);
+        }
+        let _ = &mut nstate;
+    }
+    let file_title = gtk4::Label::new(None);
+    file_title.set_markup("<b>Settings file</b>");
+    file_title.set_halign(gtk4::Align::Start);
+    file_title.set_margin_top(8);
+    dg_page.append(&file_title);
+    {
+        let store = settings::global();
+        note(
+            &dg_page,
+            &format!("{} — status: {:?}", store.path().display(), store.status),
+        );
+        if matches!(store.status, settings::LoadStatus::Torn { .. }) {
+            let restore_btn = gtk4::Button::with_label("Restore settings backup (.bak)");
+            restore_btn.set_halign(gtk4::Align::Start);
+            restore_btn.connect_clicked(move |_| {
+                let mut store = settings::global();
+                match store.restore_bak() {
+                    Ok(()) => eprintln!("joffice: SETTINGS_RESTORED from .bak (dialog)"),
+                    Err(e) => eprintln!("joffice: SETTINGS_RESTORE_FAILED {e}"),
+                }
+            });
+            dg_page.append(&restore_btn);
+        }
+    }
+    {
+        let phase = shell.save_phase.borrow();
+        let phase_text = match phase.as_ref() {
+            Some(o) => format!("Save state: {o} save in progress"),
+            None => "Save state: idle".to_string(),
+        };
+        note(&dg_page, &phase_text);
+        if *shell.save_dropped.borrow() {
+            note(
+                &dg_page,
+                "A save was dropped by the editor earlier in this window and the retry failed.",
+            );
+        }
+    }
+
+    if read_only {
+        notebook.set_sensitive(false);
+    }
+    win.present();
+}
+
+/// A personal-dictionary mutation for the dialog's list:
+/// the spell service owns the store, so list/remove/clear
+/// all ride its queue on a worker thread; the GTK list is
+/// refilled when the answer lands.
+enum PersonalAction {
+    Remove(String),
+    ClearAll,
+}
+
+fn fill_personal_list(
+    list: &gtk4::ListBox,
+    status: &gtk4::Label,
+    action: Option<PersonalAction>,
+) {
+    while let Some(row) = list.first_child() {
+        list.remove(&row);
+    }
+    status.set_text("Working…");
+    let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<String>, String>>();
+    std::thread::spawn(move || {
+        let result = (|| {
+            match &action {
+                Some(PersonalAction::Remove(w)) => spell::personal_remove(w)?,
+                Some(PersonalAction::ClearAll) => spell::personal_clear_all()?,
+                None => {}
+            }
+            Ok(spell::personal_list())
+        })();
+        let _ = tx.send(result);
+    });
+    let list_c = list.clone();
+    let status_c = status.clone();
+    gtk4::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+        match rx.try_recv() {
+            Ok(Ok(words)) => {
+                for w in &words {
+                    let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+                    let l = gtk4::Label::new(Some(w));
+                    l.set_hexpand(true);
+                    l.set_xalign(0.0);
+                    row.append(&l);
+                    let rm = gtk4::Button::with_label("Remove");
+                    {
+                        let list_r = list_c.clone();
+                        let status_r = status_c.clone();
+                        let w_c = w.clone();
+                        rm.connect_clicked(move |_| {
+                            fill_personal_list(
+                                &list_r,
+                                &status_r,
+                                Some(PersonalAction::Remove(w_c.clone())),
+                            );
+                        });
+                    }
+                    row.append(&rm);
+                    list_c.append(&row);
+                }
+                status_c.set_text(&format!("{} word(s)", words.len()));
+                gtk4::glib::ControlFlow::Break
+            }
+            Ok(Err(e)) => {
+                status_c.set_text(&format!("Personal dictionary unavailable: {e}"));
+                gtk4::glib::ControlFlow::Break
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => gtk4::glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                status_c.set_text("Personal dictionary unavailable (service gone)");
+                gtk4::glib::ControlFlow::Break
+            }
+        }
+    });
+}
+
 fn build_launcher(
     shell: &Rc<Shell>,
     window: &ApplicationWindow,
@@ -12129,6 +13134,138 @@ fn build_launcher(
             }
             row.append(&later_btn);
             bx.append(&row);
+        }
+    }
+
+    // Cycle 8: settings entry point (the dialog is also
+    // reachable from every document window's chrome).
+    {
+        let settings_btn = gtk4::Button::with_label("Settings…");
+        settings_btn.set_halign(gtk4::Align::Start);
+        let shell_s = shell.clone();
+        let window_s = window.clone();
+        settings_btn.connect_clicked(move |_| {
+            show_settings_dialog(&shell_s, &window_s);
+        });
+        bx.append(&settings_btn);
+    }
+
+    // Cycle 8: a torn settings file (crash mid-write, no
+    // valid end line + hash) runs on defaults, read-only,
+    // and offers the .bak restore here and in the dialog.
+    if matches!(settings::global().status, settings::LoadStatus::Torn { .. }) {
+        let warn = gtk4::Label::new(Some(
+            "Settings file was damaged (interrupted write) — running on defaults. Restore the backup copy?",
+        ));
+        warn.set_wrap(true);
+        warn.set_xalign(0.0);
+        bx.append(&warn);
+        let restore_btn = gtk4::Button::with_label("Restore settings backup");
+        restore_btn.set_halign(gtk4::Align::Start);
+        restore_btn.connect_clicked(move |_| {
+            let mut store = settings::global();
+            match store.restore_bak() {
+                Ok(()) => eprintln!("joffice: SETTINGS_RESTORED from .bak (launcher)"),
+                Err(e) => eprintln!("joffice: SETTINGS_RESTORE_FAILED {e}"),
+            }
+        });
+        bx.append(&restore_btn);
+    }
+
+    // Cycle 8 retention listing: sessions past their
+    // retention window that still hold unsaved work. They
+    // are NEVER deleted automatically — Keep grants another
+    // retention period; Delete now is the user's explicit
+    // per-session action (ledgered SESSION_DELETE).
+    {
+        let entries: Vec<(String, PathBuf, Option<String>, retention::SessionClass, u64)> =
+            expiring_entries()
+                .iter()
+                .map(|e| {
+                    (
+                        e.sid.clone(),
+                        e.dir.clone(),
+                        e.bound_path.clone(),
+                        e.class,
+                        e.first_shown_unix,
+                    )
+                })
+                .collect();
+        if !entries.is_empty() {
+            let exp_title = gtk4::Label::new(None);
+            exp_title.set_markup("<b>Old recovery sessions</b>");
+            exp_title.set_halign(gtk4::Align::Start);
+            exp_title.set_margin_top(10);
+            bx.append(&exp_title);
+            let intro = gtk4::Label::new(Some(
+                "These sessions still hold changes that are not in any file. They stay until you delete them.",
+            ));
+            intro.set_wrap(true);
+            intro.set_xalign(0.0);
+            bx.append(&intro);
+            for (sid, dir, bound, class, first_shown) in entries {
+                let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+                let when = gtk4::glib::DateTime::from_unix_local(first_shown as i64)
+                    .and_then(|d| d.format("%Y-%m-%d"))
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|_| "unknown".to_string());
+                let name = bound
+                    .as_deref()
+                    .and_then(|p| Path::new(p).file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .unwrap_or_else(|| sid.clone());
+                let kind = match class {
+                    retention::SessionClass::DontSave => "closed with Don't Save",
+                    retention::SessionClass::Crashed => "left by a crash",
+                    retention::SessionClass::SavedClean => "saved",
+                };
+                let label = gtk4::Label::new(Some(&format!(
+                    "{name} — {kind}, listed since {when}"
+                )));
+                label.set_wrap(true);
+                label.set_xalign(0.0);
+                label.set_hexpand(true);
+                row.append(&label);
+                let keep_btn = gtk4::Button::with_label("Keep");
+                {
+                    let row_c = row.clone();
+                    let sid_c = sid.clone();
+                    keep_btn.connect_clicked(move |_| {
+                        let state_dir = settings::state_dir();
+                        let mut log = retention::ExpiryLog::load(&state_dir);
+                        log.keeps.insert(sid_c.clone(), unix_now());
+                        log.save(&state_dir);
+                        eprintln!("joffice: SESSION_KEEP sid={sid_c} (retention listing)");
+                        row_c.set_visible(false);
+                    });
+                }
+                row.append(&keep_btn);
+                let del_btn = gtk4::Button::with_label("Delete now");
+                {
+                    let row_c = row.clone();
+                    let dir_c = dir.clone();
+                    let sid_c = sid.clone();
+                    del_btn.connect_clicked(move |_| {
+                        match std::fs::remove_dir_all(&dir_c) {
+                            Ok(()) => {
+                                eprintln!(
+                                    "joffice: SESSION_DELETE sid={sid_c} reason=user (retention listing)"
+                                );
+                                let state_dir = settings::state_dir();
+                                let mut log = retention::ExpiryLog::load(&state_dir);
+                                log.seen.remove(&sid_c);
+                                log.keeps.remove(&sid_c);
+                                log.save(&state_dir);
+                            }
+                            Err(e) => {
+                                eprintln!("joffice: SESSION_DELETE failed sid={sid_c}: {e}")
+                            }
+                        }
+                        row_c.set_visible(false);
+                    });
+                }
+                row.append(&del_btn);
+                bx.append(&row);
+            }
         }
     }
 
@@ -12262,6 +13399,321 @@ fn build_launcher(
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
+
+/// Seconds since the Unix epoch (0 on clock error).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// One expiring session awaiting the user's decision in the
+/// launcher (cycle 8 retention listing).
+struct ExpiringEntry {
+    sid: String,
+    dir: PathBuf,
+    bound_path: Option<String>,
+    class: retention::SessionClass,
+    first_shown_unix: u64,
+}
+
+/// The launch retention run's listing output, consumed by
+/// the launcher build.
+static EXPIRING: std::sync::OnceLock<std::sync::Mutex<Vec<ExpiringEntry>>> =
+    std::sync::OnceLock::new();
+
+fn expiring_entries() -> std::sync::MutexGuard<'static, Vec<ExpiringEntry>> {
+    EXPIRING
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+/// Cycle 8 launch retention (round 2 §c): scan the session
+/// store, run the pure planner, execute it. Clean deletions
+/// happen here; unique-content sessions are only marked /
+/// listed into EXPIRING for the launcher. Runs once per
+/// process launch, before the app starts; no timers.
+fn run_launch_retention() {
+    let root = sessions_root();
+    let state_dir = settings::state_dir();
+    let _ = std::fs::create_dir_all(&state_dir);
+    let sessions = retention::scan_sessions(&root);
+    if sessions.is_empty() {
+        return;
+    }
+    let days = settings::current().retention_days as u64;
+    let mut log = retention::ExpiryLog::load(&state_dir);
+    let now = unix_now();
+    let actions = retention::plan(
+        &sessions,
+        now,
+        days,
+        &log.seen,
+        &log.keeps,
+        &std::collections::HashSet::new(),
+    );
+    let by_sid: std::collections::HashMap<&str, &retention::SessionInfo> =
+        sessions.iter().map(|s| (s.sid.as_str(), s)).collect();
+    let mut listing: Vec<ExpiringEntry> = Vec::new();
+    for action in &actions {
+        match action {
+            retention::Action::Delete { sid, reason } => {
+                let dir = root.join(sid);
+                match std::fs::remove_dir_all(&dir) {
+                    Ok(()) => eprintln!(
+                        "joffice: SESSION_PURGE sid={sid} reason={reason:?} (launch retention)"
+                    ),
+                    Err(e) => eprintln!(
+                        "joffice: SESSION_PURGE_FAILED sid={sid} reason={reason:?}: {e}"
+                    ),
+                }
+                log.seen.remove(sid);
+                log.keeps.remove(sid);
+            }
+            retention::Action::MarkExpiring { sid } => {
+                log.seen.insert(sid.clone(), now);
+                if let Some(info) = by_sid.get(sid.as_str()) {
+                    listing.push(ExpiringEntry {
+                        sid: sid.clone(),
+                        dir: root.join(sid),
+                        bound_path: info.bound_path.clone(),
+                        class: info.class,
+                        first_shown_unix: now,
+                    });
+                }
+                eprintln!("joffice: SESSION_EXPIRING sid={sid} (first shown)");
+            }
+            retention::Action::ListExpiring {
+                sid,
+                first_shown_unix,
+            } => {
+                if let Some(info) = by_sid.get(sid.as_str()) {
+                    listing.push(ExpiringEntry {
+                        sid: sid.clone(),
+                        dir: root.join(sid),
+                        bound_path: info.bound_path.clone(),
+                        class: info.class,
+                        first_shown_unix: *first_shown_unix,
+                    });
+                }
+            }
+        }
+    }
+    log.save(&state_dir);
+    if !listing.is_empty() {
+        eprintln!(
+            "joffice: SESSIONS_EXPIRING count={} (listed in launcher)",
+            listing.len()
+        );
+        *expiring_entries() = listing;
+    }
+}
+
+/// Make the revert copy of the bound file inside the
+/// session dir: FICLONE reflink first (instant, no extra
+/// space), else a plain copy for files up to 256 MiB.
+/// NEVER a hardlink — an in-place writer downstream would
+/// corrupt both names at once.
+fn make_revert_copy(src: &Path, dst: &Path) -> Result<(), String> {
+    use std::os::unix::io::AsRawFd;
+    let s = std::fs::File::open(src).map_err(|e| format!("revert source open: {e}"))?;
+    let size = s.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+    if let Ok(d) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)
+    {
+        const FICLONE: libc::c_ulong = 0x4004_9409;
+        let rc = unsafe { libc::ioctl(d.as_raw_fd(), FICLONE, s.as_raw_fd()) };
+        if rc == 0 {
+            eprintln!("joffice: AUTOSAVE_REVERT_COPY reflink {}", dst.display());
+            return Ok(());
+        }
+        drop(d);
+        let _ = std::fs::remove_file(dst);
+    }
+    if size > 256 * 1024 * 1024 {
+        return Err(format!(
+            "bound file is {size} bytes — over the 256 MiB revert-copy limit and reflink failed"
+        ));
+    }
+    std::fs::copy(src, dst).map_err(|e| format!("revert copy: {e}"))?;
+    eprintln!("joffice: AUTOSAVE_REVERT_COPY copied {}", dst.display());
+    Ok(())
+}
+
+/// Cycle 8 autosave tick (~1 s, from the spell pump's slow
+/// branch): evaluate the round-2 gate exactly, and when it
+/// says Armed + idle + dirty + no save in flight, trigger
+/// ONE autosave through the shim (origin 'autosave'). The
+/// wall sentence governs: this may only make a write Ctrl+S
+/// would make without asking, against the baseline
+/// fingerprint the user has seen.
+fn autosave_tick(shell: &Rc<Shell>) {
+    let cfg_on = settings::current().autosave_enabled;
+    // Gather facts without holding borrows across evals.
+    let (policy, is_protected, doc_path) = {
+        let doc = shell.doc.borrow();
+        match doc.as_ref() {
+            Some(d) => (Some(d.policy), d.protected.is_some(), d.path.clone()),
+            None => return, // launcher / no document
+        }
+    };
+    let (bound_path, sess_dir, dirty, recovered, created_unix) = {
+        let sess = shell.session.borrow();
+        match sess.as_ref() {
+            Some(st) => (
+                st.bound_path.clone(),
+                Some(st.dir.clone()),
+                st.unsaved() > 0 || shell_is_dirty(shell),
+                st.recovered,
+                st.created_unix,
+            ),
+            None => (None, None, false, false, 0),
+        }
+    };
+    // The gate. First failing Off reason wins; Paused is
+    // sticky (only a successful save clears it, in
+    // note_save_completed).
+    let off_reason: Option<String> = if !cfg_on {
+        Some("off in Settings".to_string())
+    } else if is_protected || policy == Some(Policy::Protected) {
+        Some("password-protected document".to_string())
+    } else if matches!(policy, Some(Policy::ViewOnly) | Some(Policy::PdfAnnotate)) {
+        Some("PDF documents never autosave".to_string())
+    } else if policy == Some(Policy::SaveAsOnly) {
+        Some("legacy format — Save As only".to_string())
+    } else if policy == Some(Policy::AskOnce) {
+        let ext = doc_path
+            .as_ref()
+            .and_then(|p| p.extension().map(|e| e.to_string_lossy().to_lowercase()))
+            .unwrap_or_default();
+        let has_pref = shell
+            .config
+            .borrow()
+            .format_prefs
+            .contains_key(&ext);
+        if has_pref {
+            None
+        } else {
+            Some("saving this format asks first".to_string())
+        }
+    } else if bound_path.is_none() {
+        Some("not saved to a file yet".to_string())
+    } else if recovered && !shell.autosave_rt.borrow().binding_confirmed {
+        Some("recovered copy — save once manually to confirm".to_string())
+    } else {
+        None
+    };
+    {
+        let mut rt = shell.autosave_rt.borrow_mut();
+        if rt.opened_unix == 0 && created_unix > 0 {
+            rt.opened_unix = created_unix;
+        }
+        match (&rt.gate, &off_reason) {
+            (AutosaveGate::Paused(_), _) => {
+                // Sticky: even an Off reason does not mask a
+                // pause the user has not resolved.
+                return;
+            }
+            (_, Some(reason)) => {
+                if rt.gate != AutosaveGate::Off(reason.clone()) {
+                    eprintln!("joffice: AUTOSAVE_OFF reason={reason}");
+                    rt.gate = AutosaveGate::Off(reason.clone());
+                }
+                return;
+            }
+            (_, None) => {
+                if !matches!(rt.gate, AutosaveGate::Armed) {
+                    eprintln!("joffice: AUTOSAVE_ARMED");
+                    rt.gate = AutosaveGate::Armed;
+                }
+            }
+        }
+    }
+    // Armed. Deferred conditions: a save in flight, not
+    // dirty, not idle for 30 s.
+    if shell.save_phase.borrow().is_some() {
+        return;
+    }
+    if !dirty {
+        return;
+    }
+    {
+        let rt = shell.autosave_rt.borrow();
+        if let Some(last) = rt.last_edit {
+            if last.elapsed() < std::time::Duration::from_secs(30) {
+                return;
+            }
+        }
+    }
+    let (Some(bound), Some(dir)) = (bound_path, sess_dir) else {
+        return;
+    };
+    // The revert copy comes FIRST (before the session's
+    // first autosave write). No copy possible → autosave is
+    // Off for this window, with the banner (a safety
+    // notice: autosave-off).
+    if !shell.autosave_rt.borrow().revert_ready {
+        let dst = dir.join("revert.bin");
+        match make_revert_copy(&bound, &dst) {
+            Ok(()) => {
+                shell.autosave_rt.borrow_mut().revert_ready = true;
+            }
+            Err(e) => {
+                eprintln!("joffice: AUTOSAVE_OFF reason=revert-copy: {e}");
+                shell.autosave_rt.borrow_mut().gate =
+                    AutosaveGate::Off(format!("no revert copy possible: {e}"));
+                show_save_banner(
+                    shell,
+                    "Autosave is off for this window — no revert copy could be made. Your work is still in the recovery journal.",
+                );
+                return;
+            }
+        }
+    }
+    // Arm the baseline fingerprint (it then moves only on
+    // our own bound writes).
+    if shell.autosave_expect_fp.borrow().is_none() {
+        *shell.autosave_expect_fp.borrow_mut() = fingerprint(&bound);
+    }
+    eprintln!("joffice: AUTOSAVE_TRIGGER dest={}", bound.display());
+    eval_in_view(shell, "window.__joAutosaveSave && window.__joAutosaveSave()");
+}
+
+/// The `--settings-selftest` battery runner (cycle 8):
+/// settings C1–C9 + retention RET2–RET6 against real files
+/// under a scratch tree. Returns the failure count.
+fn run_settings_selftest_cli(scratch: &Path) -> i32 {
+    std::env::set_var("XDG_CONFIG_HOME", scratch.join("config"));
+    std::env::set_var("XDG_STATE_HOME", scratch.join("state"));
+    let mut failures = 0i32;
+    let cases = scratch.join("cases");
+    let _ = std::fs::create_dir_all(&cases);
+    for (name, ok, detail) in settings::selftest(&cases) {
+        eprintln!(
+            "SELFTEST settings {name}: {} ({detail})",
+            if ok { "PASS" } else { "FAIL" }
+        );
+        if !ok {
+            failures += 1;
+        }
+    }
+    let sess = scratch.join("sessions");
+    let _ = std::fs::create_dir_all(&sess);
+    for (name, ok, detail) in retention::selftest(&sess) {
+        eprintln!(
+            "SELFTEST retention {name}: {} ({detail})",
+            if ok { "PASS" } else { "FAIL" }
+        );
+        if !ok {
+            failures += 1;
+        }
+    }
+    failures
+}
 
 fn main() {
     eprintln!("joffice: MAIN_THREAD id={:?}", std::thread::current().id());
@@ -12405,6 +13857,15 @@ fn main() {
     // the add leg never touches a real personal dictionary.
     if args.len() >= 3 && args[1] == "--spell-selftest" {
         std::process::exit(spell::run_selftest_cli(&PathBuf::from(&args[2])));
+    }
+    // Hidden settings self-test (marathon 2 cycle 8):
+    // `joffice-shell --settings-selftest <scratch-dir>` runs
+    // the settings C-battery and the retention RET battery
+    // against real files under the scratch dir (XDG dirs are
+    // redirected there first), then exits with the failure
+    // count. No GTK is started.
+    if args.len() >= 3 && args[1] == "--settings-selftest" {
+        std::process::exit(run_settings_selftest_cli(&PathBuf::from(&args[2])));
     }
     let mut pending_file: Option<PathBuf> = None;
     let mut i = 1;
@@ -12566,6 +14027,20 @@ fn main() {
             .filter(|p| p.is_dir());
         spell::init(dict_dir);
     }
+
+    // Cycle 8: the settings store loads before the app (the
+    // loader never fails; a torn or incompatible file yields
+    // defaults + read-only + a status the dialog renders).
+    // Identity in settings.toml now owns user_id/user_name;
+    // the legacy config.toml values were imported on load.
+    settings::global_init();
+
+    // Cycle 8: the launch-time retention run (round 2 §c —
+    // purge only at launch, no timers). Clean sessions
+    // (provably no unique content) are deleted; unique-
+    // content sessions past retention are only MARKED and
+    // listed in the launcher (see build_launcher).
+    run_launch_retention();
 
     let app = Application::builder()
         .application_id("io.nowlin.jOffice")
@@ -12744,11 +14219,28 @@ fn main() {
         // (round 2 §2 — stock advertises all ~49 whether or
         // not a dictionary exists, a silent failure built
         // into stock).
+        // Cycle 8: the settings snapshot the shim consumes
+        // at editor load — the spellcheck lock values (mode
+        // + ignore rules), the single-producer language, the
+        // identity, and the PDF-annotate flag state (display
+        // only; the env var stays the only switch).
+        let st8 = settings::current();
+        let jo_settings = serde_json::json!({
+            "spellEnabled": st8.spell_enabled,
+            "ignoreUppercase": st8.spell_ignore_uppercase,
+            "ignoreNumbers": st8.spell_ignore_numbers,
+            "lang": settings::editor_lang(),
+            "userId": st8.uuid,
+            "userName": settings::effective_username(),
+            "pdfAnnotate": pdf_annotate_enabled(),
+            "autosaveEnabled": st8.autosave_enabled,
+        });
         let config_js = format!(
-            "window.__joFlushMode = {}; window.__joSecret = {}; window.__joSpellLcids = {};",
+            "window.__joFlushMode = {}; window.__joSecret = {}; window.__joSpellLcids = {}; window.__joSettings = {};",
             serde_json::to_string(&shell.flush_mode).unwrap_or_else(|_| "\"journal\"".into()),
             serde_json::to_string(&shell.secret).unwrap_or_else(|_| "\"\"".into()),
             serde_json::to_string(&spell::installed_lcids()).unwrap_or_else(|_| "[]".into()),
+            serde_json::to_string(&jo_settings).unwrap_or_else(|_| "{}".into()),
         );
         let config_script = UserScript::new(
             &config_js,
@@ -13190,6 +14682,17 @@ fn main() {
             let shell_pw = shell.clone();
             pw_btn.connect_clicked(move |_| {
                 change_password_flow(&shell_pw);
+            });
+        }
+        // Settings… (cycle 8): the settings dialog, reachable
+        // from every document window as well as the launcher.
+        let settings_btn = gtk4::Button::with_label("Settings…");
+        action_row.append(&settings_btn);
+        {
+            let shell_st = shell.clone();
+            let window_st = window.clone();
+            settings_btn.connect_clicked(move |_| {
+                show_settings_dialog(&shell_st, &window_st);
             });
         }
         action_row.set_visible(false);

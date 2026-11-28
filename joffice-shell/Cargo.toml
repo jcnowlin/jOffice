@@ -13,6 +13,17 @@ base64 = "0.22"
 # Protected-documents cycle: setrlimit(RLIMIT_CORE) at startup.
 # Already in Cargo.lock as a transitive dependency (0.2.190).
 libc = "0.2"
+# Settings cycle (cycle 8): the settings store is TOML, parsed
+# and edited with toml_edit so unknown keys survive a round
+# trip verbatim (KAO round 2 §d). Already in Cargo.lock as a
+# transitive dependency (0.25.17); promoted to direct here.
+toml_edit = "0.25"
 
 [profile.release]
 lto = true
+
+[dev-dependencies]
+# Capped below the release line whose MSRV jumped past the
+# Nix build's pinned rustc 1.86 (proptest 1.12 wants 1.88 and
+# failed the cycle-8 Nix check phase; 1.7 declares 1.66).
+proptest = ">=1.7, <1.10"
