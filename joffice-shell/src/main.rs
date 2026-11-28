@@ -12230,7 +12230,6 @@ fn show_save_fallback_dialog(shell: &Rc<Shell>) {
             ("_Save", ResponseType::Accept),
         ],
     );
-    dialog.set_do_overwrite_confirmation(true);
     let _ = dialog.set_current_folder(Some(&gtk4::gio::File::for_path(&preset_dir)));
     dialog.set_current_name(&preset_name);
     let mut filter_objs: Vec<(FileFilter, i32)> = Vec::new();
