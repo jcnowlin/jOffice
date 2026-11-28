@@ -614,6 +614,8 @@ fn ensure_spell_pump(shell: &Rc<Shell>) {
             // in a pipeline stage past its budget gets named
             // here, once per stage.
             exportlog::scan();
+            // Cycle 9 (A10): the save-chooser watchdog.
+            dialog_watchdog_tick(&shell_p);
         }
         gtk4::glib::ControlFlow::Continue
     });
@@ -1951,6 +1953,11 @@ struct PendingSave {
     /// 2/3 handling (password prompt / downgrade warning),
     /// never the plain copy/convert paths.
     protected: bool,
+    /// Cycle 9 (A10): the native chooser for this save was
+    /// declared lost by the dialog watchdog (portal
+    /// swallowed it); the re-presented dialog is the
+    /// in-process fallback.
+    dialog_lost: bool,
 }
 
 /// A print-intent export parked on the native print dialog
@@ -2229,6 +2236,16 @@ struct Shell {
     /// While set, print and PDF export refuse with the
     /// reason instead of dying inside x2t's renderer.
     fontmap_stale: RefCell<Option<String>>,
+    /// Cycle 9 (A10): when the native save chooser was
+    /// shown (the dialog watchdog's clock) and the
+    /// in-process fallback chooser currently open, if any.
+    /// FileChooserNative delegates to the xdg portal when
+    /// one answers; in environments where the portal's
+    /// chooser never lands, the response simply never
+    /// comes — the watchdog declares it lost and the save
+    /// re-presents in-process instead of wedging forever.
+    dialog_shown_at: RefCell<Option<Instant>>,
+    fallback_dialog: RefCell<Option<gtk4::FileChooserDialog>>,
     /// Cycle 8: SAVE_DROPPED after the retry also failed —
     /// a safety notice (window-scoped, never suppressible).
     save_dropped: RefCell<bool>,
@@ -2442,6 +2459,8 @@ impl Shell {
             save_phase: RefCell::new(None),
             export_corr: RefCell::new(None),
             fontmap_stale: RefCell::new(None),
+            dialog_shown_at: RefCell::new(None),
+            fallback_dialog: RefCell::new(None),
             save_dropped: RefCell::new(false),
             settings_drift: RefCell::new(None),
             autosave_rt: RefCell::new(AutosaveRuntime::default()),
@@ -11040,6 +11059,7 @@ fn handle_bridge(
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string()),
                         protected: false,
+                        dialog_lost: false,
                     });
                     show_save_dialog(shell);
                     return;
@@ -11424,6 +11444,7 @@ fn handle_bridge(
                             .as_ref()
                             .map(|d| d.protected.is_some())
                             .unwrap_or(false),
+                        dialog_lost: false,
                     });
                     if is_askonce {
                         show_askonce(shell);
@@ -11596,6 +11617,14 @@ fn handle_bridge(
                 let prev = shell.modified.replace(Some(v));
                 if prev != Some(v) {
                     eprintln!("joffice: [save-ledger] RUST-MODIFIED value={v}");
+                }
+                // Cycle 9 (A1/A2): a dirtiness push is an
+                // edit signal for the autosave idle clock
+                // too — the journal append that also stamps
+                // it can land after the tick that first
+                // observes the dirt.
+                if v {
+                    shell.autosave_rt.borrow_mut().last_edit = Some(Instant::now());
                 }
                 refresh_chrome(shell);
             }
@@ -12045,6 +12074,19 @@ fn show_save_dialog(shell: &Rc<Shell>) {
         let Some(p) = p.as_ref() else { return };
         (p.preset_dir.clone(), p.preset_name.clone(), p.kind)
     };
+    // Cycle 9 (A10): if the watchdog declared this save's
+    // native chooser lost, present the in-process fallback
+    // instead of delegating to the portal again.
+    if shell
+        .pending_save
+        .borrow()
+        .as_ref()
+        .map(|p| p.dialog_lost)
+        .unwrap_or(false)
+    {
+        show_save_fallback_dialog(shell);
+        return;
+    }
     let window = shell.window.borrow().clone();
     let dialog = FileChooserNative::new(
         Some("Save As"),
@@ -12101,10 +12143,12 @@ fn show_save_dialog(shell: &Rc<Shell>) {
         p.filters = filter_objs;
     }
     *shell.active_dialog.borrow_mut() = Some(dialog.clone());
+    *shell.dialog_shown_at.borrow_mut() = Some(Instant::now());
     xstage(shell, exportlog::STAGE_GATE, "dialog-parked", true);
     let shell_c = shell.clone();
     dialog.connect_response(move |d, resp| {
         *shell_c.active_dialog.borrow_mut() = None;
+        *shell_c.dialog_shown_at.borrow_mut() = None;
         xstage(&shell_c, exportlog::STAGE_GATE, "dialog-answered", false);
         eprintln!(
             "joffice: SAVE-DIALOG response={resp:?} file={:?} filter={:?}",
@@ -12141,41 +12185,219 @@ fn show_save_dialog(shell: &Rc<Shell>) {
             .as_ref()
             .map(|p| p.kind)
             .unwrap_or(EditorKind::Word);
-        let ext = path
-            .extension()
-            .map(|e| e.to_string_lossy().to_lowercase())
-            .unwrap_or_default();
-        // Extension adjudication (restatement 3).
-        let format: i32 = if ext.is_empty() {
-            let e = ext_of_code(active_code).unwrap_or("docx");
-            path.set_extension(e);
-            active_code
-        } else if let Some(typed_code) = code_of_ext(&ext) {
-            if kind_of_code(typed_code) != Some(kind) && typed_code != active_code {
-                // Another editor's format typed into this
-                // editor's dialog: reject BEFORE anything is
-                // written, with the chance to fix the name.
-                // (typed == active covers cross-family EXPORTS
-                // the dialog itself offers, e.g. PDF.)
-                show_reject_window(&shell_c, path, active_code);
-                return;
-            }
-            typed_code
-        } else {
-            // Unrecognized extension: append the filter's.
-            let e = ext_of_code(active_code).unwrap_or("docx");
-            let mut name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            name.push('.');
-            name.push_str(e);
-            path.set_file_name(name);
-            active_code
-        };
-        let Some(p) = take_pending_save(&shell_c) else {
+        let Some((path, format)) =
+            adjudicate_save_choice(&shell_c, path, active_code, kind)
+        else {
             return;
         };
+        complete_save_dialog(&shell_c, path, format);
+    });
+    dialog.show();
+}
+
+/// Cycle 9 (A10): the in-process Save As fallback. Same
+/// presets, filters and completion as the native chooser,
+/// but a GtkFileChooserDialog — a plain widget window this
+/// process owns, which cannot be swallowed by a portal
+/// that never presents. Reached only when the watchdog
+/// declared the native chooser lost for this save.
+fn show_save_fallback_dialog(shell: &Rc<Shell>) {
+    if shell.fallback_dialog.borrow().is_some() {
+        return;
+    }
+    let (preset_dir, preset_name, filter_code, choices) = {
+        let p = shell.pending_save.borrow();
+        let Some(p) = p.as_ref() else { return };
+        let choices: Vec<(i32, &str)> = if p.copy_source.is_some() || p.pdf_merge {
+            vec![(fmt::PDF, "PDF")]
+        } else {
+            save_as_choices(p.kind)
+        };
+        (
+            p.preset_dir.clone(),
+            p.preset_name.clone(),
+            p.filter_code,
+            choices,
+        )
+    };
+    let window = shell.window.borrow().clone();
+    let dialog = gtk4::FileChooserDialog::new(
+        Some("Save As"),
+        window.as_ref(),
+        FileChooserAction::Save,
+        &[
+            ("_Cancel", ResponseType::Cancel),
+            ("_Save", ResponseType::Accept),
+        ],
+    );
+    dialog.set_do_overwrite_confirmation(true);
+    let _ = dialog.set_current_folder(Some(&gtk4::gio::File::for_path(&preset_dir)));
+    dialog.set_current_name(&preset_name);
+    let mut filter_objs: Vec<(FileFilter, i32)> = Vec::new();
+    for (code, label) in choices.iter() {
+        let f = FileFilter::new();
+        f.set_name(Some(label));
+        if let Some(ext) = ext_of_code(*code) {
+            f.add_pattern(&format!("*.{ext}"));
+        }
+        dialog.add_filter(&f);
+        filter_objs.push((f, *code));
+    }
+    if let Some((f, _)) = filter_objs.iter().find(|(_, c)| *c == filter_code) {
+        dialog.set_filter(f);
+    }
+    if let Some(p) = shell.pending_save.borrow_mut().as_mut() {
+        p.filters = filter_objs;
+    }
+    *shell.fallback_dialog.borrow_mut() = Some(dialog.clone());
+    xstage(shell, exportlog::STAGE_GATE, "dialog-fallback-presented", true);
+    let shell_c = shell.clone();
+    dialog.connect_response(move |d, resp| {
+        *shell_c.fallback_dialog.borrow_mut() = None;
+        xstage(&shell_c, exportlog::STAGE_GATE, "dialog-answered", false);
+        eprintln!(
+            "joffice: SAVE-DIALOG-FALLBACK response={resp:?} file={:?}",
+            d.file().and_then(|f| f.path())
+        );
+        if resp != ResponseType::Accept {
+            cancel_pending_save(&shell_c);
+            return;
+        }
+        let Some(path) = d.file().and_then(|f| f.path()) else {
+            cancel_pending_save(&shell_c);
+            return;
+        };
+        let active_code = {
+            let p = shell_c.pending_save.borrow();
+            let p = p.as_ref();
+            match (p, d.filter()) {
+                (Some(p), Some(active)) => p
+                    .filters
+                    .iter()
+                    .find(|(f, _)| *f == active)
+                    .map(|(_, c)| *c)
+                    .unwrap_or(p.filter_code),
+                (Some(p), None) => p.filter_code,
+                _ => fmt::DOCX,
+            }
+        };
+        let kind = shell_c
+            .pending_save
+            .borrow()
+            .as_ref()
+            .map(|p| p.kind)
+            .unwrap_or(EditorKind::Word);
+        let Some((path, format)) =
+            adjudicate_save_choice(&shell_c, path, active_code, kind)
+        else {
+            return;
+        };
+        complete_save_dialog(&shell_c, path, format);
+    });
+    dialog.present();
+}
+
+/// Cycle 9 (A10): the save-chooser watchdog, run on the
+/// ~1 s pump beside the export watchdog. A native chooser
+/// that stays unanswered for 45 s is declared lost: the
+/// portal it delegated to never presented it (the
+/// cycle-8 A10 wedge — startsave + snapshot fired, then
+/// the window sat behind a "Saving document" spinner
+/// forever). The native is destroyed, the parked save is
+/// marked dialog_lost, and the dialog re-presents
+/// in-process. 45 s is deliberately generous — a human
+/// browsing a working portal picker is left alone; the
+/// cost of a false positive is the same save re-offered
+/// in the fallback picker with its presets intact.
+fn dialog_watchdog_tick(shell: &Rc<Shell>) {
+    let Some(shown) = *shell.dialog_shown_at.borrow() else {
+        return;
+    };
+    if shown.elapsed() < std::time::Duration::from_secs(45) {
+        return;
+    }
+    if shell.active_dialog.borrow().is_none() {
+        *shell.dialog_shown_at.borrow_mut() = None;
+        return;
+    }
+    *shell.dialog_shown_at.borrow_mut() = None;
+    if let Some(d) = shell.active_dialog.borrow_mut().take() {
+        d.destroy();
+    }
+    let parked = {
+        let mut p = shell.pending_save.borrow_mut();
+        match p.as_mut() {
+            Some(p) => {
+                p.dialog_lost = true;
+                true
+            }
+            None => false,
+        }
+    };
+    eprintln!(
+        "joffice: SAVE_DIALOG_LOST native chooser unanswered for 45s (portal never presented it); re-presenting in-process"
+    );
+    if parked {
+        show_save_dialog(shell);
+    }
+}
+
+/// The extension adjudication (restatement 3), shared by
+/// the native chooser and the cycle-9 in-process fallback
+/// chooser: a name with no extension takes the active
+/// filter's; a typed extension from another editor's
+/// family is rejected before anything is written (None —
+/// the reject window is up and the pending save stays
+/// parked); an unrecognized extension gets the filter's
+/// appended.
+fn adjudicate_save_choice(
+    shell_c: &Rc<Shell>,
+    mut path: PathBuf,
+    active_code: i32,
+    kind: EditorKind,
+) -> Option<(PathBuf, i32)> {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let format: i32 = if ext.is_empty() {
+        let e = ext_of_code(active_code).unwrap_or("docx");
+        path.set_extension(e);
+        active_code
+    } else if let Some(typed_code) = code_of_ext(&ext) {
+        if kind_of_code(typed_code) != Some(kind) && typed_code != active_code {
+            // Another editor's format typed into this
+            // editor's dialog: reject BEFORE anything is
+            // written, with the chance to fix the name.
+            // (typed == active covers cross-family EXPORTS
+            // the dialog itself offers, e.g. PDF.)
+            show_reject_window(shell_c, path, active_code);
+            return None;
+        }
+        typed_code
+    } else {
+        // Unrecognized extension: append the filter's.
+        let e = ext_of_code(active_code).unwrap_or("docx");
+        let mut name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        name.push('.');
+        name.push_str(e);
+        path.set_file_name(name);
+        active_code
+    };
+    Some((path, format))
+}
+
+/// Everything after a save chooser's verdict: take the
+/// parked save and complete it (merge / protected / copy /
+/// convert). Shared by the native chooser and the
+/// in-process fallback.
+fn complete_save_dialog(shell_c: &Rc<Shell>, path: PathBuf, format: i32) {
+    let Some(p) = take_pending_save(shell_c) else {
+        return;
+    };
         // PdfAnnotate merge completions (cycle 5): tmp_bin
         // holds the compiled changes. A CLEAN document saved
         // as its own format byte-copies instead (§6a — never
@@ -12365,8 +12587,6 @@ fn show_save_dialog(shell: &Rc<Shell>) {
             after,
             p.pdfa,
         );
-    });
-    dialog.show();
 }
 
 /// The cross-editor rejection (restatement 3): "x.xlsx" is a
@@ -13878,9 +14098,24 @@ fn autosave_tick(shell: &Rc<Shell>) {
         return;
     }
     {
-        let rt = shell.autosave_rt.borrow();
-        if let Some(last) = rt.last_edit {
-            if last.elapsed() < std::time::Duration::from_secs(30) {
+        let mut rt = shell.autosave_rt.borrow_mut();
+        match rt.last_edit {
+            Some(last) => {
+                if last.elapsed() < std::time::Duration::from_secs(30) {
+                    return;
+                }
+            }
+            None => {
+                // Cycle 9 (drives A1/A2): an un-stamped idle
+                // clock is NOT an idle document. Dirtiness
+                // can be observed (the modified push) before
+                // the first journalAppend stamps last_edit;
+                // treating None as "idle forever" fired the
+                // first autosave seconds after the first
+                // edit, mid-typing, once per window. The
+                // earliest provable edit time is now: stamp
+                // and let the 30 s rule run from here.
+                rt.last_edit = Some(Instant::now());
                 return;
             }
         }

@@ -442,7 +442,19 @@
         try {
             var sp = ed.WordControl && ed.WordControl.m_oLogicDocument
                 && ed.WordControl.m_oLogicDocument.Spelling;
-            if (sp && typeof sp.IsOn === 'function') rep.enabled = !!sp.IsOn();
+            // Cycle 9 (E8 blemish): read back the surface
+            // the toggle actually writes. asc_setSpellCheck
+            // sets Spelling.Use (a plain field, and the one
+            // the per-element gate reads); IsOn() reads a
+            // TurnOn/TurnOff REFCOUNT (1 === Active) that
+            // the toggle never moves — with spellcheck off
+            // the old read-back kept reporting "on in the
+            // editor" forever, a false drift that only
+            // cleared by turning the setting back on. Use
+            // wins when present; IsOn is the fallback for a
+            // surface without the field.
+            if (sp && typeof sp.Use === 'boolean') rep.enabled = !!sp.Use;
+            else if (sp && typeof sp.IsOn === 'function') rep.enabled = !!sp.IsOn();
         } catch (e) { /* not a word editor */ }
         try {
             if (typeof ed.asc_getSpellCheckSettings === 'function') {
